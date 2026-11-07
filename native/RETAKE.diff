@@ -620,10 +620,10 @@ index 6c43ca0..782d97f 100644
          run(plugins_read_frames_and_hold_gameplay_options);
  #ifdef _WIN32
 diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
-index 8abd30b..03b204c 100644
+index 8abd30b..fe446e4 100644
 --- a/Extension/Plugins/plugin_api_world.cpp
 +++ b/Extension/Plugins/plugin_api_world.cpp
-@@ -2930,6 +2930,289 @@ struct WorldApi {
+@@ -2930,6 +2930,310 @@ struct WorldApi {
          lua_setfield(L, -2, "playstation");
          return 1;
      }
@@ -871,6 +871,23 @@ index 8abd30b..03b204c 100644
 +        const char* text = luaL_optlstring(L, 2, "", &length);
 +        return result(L, game(plugin).tas_line_save(plugin.id(), path, std::string_view(text, length)));
 +    }
++    // tas.skater_dump(path): research, the local skater's memory as far as it reaches, to a file in the plugin's data
++    // folder, up to 8 MB: skaters built at different step lengths, compared, show what the build works out from it.
++    static int tas_skater_dump(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.skater_dump");
++        need(L, plugin, "files", "reskate.tas.skater_dump");
++        const auto path = data_path(L, 1, false);
++        return result(L, game(plugin).tas_skater_dump(plugin.id(), path));
++    }
++    // tas.skater_dump_status(): the dump is written in the background: "writing", "saved", why it failed, or "".
++    static int tas_skater_dump_status(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.skater_dump_status");
++        const auto status = game(plugin).tas_skater_dump_status();
++        lua_pushlstring(L, status.data(), status.size());
++        return 1;
++    }
 +    static int tas_stop(lua_State* L) {
 +        auto& plugin = plugin_of(L);
 +        need(L, plugin, "tas", "reskate.tas.stop");
@@ -886,6 +903,10 @@ index 8abd30b..03b204c 100644
 +        lua_setfield(L, -2, "virtual_time");
 +        lua_pushnumber(L, static_cast<double>(s.clock_reads));
 +        lua_setfield(L, -2, "clock_reads");
++        lua_pushnumber(L, static_cast<double>(s.replay_off));
++        lua_setfield(L, -2, "replay_off");
++        lua_pushnumber(L, static_cast<double>(s.replay_off_at));
++        lua_setfield(L, -2, "replay_off_at");
 +        lua_pushnumber(L, static_cast<double>(s.since_spawn));
 +        lua_setfield(L, -2, "since_spawn");
 +        lua_pushnumber(L, static_cast<double>(s.unread));
@@ -913,14 +934,14 @@ index 8abd30b..03b204c 100644
      // A whole replacement for a real controller, in the same units as input.gamepad().
      static int input_write(lua_State* L) {
          auto& plugin = plugin_of(L);
-@@ -3274,6 +3557,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+@@ -3274,6 +3578,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
      add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
      add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
      add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
 +    add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
 +        {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
 +        {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}});
++        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status}});
      add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
      add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                    {"ready", entities_ready}, {"blueprints", entities_blueprints},
@@ -945,10 +966,10 @@ index 173bdd7..6decf4f 100644
              if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
              if (has("capture")) actions.push_back("record your screen");
 diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
-index 61689ee..8803f2c 100644
+index 61689ee..af54fb1 100644
 --- a/Extension/Plugins/plugin_game.h
 +++ b/Extension/Plugins/plugin_game.h
-@@ -143,7 +143,37 @@ struct PhysicsStep {
+@@ -143,7 +143,39 @@ struct PhysicsStep {
      struct Pose { EffectMatrix transform{}; Vec3 velocity{}; };
      std::map<std::string, Pose, std::less<>> poses; // all available local bodies, including airborne ones
      std::optional<std::uint32_t> state;
@@ -969,6 +990,8 @@ index 61689ee..8803f2c 100644
 +    std::size_t since_spawn{}; // physics steps since the skater was last built (a spawn, a teleport)
 +    bool virtual_time{};       // the clock is driven by the physics steps
 +    std::uint64_t clock_reads{}; // reads of the clock the hook has seen
++    float replay_off{};          // the last run up: the most the board was from its recording before a step was put back, m
++    std::size_t replay_off_at{}; // and at which step
 +};
 +// A line: one recording from a standing start that can go back to any step of it (reskate.tas.line).
 +struct TasLine {
@@ -986,7 +1009,7 @@ index 61689ee..8803f2c 100644
  // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
  // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
  struct LaunchShape {
-@@ -1076,6 +1106,37 @@ public:
+@@ -1076,6 +1108,42 @@ public:
      virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
      virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
      virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
@@ -1021,15 +1044,23 @@ index 61689ee..8803f2c 100644
 +    // `text`, then the line's every step (the controller as recorded, where the board was), to `path` in the
 +    // plugin's data folder: a bug report, larger than a plugin's own files may be.
 +    virtual std::string tas_line_save(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*text*/) { return unavailable; }
++    // Research: the local skater's memory as far as it reaches (Extension/Skater/state_dump.h graph), to `path` in
++    // the plugin's data folder.
++    virtual std::string tas_skater_dump(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
++    // How the last skater dump went: "writing", "saved", why it failed, or empty before the first.
++    virtual std::string tas_skater_dump_status() { return {}; }
      // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
      // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
      virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
 diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
-index 5c0acee..46a89f2 100644
+index 5c0acee..062552f 100644
 --- a/Extension/Plugins/plugin_game_runtime.cpp
 +++ b/Extension/Plugins/plugin_game_runtime.cpp
-@@ -30,6 +30,10 @@
+@@ -28,8 +28,13 @@
+ #include "Engine/Vfs/mod_catalog.h"
+ #include "Engine/Core/Log/logging.h"
  #include <mutex>
++#include <thread>
  #include "Extension/Assets/live_mods.h"
  #include "Extension/Skater/game_speed.h"
 +#include "Extension/Skater/motion_snapshot.h"
@@ -1039,7 +1070,7 @@ index 5c0acee..46a89f2 100644
  #include "Extension/Skater/launches.h"
  #include "Extension/Skater/pad_hide.h"
  #include "Engine/Game/Skater/first_person_cycle.h"
-@@ -46,6 +50,7 @@
+@@ -46,6 +51,7 @@
  #include "Extension/Music/spotify_station.h"
  #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
  #include "Extension/Profile/local_profile_runtime.h"
@@ -1047,7 +1078,7 @@ index 5c0acee..46a89f2 100644
  #include "Extension/Settings/named_settings.h"
  #include "Engine/Game/Settings/multiplayer_settings_lock.h"
  #include "Extension/Skater/ai_skaters.h"
-@@ -75,6 +80,7 @@
+@@ -75,6 +81,7 @@
  #include "Extension/UI/Overlay/viewmodel.h"
  #include "Extension/UI/Overlay/scripted_pad.h"
  #include "Engine/Game/Input/pad_output.h"
@@ -1055,7 +1086,7 @@ index 5c0acee..46a89f2 100644
  #include "Engine/Game/Skater/animation_values.h"
  #include "Extension/Skater/grind_target.h"
  #include "Engine/Game/Input/gameplay_options.h"
-@@ -87,6 +93,7 @@
+@@ -87,6 +94,7 @@
  #include <shellapi.h>
  #include <algorithm>
  #include <array>
@@ -1063,7 +1094,7 @@ index 5c0acee..46a89f2 100644
  #include <cmath>
  #include <format>
  #include <fstream>
-@@ -697,6 +704,12 @@ public:
+@@ -697,6 +705,12 @@ public:
              for (std::size_t i = 1; i < skater_body::count; ++i) {
                  const auto& c = s.body.bodies[i];
                  if (const auto& pose = s.poses[i]) step.poses.emplace(skater_body::names[i], PhysicsStep::Pose{pose->transform, pose->velocity});
@@ -1076,7 +1107,7 @@ index 5c0acee..46a89f2 100644
                  if (!c.touching) continue;
                  const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
                  step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
-@@ -1085,6 +1098,559 @@ public:
+@@ -1085,6 +1099,624 @@ public:
              axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
          return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
      }
@@ -1088,6 +1119,10 @@ index 5c0acee..46a89f2 100644
 +        std::atomic<bool> capture_wanted{}, captured{};
 +        std::atomic<int> restore_wanted{};  // a TasRestore
 +        std::atomic<std::size_t> restores{};
++        // A run up, checked against its recording: before each step is put back, how far the board had gone from where
++        // the recording had it then (the step's own error, with no lag between the two), the most and its step.
++        std::atomic<float> replay_off{};
++        std::atomic<std::size_t> replay_off_at{};
 +        std::atomic<std::size_t> since_spawn{};
 +        // Every step of the recording, and whether a playing is held to them. The physics thread's: a run
 +        // always begins from a step of it (tas_wait).
@@ -1216,6 +1251,8 @@ index 5c0acee..46a89f2 100644
 +            // At the same step of the skater's life as when the line began.
 +            if (since >= m.line_at.load(std::memory_order_acquire)) {
 +                m.locked = true;
++                m.replay_off.store(0.0f, std::memory_order_relaxed);
++                m.replay_off_at.store(0, std::memory_order_relaxed);
 +                script.run_up(m.line_from.load(std::memory_order_acquire), m.line_to.load(std::memory_order_acquire), m.line_hand_over.load(std::memory_order_acquire));
 +                m.line.store(Line::running_up, std::memory_order_release);
 +            }
@@ -1321,6 +1358,7 @@ index 5c0acee..46a89f2 100644
 +                m.loads.fetch_add(1, std::memory_order_relaxed);
 +        }
 +        tas_step_history(m, skater, since);
++        skater_physics::apply_asked_step(skater); // a step length asked for, put in with the flight's path just below
 +        motion_snapshot::match_flight_step(skater, skater_physics::step_length());
 +        try {
 +            if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off && multiplayer_session_active()) tas_line_off(m); // never a held skater in a session
@@ -1347,6 +1385,15 @@ index 5c0acee..46a89f2 100644
 +                m.frames.emplace_back();
 +                (void)motion_snapshot::capture(skater, m.frames.back());
 +            } else if (script.mode == input::StepScript::Mode::playing && m.locked && script.step < m.frames.size()) {
++                std::array<float, 3> now{};
++                if (script.step > 0 && motion_snapshot::board_place(skater, now)) {
++                    const auto& t = m.frames[script.step].board[0].transform;
++                    const float off = std::sqrt((now[0] - t[12]) * (now[0] - t[12]) + (now[1] - t[13]) * (now[1] - t[13]) + (now[2] - t[14]) * (now[2] - t[14]));
++                    if (std::isfinite(off) && off > m.replay_off.load(std::memory_order_relaxed)) {
++                        m.replay_off.store(off, std::memory_order_relaxed);
++                        m.replay_off_at.store(script.step, std::memory_order_relaxed);
++                    }
++                }
 +                if (motion_snapshot::restore(skater, m.frames[script.step], true)) m.restores.fetch_add(1, std::memory_order_relaxed);
 +            }
 +            input::step_script().step();
@@ -1372,6 +1419,7 @@ index 5c0acee..46a89f2 100644
 +        if (!allowed) return "the game does not have gameplay input";
 +        if (!listening.load(std::memory_order_acquire)) {
 +            if (!add_no_bail_step_listener(&tas_on_step)) return "the skater's physics steps are unavailable";
++            skater_physics::apply_asks_on_steps(true); // tas_on_step puts step lengths in from now on
 +            listening.store(true, std::memory_order_release);
 +        }
 +        return {};
@@ -1567,6 +1615,53 @@ index 5c0acee..46a89f2 100644
 +        out += "== end of the line ==\n";
 +        return files_write_bytes(plugin, path, out, line_save_most_bytes);
 +    }
++    // A dump reads thousands of blocks and writes 8 MB: far past a plugin call's 50 ms, so it runs on a thread of its
++    // own, one at a time, and the plugin asks how it went (tas_skater_dump_status).
++    struct SkaterDump {
++        std::mutex mutex;
++        bool running{};
++        std::string outcome; // "saved", or why not; empty before the first
++    };
++    static SkaterDump& skater_dump_state() {
++        static auto* value = new SkaterDump; // a thread may still be writing at exit
++        return *value;
++    }
++    std::string tas_skater_dump(std::string_view plugin, std::string_view path) override {
++        if (multiplayer_session_active()) return "never in a multiplayer session";
++        NoBailSkater skater;
++        if (!no_bail_skater(skater)) return "there is no skater to read";
++        std::filesystem::path root, file;
++        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
++        auto& state = skater_dump_state();
++        {
++            std::lock_guard lock(state.mutex);
++            if (state.running) return "a skater dump is still being written";
++            state.running = true;
++            state.outcome.clear();
++        }
++        std::thread([skater, file] {
++            std::string outcome = "saved";
++            try {
++                const auto bytes = state_dump::graph(skater, line_save_most_bytes);
++                std::error_code error;
++                std::filesystem::create_directories(file.parent_path(), error);
++                std::ofstream out(file, std::ios::binary | std::ios::trunc);
++                if (error || !out || !out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()))) outcome = "the file cannot be written";
++            } catch (...) {
++                outcome = "the skater could not be read";
++            }
++            auto& done = skater_dump_state();
++            std::lock_guard lock(done.mutex);
++            done.outcome = std::move(outcome);
++            done.running = false;
++        }).detach();
++        return {};
++    }
++    std::string tas_skater_dump_status() override {
++        auto& state = skater_dump_state();
++        std::lock_guard lock(state.mutex);
++        return state.running ? std::string("writing") : state.outcome;
++    }
 +    std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
 +        auto& m = tas_motion();
 +        std::lock_guard lock(m.frames_mutex);
@@ -1591,7 +1686,8 @@ index 5c0acee..46a89f2 100644
 +        }
 +        const char* mode = waiting ? "waiting" : s.mode == input::StepScript::Mode::recording ? "recording" : s.mode == input::StepScript::Mode::playing ? "playing" : "off";
 +        return {mode, s.step, s.length, s.stopped, tas_motion().captured.load(std::memory_order_acquire), tas_motion().restores.load(std::memory_order_relaxed),
-+            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads()};
++            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads(),
++            tas_motion().replay_off.load(std::memory_order_relaxed), tas_motion().replay_off_at.load(std::memory_order_relaxed)};
 +    }
 +    std::string tas_save(unsigned slot) override {
 +        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
@@ -1636,7 +1732,7 @@ index 5c0acee..46a89f2 100644
      std::optional<StickInput> joystick(int device) override {
          if (!joystick::game_in_foreground()) return std::nullopt;
          const auto sample = joystick::poll(device);
-@@ -1876,6 +2442,8 @@ public:
+@@ -1876,6 +2508,8 @@ public:
      }
      void release(std::string_view plugin) override {
          input::pad_outputs().release(plugin);
@@ -1689,10 +1785,10 @@ index a9fc444..ea3b92e 100644
  bool known_permission(std::string_view name) noexcept {
 diff --git a/Extension/Skater/motion_snapshot.cpp b/Extension/Skater/motion_snapshot.cpp
 new file mode 100644
-index 0000000..0d7da1c
+index 0000000..861e50f
 --- /dev/null
 +++ b/Extension/Skater/motion_snapshot.cpp
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,138 @@
 +#include "motion_snapshot.h"
 +#include "Engine/Core/Log/logging.h"
 +#include "Engine/Core/Platform/memory.h"
@@ -1773,6 +1869,14 @@ index 0000000..0d7da1c
 +}
 +}
 +
++bool board_place(const NoBailSkater& skater, std::array<float, 3>& place) noexcept {
++    Holders at;
++    std::array<float, 16> transform{};
++    if (!holders(skater, at) || !memory::peek(at.board + body::body_transform_offset, transform)) return false;
++    place = {transform[12], transform[13], transform[14]};
++    return std::isfinite(place[0]) && std::isfinite(place[1]) && std::isfinite(place[2]);
++}
++
 +bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept {
 +    snapshot.valid = false;
 +    Holders at;
@@ -1825,10 +1929,10 @@ index 0000000..0d7da1c
 +}
 diff --git a/Extension/Skater/motion_snapshot.h b/Extension/Skater/motion_snapshot.h
 new file mode 100644
-index 0000000..4ff187f
+index 0000000..9b3d5da
 --- /dev/null
 +++ b/Extension/Skater/motion_snapshot.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +#pragma once
 +#include "Extension/Skater/no_bail.h"
 +#include "Engine/Game/Abi/linear_transform.h"
@@ -1852,6 +1956,8 @@ index 0000000..4ff187f
 +};
 +// False when a body could not be read or does not hold the layout expected.
 +bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept;
++// Where the board's root is now (its world matrix's place), for checking a replay against its recording. False when unread.
++bool board_place(const NoBailSkater& skater, std::array<float, 3>& place) noexcept;
 +// `skeleton`: the skeleton's bodies too, not only the board's. False when nothing was written.
 +// A flight's path goes on at the speed of the skater's step: its frame time becomes `step`, and its frame count
 +// the one that is the same time along the path. Nothing is written while they agree. Physics thread.
@@ -1859,10 +1965,16 @@ index 0000000..4ff187f
 +bool restore(const NoBailSkater& skater, const Snapshot& snapshot, bool skeleton) noexcept;
 +}
 diff --git a/Extension/Skater/skater_physics.cpp b/Extension/Skater/skater_physics.cpp
-index d358e81..2cd648a 100644
+index d358e81..4f1cc25 100644
 --- a/Extension/Skater/skater_physics.cpp
 +++ b/Extension/Skater/skater_physics.cpp
-@@ -110,6 +110,55 @@ bool read_motion(const NoBailSkater& skater, Vec3& board, Vec3& pelvis, Vec3& sp
+@@ -1,4 +1,5 @@
+ #include "skater_physics.h"
++#include "step_fields.h"
+ #include "Engine/Core/Log/logging.h"
+ #include "Engine/Core/Platform/memory.h"
+ #include "Engine/Game/Build/addresses.h"
+@@ -110,6 +111,55 @@ bool read_motion(const NoBailSkater& skater, Vec3& board, Vec3& pelvis, Vec3& sp
              skater_body::index(skater_body::Bone::hips), pelvis, &spin);
  }
  
@@ -1918,7 +2030,7 @@ index d358e81..2cd648a 100644
  // Where the local skater's physics step length is kept now (a float, seconds of game time), 0 while
  // there is no local skater.
  std::uintptr_t step_length_address() noexcept {
-@@ -187,6 +236,7 @@ Step read_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept
+@@ -187,6 +237,7 @@ Step read_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept
          }
      }
      (void)read_contacts(skater, step.body);
@@ -1926,8 +2038,81 @@ index d358e81..2cd648a 100644
      return step;
  }
  
+@@ -196,11 +247,8 @@ float step_length() noexcept {
+     return address && memory::peek(address, seconds) ? seconds : 0.0f;
+ }
+ 
+-bool set_step_length(float seconds) noexcept {
+-    const auto address = step_length_address();
+-    float current{};
+-    if (!address || !memory::peek(address, current)) return false;
+-    if (current == seconds) return true;
++namespace {
++bool write_step(std::uintptr_t address, float seconds) noexcept {
+     __try {
+         *reinterpret_cast<volatile float*>(address) = seconds; // read by the physics thread each step
+         return true;
+@@ -209,3 +257,58 @@ bool set_step_length(float seconds) noexcept {
+     }
+ }
+ }
++
++namespace {
++// A step length asked for while a step listener puts asks in (0: none), and whether one does.
++std::atomic<float>& asked_step() {
++    static std::atomic<float> value{0.0f};
++    return value;
++}
++std::atomic<bool>& asks_on_steps() {
++    static std::atomic<bool> value{};
++    return value;
++}
++
++// The step put in, and what the skater's build worked out from its step (step_fields.h) with it, so the skater is as
++// one built at this step.
++bool put_in(const NoBailSkater& skater, std::uintptr_t address, float seconds) noexcept {
++    float current{};
++    if (!address || !memory::peek(address, current)) return false;
++    if (current == seconds) return true;
++    if (!write_step(address, seconds)) return false;
++    const auto outcome = step_fields::follow(skater, current, seconds);
++    try {
++        logging::log(logging::Level::info, logging::Channel::skater,
++            "Physics step {} -> {} s: {} values the skater was built with made to follow it ({}), {} already had, {} were neither, {} not found.",
++            current, seconds, outcome.changed, outcome.written, outcome.already, outcome.other, outcome.missing);
++    } catch (...) {
++    }
++    return true;
++}
++}
++
++bool set_step_length(float seconds) noexcept {
++    const auto address = step_length_address();
++    if (!address) return false;
++    if (asks_on_steps().load(std::memory_order_acquire)) {
++        // Put in at the next physics step, between two steps, with the flight's path (apply_asked_step).
++        asked_step().store(seconds, std::memory_order_release);
++        return true;
++    }
++    NoBailSkater skater;
++    if (!no_bail_skater(skater)) return false;
++    return put_in(skater, address, seconds);
++}
++
++void apply_asks_on_steps(bool on) noexcept {
++    asks_on_steps().store(on, std::memory_order_release);
++}
++
++void apply_asked_step(const NoBailSkater& skater) noexcept {
++    const float seconds = asked_step().exchange(0.0f, std::memory_order_acq_rel);
++    if (!(seconds > 0.0f)) return;
++    std::uintptr_t input{};
++    if (!memory::peek(skater.core + body::core_step_input_offset, input) || !input) return;
++    (void)put_in(skater, input + body::step_input_length_offset, seconds);
++}
++}
 diff --git a/Extension/Skater/skater_physics.h b/Extension/Skater/skater_physics.h
-index 48d462b..c806ade 100644
+index 48d462b..b6b8283 100644
 --- a/Extension/Skater/skater_physics.h
 +++ b/Extension/Skater/skater_physics.h
 @@ -26,6 +26,13 @@ struct Step {
@@ -1944,12 +2129,24 @@ index 48d462b..c806ade 100644
  };
  
  // Requires the validated build and No Bail started: verifies the layout once.
+@@ -39,4 +46,11 @@ float step_length() noexcept;
+ // Game update thread: gives the local skater this physics step length. False while there is no local
+ // skater.
+ bool set_step_length(float seconds) noexcept;
++// With a step listener that calls apply_asked_step every physics step (the plugin runtime's), a step length set is put
++// in there instead, between two steps, just before the flight's path is matched to it (motion_snapshot.h): set from the
++// game update thread at any moment, a step could run in the air with the new length and the path at the old one, and
++// slow motion easing in, changing it ten times in a flight, flung the board from 11 to 48 m/s (2026-11-07).
++void apply_asks_on_steps(bool on) noexcept;
++// Physics thread, from that step listener: the step length set since, if any.
++void apply_asked_step(const NoBailSkater& skater) noexcept;
+ }
 diff --git a/Extension/Skater/state_dump.cpp b/Extension/Skater/state_dump.cpp
 new file mode 100644
-index 0000000..f76bca2
+index 0000000..4e2b366
 --- /dev/null
 +++ b/Extension/Skater/state_dump.cpp
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,177 @@
 +#include "state_dump.h"
 +#include "Engine/Core/Platform/memory.h"
 +#include "Engine/Game/Build/addresses.h"
@@ -1959,8 +2156,11 @@ index 0000000..f76bca2
 +#include <array>
 +#include <atomic>
 +#include <cstring>
++#include <deque>
++#include <format>
 +#include <fstream>
 +#include <mutex>
++#include <unordered_set>
 +#include <vector>
 +
 +namespace dingosdk::state_dump {
@@ -2047,6 +2247,69 @@ index 0000000..f76bca2
 +    }
 +}
 +
++std::string graph(const NoBailSkater& skater, std::size_t most) {
++    std::vector<unsigned char> out;
++    out.reserve(most);
++    const char magic[4] = {'R', 'T', 'K', 'G'};
++    out.insert(out.end(), magic, magic + 4);
++    // Pointers into the game's image are its code and tables, the same in every dump: not followed.
++    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
++    std::uintptr_t image_end = image;
++    IMAGE_DOS_HEADER dos{};
++    IMAGE_NT_HEADERS64 headers{};
++    if (memory::read(image, dos) && memory::read(image + static_cast<std::uintptr_t>(dos.e_lfanew), headers))
++        image_end = image + headers.OptionalHeader.SizeOfImage;
++    struct Block {
++        std::string name;
++        std::uintptr_t address{};
++        std::uint32_t size{};
++        int depth{};
++    };
++    std::deque<Block> queue;
++    queue.push_back({"context", skater.context, 0x2000, 0});
++    queue.push_back({"core", skater.core, 0x4200, 0});
++    queue.push_back({"rig", skater.rig, 0x4700, 0});
++    queue.push_back({"entity", skater.entity, 0x800, 0});
++    queue.push_back({"base", skater.base, 0x800, 0});
++    // Known to hold what a build sets from the step (skater_state.h: the jump block's dt), whole.
++    const auto jump = pointer_at(skater.core + state::core_jump_block_offset);
++    queue.push_back({"core+3e8", jump, 0x2000, 1});
++    queue.push_back({"core+3e8+1100", pointer_at(jump + state::jump_block_request_offset), 0x200, 2});
++    queue.push_back({"core+308", pointer_at(skater.core + state::core_air_state_offset), 0x800, 1});
++    queue.push_back({"core+3c8", pointer_at(skater.core + body::core_step_input_offset), 0x200, 1});
++    std::unordered_set<std::uintptr_t> seen;
++    while (!queue.empty() && out.size() < most) {
++        auto block = std::move(queue.front());
++        queue.pop_front();
++        if (block.address < 0x10000 || !seen.insert(block.address).second) continue;
++        unsigned char probe[16];
++        if (!memory::read_bytes(block.address, probe, sizeof(probe))) continue;
++        const auto need = 2 + block.name.size() + 8 + 4 + block.size;
++        if (out.size() + need > most) continue;
++        append(out, static_cast<std::uint16_t>(block.name.size()));
++        out.insert(out.end(), block.name.begin(), block.name.end());
++        append(out, static_cast<std::uint64_t>(block.address));
++        append(out, block.size);
++        const auto at = out.size();
++        out.resize(at + block.size, 0xCD);
++        for (std::size_t done = 0; done < block.size; done += chunk) {
++            const auto length = std::min<std::size_t>(chunk, block.size - done);
++            (void)memory::read_bytes(block.address + done, out.data() + at + done, length);
++        }
++        if (block.depth >= 2) continue;
++        for (std::uint32_t offset = 0; offset + 8 <= block.size; offset += 8) {
++            std::uint64_t value{};
++            std::memcpy(&value, out.data() + at + offset, sizeof(value));
++            if (value < 0x10000 || value > memory::highest_user_address || (value & 7) != 0) continue;
++            if ((value >= image && value < image_end) || (value >= block.address && value < block.address + block.size)) continue;
++            if (seen.contains(value)) continue;
++            queue.push_back({std::format("{}+{:x}", block.name, offset), static_cast<std::uintptr_t>(value), block.depth == 0 ? 0x1000u : 0x400u,
++                             block.depth + 1});
++        }
++    }
++    return std::string(reinterpret_cast<const char*>(out.data()), out.size());
++}
++
 +std::string save(const std::filesystem::path& file) {
 +    auto& d = dump();
 +    d.armed.store(false, std::memory_order_release);
@@ -2063,10 +2326,10 @@ index 0000000..f76bca2
 +}
 diff --git a/Extension/Skater/state_dump.h b/Extension/Skater/state_dump.h
 new file mode 100644
-index 0000000..fc9f615
+index 0000000..6b4ef91
 --- /dev/null
 +++ b/Extension/Skater/state_dump.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,33 @@
 +#pragma once
 +#include "Extension/Skater/no_bail.h"
 +#include <cstddef>
@@ -2088,10 +2351,219 @@ index 0000000..fc9f615
 +void on_step(const NoBailSkater& skater, std::size_t step) noexcept;
 +// Client thread: ends the taking and writes what was taken. Empty when it worked, else why not.
 +std::string save(const std::filesystem::path& file);
++// Research: everything the local skater reaches, at once, for finding what its build works out from its step
++// length (a skater built in slow motion against one built at full speed). Its own blocks and the known ones
++// whole, every block one pointer away in part and two away in less, each named by the way to it from the
++// skater ("core+3e8+1100", offsets in hex), so dumps of skaters built apart line up by name. The bytes are
++// "RTKG", then records: u16 name length, the name, u64 address, u32 size, the bytes (0xCD where unreadable).
++// At most `most` bytes. Client thread; it only reads, and what moves meanwhile is noise to compare away.
++std::string graph(const NoBailSkater& skater, std::size_t most);
 +// Whether `step` of a run is one taken, by the rule arm() describes.
 +constexpr bool wanted(std::size_t step, std::uint32_t every) noexcept {
 +    return step <= 5 || (every != 0 && step % every == 0);
 +}
++}
+diff --git a/Extension/Skater/step_fields.cpp b/Extension/Skater/step_fields.cpp
+new file mode 100644
+index 0000000..518091e
+--- /dev/null
++++ b/Extension/Skater/step_fields.cpp
+@@ -0,0 +1,162 @@
++#include "step_fields.h"
++#include "Engine/Core/Platform/memory.h"
++#include <Windows.h>
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace dingosdk::step_fields {
++namespace {
++enum class Root : std::uint8_t { context, core, rig, entity };
++// dt: the step times a constant (1, -1, 60, 91, ...). pow2: a power of two below the step, which moves by the
++// power of two nearest the change (1/128 at 1/60, 1/2048 at 1/1200, 1/512 at 1/240).
++enum class Kind : std::uint8_t { dt, pow2 };
++struct Field {
++    Root root;
++    std::uint8_t hops;                  // offsets, all but the last a pointer to follow
++    std::array<std::uint32_t, 3> offset;
++    Kind kind;
++    float times; // dt: the value over the step, as built
++    const char* name; // its way from the skater
++};
++// From the comparison of builds (the comment beside each is its way from the skater, offsets in hex). The step input's
++// own length (core+3c8+20) is game_speed's to write. Left out: values that also depend on where the skater stands, and clocks
++// that only looked like it in the comparison, read at the same step count after each build (core+1ac and context+18ac
++// are minus the time since the build, core+30b0 to +30c0 and core+3f60+ac count time too: 2026-11-07, a build at full
++// speed slowed afterwards had them at its own age, not at 91 steps).
++constexpr Field fields[] = {
++    {Root::context, 3, {0x14a8, 0x890, 0x1c0}, Kind::dt, 1.0000f, "context+14a8+890+1c0"},
++    {Root::context, 3, {0x14a8, 0x890, 0x20}, Kind::dt, 1.0000f, "context+14a8+890+20"},
++    {Root::context, 3, {0x14a8, 0x890, 0x360}, Kind::dt, 1.0000f, "context+14a8+890+360"},
++    {Root::context, 1, {0x17ec}, Kind::dt, 1.0000f, "context+17ec"},
++    {Root::core, 2, {0x3a8, 0xf40}, Kind::dt, 1.0000f, "core+3a8+f40"},
++    {Root::core, 3, {0x3b8, 0x18, 0x0}, Kind::dt, 1.0000f, "core+3b8+18+0"},
++    {Root::core, 1, {0x3f50}, Kind::dt, 1.0000f, "core+3f50"},
++    {Root::core, 3, {0x488, 0x48, 0x1f0}, Kind::dt, 1.0000f, "core+488+48+1f0"},
++    {Root::core, 3, {0x488, 0x48, 0x350}, Kind::dt, 1.0000f, "core+488+48+350"},
++    {Root::core, 3, {0x488, 0x48, 0x90}, Kind::dt, 1.0000f, "core+488+48+90"},
++    {Root::core, 2, {0x490, 0x1b0}, Kind::dt, 1.0000f, "core+490+1b0"},
++    {Root::core, 3, {0x608, 0x5b0, 0x88}, Kind::dt, 1.0000f, "core+608+5b0+88"},
++    {Root::core, 3, {0x608, 0x5d0, 0x68}, Kind::dt, 1.0000f, "core+608+5d0+68"},
++    {Root::core, 3, {0x610, 0x18, 0x64}, Kind::dt, 60.0000f, "core+610+18+64"},
++    {Root::core, 3, {0x610, 0x68, 0x104}, Kind::dt, 60.0000f, "core+610+68+104"},
++    {Root::core, 1, {0xb70}, Kind::pow2, 0.0078125f, "core+b70"},
++    {Root::core, 3, {0xc48, 0x5b0, 0x340}, Kind::dt, 1.0000f, "core+c48+5b0+340"},
++    {Root::core, 2, {0xec8, 0xad0}, Kind::dt, 1.0000f, "core+ec8+ad0"},
++    {Root::core, 2, {0xec8, 0xb90}, Kind::dt, 1.0000f, "core+ec8+b90"},
++    {Root::entity, 2, {0x470, 0x440}, Kind::dt, 1.0000f, "entity+470+440"},
++    {Root::entity, 2, {0xf8, 0xbb0}, Kind::dt, 1.0000f, "entity+f8+bb0"},
++    {Root::entity, 2, {0xf8, 0xc40}, Kind::dt, 1.0000f, "entity+f8+c40"},
++    {Root::entity, 2, {0xf8, 0xd98}, Kind::dt, 1.0000f, "entity+f8+d98"},
++    {Root::entity, 2, {0xf8, 0xd9c}, Kind::dt, 1.0000f, "entity+f8+d9c"},
++    {Root::rig, 2, {0x2e90, 0xffc}, Kind::dt, 1.0000f, "rig+2e90+ffc"},
++    {Root::rig, 2, {0x2e98, 0xfac}, Kind::dt, 1.0000f, "rig+2e98+fac"},
++    {Root::rig, 2, {0x2e98, 0xfb0}, Kind::dt, -1.0000f, "rig+2e98+fb0"},
++    {Root::rig, 2, {0x2ea0, 0xf5c}, Kind::dt, 1.0000f, "rig+2ea0+f5c"},
++    {Root::rig, 2, {0x2ea0, 0xf60}, Kind::dt, -1.0000f, "rig+2ea0+f60"},
++    {Root::rig, 2, {0x2ea8, 0xf0c}, Kind::dt, 1.0000f, "rig+2ea8+f0c"},
++    {Root::rig, 2, {0x2ea8, 0xf10}, Kind::dt, -1.0000f, "rig+2ea8+f10"},
++    {Root::rig, 2, {0x2eb0, 0xebc}, Kind::dt, 1.0000f, "rig+2eb0+ebc"},
++    {Root::rig, 2, {0x2eb0, 0xec0}, Kind::dt, -1.0000f, "rig+2eb0+ec0"},
++    {Root::rig, 2, {0x2eb8, 0xe6c}, Kind::dt, 1.0000f, "rig+2eb8+e6c"},
++    {Root::rig, 2, {0x2eb8, 0xe70}, Kind::dt, -1.0000f, "rig+2eb8+e70"},
++    {Root::rig, 2, {0x2ec0, 0xe1c}, Kind::dt, 1.0000f, "rig+2ec0+e1c"},
++    {Root::rig, 2, {0x2ec0, 0xe20}, Kind::dt, -1.0000f, "rig+2ec0+e20"},
++    {Root::rig, 2, {0x2ec8, 0xdcc}, Kind::dt, 1.0000f, "rig+2ec8+dcc"},
++    {Root::rig, 2, {0x2ec8, 0xdd0}, Kind::dt, -1.0000f, "rig+2ec8+dd0"},
++    {Root::rig, 2, {0x2ed0, 0xd7c}, Kind::dt, 1.0000f, "rig+2ed0+d7c"},
++    {Root::rig, 2, {0x2ed0, 0xd80}, Kind::dt, -1.0000f, "rig+2ed0+d80"},
++    {Root::rig, 2, {0x2ed8, 0xd2c}, Kind::dt, 1.0000f, "rig+2ed8+d2c"},
++    {Root::rig, 2, {0x2ed8, 0xd30}, Kind::dt, -1.0000f, "rig+2ed8+d30"},
++    {Root::rig, 2, {0x2ee0, 0xcdc}, Kind::dt, 1.0000f, "rig+2ee0+cdc"},
++    {Root::rig, 2, {0x2ee0, 0xce0}, Kind::dt, -1.0000f, "rig+2ee0+ce0"},
++    {Root::rig, 2, {0x2ee8, 0xc8c}, Kind::dt, 1.0000f, "rig+2ee8+c8c"},
++    {Root::rig, 2, {0x2ee8, 0xc90}, Kind::dt, -1.0000f, "rig+2ee8+c90"},
++    {Root::rig, 2, {0x2ef0, 0xc3c}, Kind::dt, 1.0000f, "rig+2ef0+c3c"},
++    {Root::rig, 2, {0x2ef0, 0xc40}, Kind::dt, -1.0000f, "rig+2ef0+c40"},
++    {Root::rig, 2, {0x2ef8, 0xbec}, Kind::dt, 1.0000f, "rig+2ef8+bec"},
++    {Root::rig, 2, {0x2ef8, 0xbf0}, Kind::dt, -1.0000f, "rig+2ef8+bf0"},
++    {Root::rig, 1, {0x4624}, Kind::dt, 1.0000f, "rig+4624"},
++    {Root::rig, 1, {0x4640}, Kind::dt, 1.0000f, "rig+4640"},
++};
++
++bool write(std::uintptr_t address, float value) noexcept {
++    __try {
++        *reinterpret_cast<volatile float*>(address) = value;
++        return true;
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        return false;
++    }
++}
++
++std::uintptr_t root_of(const NoBailSkater& skater, Root root) noexcept {
++    switch (root) {
++    case Root::context: return skater.context;
++    case Root::core: return skater.core;
++    case Root::rig: return skater.rig;
++    case Root::entity: return skater.entity;
++    }
++    return 0;
++}
++
++// Where the field is now: its pointers followed. 0 when one of them is not there.
++std::uintptr_t address_of(const NoBailSkater& skater, const Field& field) noexcept {
++    std::uintptr_t at = root_of(skater, field.root);
++    for (std::uint8_t hop = 0; hop + 1 < field.hops; ++hop) {
++        std::uintptr_t next{};
++        if (!at || !memory::read(at + field.offset[hop], next) || next < 0x10000) return 0;
++        at = next;
++    }
++    return at ? at + field.offset[field.hops - 1] : 0;
++}
++}
++
++Outcome follow(const NoBailSkater& skater, float from, float to) noexcept {
++    Outcome outcome;
++    if (!std::isfinite(from) || !std::isfinite(to) || from < 1e-5f || to < 1e-5f || from == to) return outcome;
++    const double ratio = static_cast<double>(to) / from;
++    const double power_of_two = std::exp2(std::round(std::log2(ratio)));
++    for (const auto& field : fields) {
++        const auto address = address_of(skater, field);
++        float value{};
++        if (!address || !memory::read(address, value) || !std::isfinite(value)) {
++            ++outcome.missing;
++            continue;
++        }
++        double next{};
++        if (field.kind == Kind::dt) {
++            // As a build at `from` leaves it, to a thousandth.
++            const double built = static_cast<double>(field.times) * from;
++            const double wanted = static_cast<double>(field.times) * to;
++            if (std::fabs(value - wanted) <= 1e-3 * std::fabs(wanted)) {
++                ++outcome.already; // the game keeps this one with the step itself
++                continue;
++            }
++            if (std::fabs(value - built) > 1e-3 * std::fabs(built)) {
++                ++outcome.other;
++                continue;
++            }
++            next = static_cast<double>(field.times) * to;
++        } else {
++            int exponent{};
++            const double mantissa = std::frexp(static_cast<double>(value), &exponent);
++            if (mantissa != 0.5 || value > from) {
++                ++outcome.other;
++                continue;
++            }
++            next = value * power_of_two;
++        }
++        if (write(address, static_cast<float>(next))) {
++            ++outcome.changed;
++            try {
++                if (!outcome.written.empty()) outcome.written += ", ";
++                outcome.written += field.name;
++            } catch (...) {
++            }
++        } else {
++            ++outcome.missing;
++        }
++    }
++    return outcome;
++}
++}
+diff --git a/Extension/Skater/step_fields.h b/Extension/Skater/step_fields.h
+new file mode 100644
+index 0000000..c68db26
+--- /dev/null
++++ b/Extension/Skater/step_fields.h
+@@ -0,0 +1,28 @@
++#pragma once
++#include "Extension/Skater/no_bail.h"
++#include <cstddef>
++#include <string>
++
++// What skate. works out from a skater's physics step length when it builds the skater, kept up with a step changed
++// since. The game gives a skater its step when it builds it (at a spawn and at every teleport) and works out more
++// from it then: copies of the step in the board's and the skeleton's physics and in each of the skeleton's joints,
++// and limits of so many metres a step. Slow motion changes the step of a skater already built (game_speed.h), and
++// with only the step changed all of those stay as they were for the step it was built with: in play the board
++// slid sideways and lost speed, and the body went stiff, the more so the slower.
++//
++// Found by building the skater at full speed, at 0.05 and at 0.25 and comparing all of its memory
++// (state_dump::graph, ReTake's `retake skatertest`, 2026-11-07, two runs): the values the same in every build at
++// one speed, different between speeds, and in proportion to the step at all three. Each is written only when it
++// holds what a build at the old step would have given it, so a value that is something else by then (another
++// layout, a body the game rebuilt meanwhile) is left alone.
++namespace dingosdk::step_fields {
++struct Outcome {
++    std::size_t changed{}; // values written for the new step
++    std::size_t already{}; // values the game had already changed with the step itself
++    std::size_t other{};   // values not as a build at the old step leaves them: left alone
++    std::size_t missing{}; // values that could not be reached
++    std::string written;   // the names of those written, for the log
++};
++// Game update thread, as the skater's step changes from `from` to `to` seconds.
++Outcome follow(const NoBailSkater& skater, float from, float to) noexcept;
 +}
 diff --git a/Extension/Skater/virtual_time.cpp b/Extension/Skater/virtual_time.cpp
 new file mode 100644
@@ -2359,15 +2831,16 @@ index 284fb8e..958d8dd 100644
      set(crash_report_default_url "$ENV{RESKATE_CRASH_REPORT_URL}")
  endif()
 diff --git a/cmake/Runtime.cmake b/cmake/Runtime.cmake
-index e908ad3..ffc977a 100644
+index e908ad3..3b8bf5e 100644
 --- a/cmake/Runtime.cmake
 +++ b/cmake/Runtime.cmake
-@@ -157,6 +157,9 @@ add_library(dingosdk_runtime SHARED
+@@ -157,6 +157,10 @@ add_library(dingosdk_runtime SHARED
      Extension/Skater/layer_materials.cpp
      Extension/Skater/board_pose.cpp
      Extension/Skater/skater_physics.cpp
 +    Extension/Skater/motion_snapshot.cpp
 +    Extension/Skater/state_dump.cpp
++    Extension/Skater/step_fields.cpp
 +    Extension/Skater/virtual_time.cpp
      Extension/Skater/xray.cpp
      Extension/Skater/xray_render.cpp

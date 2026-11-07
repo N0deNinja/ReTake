@@ -21,6 +21,8 @@ struct Snapshot {
 };
 // False when a body could not be read or does not hold the layout expected.
 bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept;
+// Where the board's root is now (its world matrix's place), for checking a replay against its recording. False when unread.
+bool board_place(const NoBailSkater& skater, std::array<float, 3>& place) noexcept;
 // `skeleton`: the skeleton's bodies too, not only the board's. False when nothing was written.
 // A flight's path goes on at the speed of the skater's step: its frame time becomes `step`, and its frame count
 // the one that is the same time along the path. Nothing is written while they agree. Physics thread.

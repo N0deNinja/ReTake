@@ -46,4 +46,11 @@ float step_length() noexcept;
 // Game update thread: gives the local skater this physics step length. False while there is no local
 // skater.
 bool set_step_length(float seconds) noexcept;
+// With a step listener that calls apply_asked_step every physics step (the plugin runtime's), a step length set is put
+// in there instead, between two steps, just before the flight's path is matched to it (motion_snapshot.h): set from the
+// game update thread at any moment, a step could run in the air with the new length and the path at the old one, and
+// slow motion easing in, changing it ten times in a flight, flung the board from 11 to 48 m/s (2026-11-07).
+void apply_asks_on_steps(bool on) noexcept;
+// Physics thread, from that step listener: the step length set since, if any.
+void apply_asked_step(const NoBailSkater& skater) noexcept;
 }

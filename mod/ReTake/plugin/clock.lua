@@ -79,7 +79,37 @@ reskate.on("physics_step", function(e)
 
     local v = e.velocity
     local board_spin = e.board and e.board.spin
+    -- Which way the board faces, for a slide: its transform's first and third rows are axes across the deck
+    -- and along it (which one is the nose is not assumed), headings in degrees as the velocity's are.
+    local across, along, up_y
+    local bm = e.board and e.board.transform
+    if bm then
+        across = math.deg(math.atan2(bm[1], bm[3]))
+        along = math.deg(math.atan2(bm[9], bm[11]))
+        up_y = bm[6]
+    end
+    -- How far the pelvis is from the board: a body left behind by the board shows here.
+    local body_gap
+    local pelvis = poses and poses.Pelvis and poses.Pelvis.transform
+    if pelvis and x and src == "board" then body_gap = U.dist(pelvis[13], pelvis[14], pelvis[15], x, y, z) end
+    -- How fast the hands and forearms move against the pelvis, the fastest of them: a kick to the arms shows here.
+    local hand_speed
+    local pelvis_v = poses and poses.Pelvis and poses.Pelvis.velocity
+    if pelvis_v then
+        for _, name in {"Left hand", "Right hand", "Left forearm", "Right forearm"} do
+            local w = poses[name] and poses[name].velocity
+            if w then
+                hand_speed = math.max(hand_speed or 0, math.sqrt((w[1] - pelvis_v[1]) ^ 2 + (w[2] - pelvis_v[2]) ^ 2 + (w[3] - pelvis_v[3]) ^ 2))
+            end
+        end
+    end
     local sample = {
+        hand_speed = hand_speed,
+        across = across,
+        along = along,
+        up_y = up_y,
+        yaw_rate = board_spin and board_spin[2],
+        body_gap = body_gap,
         spin = board_spin and math.sqrt(board_spin[1] ^ 2 + board_spin[2] ^ 2 + board_spin[3] ^ 2),
         hash = e.hash,
         bhash = e.board_hash,

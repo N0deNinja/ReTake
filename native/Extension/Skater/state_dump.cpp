@@ -7,8 +7,11 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <deque>
+#include <format>
 #include <fstream>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace dingosdk::state_dump {
@@ -93,6 +96,69 @@ void on_step(const NoBailSkater& skater, std::size_t step) noexcept {
         add_block(out, number, 12, skater.entity, 0x800);
     } catch (...) {
     }
+}
+
+std::string graph(const NoBailSkater& skater, std::size_t most) {
+    std::vector<unsigned char> out;
+    out.reserve(most);
+    const char magic[4] = {'R', 'T', 'K', 'G'};
+    out.insert(out.end(), magic, magic + 4);
+    // Pointers into the game's image are its code and tables, the same in every dump: not followed.
+    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::uintptr_t image_end = image;
+    IMAGE_DOS_HEADER dos{};
+    IMAGE_NT_HEADERS64 headers{};
+    if (memory::read(image, dos) && memory::read(image + static_cast<std::uintptr_t>(dos.e_lfanew), headers))
+        image_end = image + headers.OptionalHeader.SizeOfImage;
+    struct Block {
+        std::string name;
+        std::uintptr_t address{};
+        std::uint32_t size{};
+        int depth{};
+    };
+    std::deque<Block> queue;
+    queue.push_back({"context", skater.context, 0x2000, 0});
+    queue.push_back({"core", skater.core, 0x4200, 0});
+    queue.push_back({"rig", skater.rig, 0x4700, 0});
+    queue.push_back({"entity", skater.entity, 0x800, 0});
+    queue.push_back({"base", skater.base, 0x800, 0});
+    // Known to hold what a build sets from the step (skater_state.h: the jump block's dt), whole.
+    const auto jump = pointer_at(skater.core + state::core_jump_block_offset);
+    queue.push_back({"core+3e8", jump, 0x2000, 1});
+    queue.push_back({"core+3e8+1100", pointer_at(jump + state::jump_block_request_offset), 0x200, 2});
+    queue.push_back({"core+308", pointer_at(skater.core + state::core_air_state_offset), 0x800, 1});
+    queue.push_back({"core+3c8", pointer_at(skater.core + body::core_step_input_offset), 0x200, 1});
+    std::unordered_set<std::uintptr_t> seen;
+    while (!queue.empty() && out.size() < most) {
+        auto block = std::move(queue.front());
+        queue.pop_front();
+        if (block.address < 0x10000 || !seen.insert(block.address).second) continue;
+        unsigned char probe[16];
+        if (!memory::read_bytes(block.address, probe, sizeof(probe))) continue;
+        const auto need = 2 + block.name.size() + 8 + 4 + block.size;
+        if (out.size() + need > most) continue;
+        append(out, static_cast<std::uint16_t>(block.name.size()));
+        out.insert(out.end(), block.name.begin(), block.name.end());
+        append(out, static_cast<std::uint64_t>(block.address));
+        append(out, block.size);
+        const auto at = out.size();
+        out.resize(at + block.size, 0xCD);
+        for (std::size_t done = 0; done < block.size; done += chunk) {
+            const auto length = std::min<std::size_t>(chunk, block.size - done);
+            (void)memory::read_bytes(block.address + done, out.data() + at + done, length);
+        }
+        if (block.depth >= 2) continue;
+        for (std::uint32_t offset = 0; offset + 8 <= block.size; offset += 8) {
+            std::uint64_t value{};
+            std::memcpy(&value, out.data() + at + offset, sizeof(value));
+            if (value < 0x10000 || value > memory::highest_user_address || (value & 7) != 0) continue;
+            if ((value >= image && value < image_end) || (value >= block.address && value < block.address + block.size)) continue;
+            if (seen.contains(value)) continue;
+            queue.push_back({std::format("{}+{:x}", block.name, offset), static_cast<std::uintptr_t>(value), block.depth == 0 ? 0x1000u : 0x400u,
+                             block.depth + 1});
+        }
+    }
+    return std::string(reinterpret_cast<const char*>(out.data()), out.size());
 }
 
 std::string save(const std::filesystem::path& file) {

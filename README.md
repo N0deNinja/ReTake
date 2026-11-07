@@ -15,7 +15,7 @@
 </p>
 
 > [!WARNING]
-> **This is version 0.0.2, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
+> **This is version 0.0.3, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
 
 ![How ReTake works, step by step](docs/how-it-works.jpg)
 
@@ -26,7 +26,7 @@ You skate a line. ReTake records it. When you mess up, open the timeline, pick a
 - **Timeline (F11).** Slows the game down and shows your whole line. Scrub it and a ghost skater shows where you were.
 - **Replay from here.** Fast-forwards your line to the moment you picked, slows down, counts 3, 2, 1, and you're back in.
 - **Play whole line.** Plays every retake back as one run, at full speed.
-- **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate.
+- **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate. The skater rides in it just as at full speed.
 - **Bails off.** One switch so you don't fall off from big drops.
 - **Stop all.** One button that stops everything ReTake is doing.
 - **Report a problem.** Write what went wrong; ReTake saves it in a file with the last 30 seconds of the game, for us to look at.
@@ -40,7 +40,7 @@ You need:
 
 Then:
 
-1. Download **`ReTake-v0.0.2.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
+1. Download **`ReTake-v0.0.3.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
 2. Close skate. and the ReSkate launcher.
 3. Double-click **`Install ReTake.bat`**.
    It finds your game on its own (or lets you pick the folder), backs up your `ReSkate.dll`, installs ReTake, and asks to turn off the launcher's automatic updates.
@@ -120,7 +120,12 @@ retake stop               stop everything ReTake is doing
 retake off                stop recording and forget the line
 retake report             report a problem: write what went wrong, saved with the game's state
 retake files              open ReTake's log folder
+retake ease [on|off]      speed changes ease in (on, the default) or happen at once
+retake slowtest [m:ss]    test slow motion at that moment of the line (replaces what comes after)
+retake skatertest         stand still: the skater is rebuilt at full speed and in slow motion, and saved each time
 ```
+
+The last two are for tracking down bugs; you won't need them to skate.
 
 ## Known issues
 
@@ -153,9 +158,9 @@ cd ..
 powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
 ```
 
-That writes `dist\ReTake-v0.0.2.zip`.
+That writes `dist\ReTake-v0.0.3.zip`.
 
-ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that rescales the board's flight so it works mid-air, a no-bail switch, sharper plugin fonts, and **no crash reports**: this build never uploads anything.
+ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that keeps the skater as the game would build it at the shorter step (the board's flight, the joints and everything else worked out from the step length) so it rides the same, a no-bail switch, sharper plugin fonts, and **no crash reports**: this build never uploads anything.
 
 ## Credits and licence
 

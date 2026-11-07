@@ -160,6 +160,8 @@ struct TasStatus {
     std::size_t since_spawn{}; // physics steps since the skater was last built (a spawn, a teleport)
     bool virtual_time{};       // the clock is driven by the physics steps
     std::uint64_t clock_reads{}; // reads of the clock the hook has seen
+    float replay_off{};          // the last run up: the most the board was from its recording before a step was put back, m
+    std::size_t replay_off_at{}; // and at which step
 };
 // A line: one recording from a standing start that can go back to any step of it (reskate.tas.line).
 struct TasLine {
@@ -1137,6 +1139,11 @@ public:
     // `text`, then the line's every step (the controller as recorded, where the board was), to `path` in the
     // plugin's data folder: a bug report, larger than a plugin's own files may be.
     virtual std::string tas_line_save(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*text*/) { return unavailable; }
+    // Research: the local skater's memory as far as it reaches (Extension/Skater/state_dump.h graph), to `path` in
+    // the plugin's data folder.
+    virtual std::string tas_skater_dump(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
+    // How the last skater dump went: "writing", "saved", why it failed, or empty before the first.
+    virtual std::string tas_skater_dump_status() { return {}; }
     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
     // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
     virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }

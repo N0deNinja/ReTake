@@ -159,6 +159,7 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/skater_physics.cpp
     Extension/Skater/motion_snapshot.cpp
     Extension/Skater/state_dump.cpp
+    Extension/Skater/step_fields.cpp
     Extension/Skater/virtual_time.cpp
     Extension/Skater/xray.cpp
     Extension/Skater/xray_render.cpp

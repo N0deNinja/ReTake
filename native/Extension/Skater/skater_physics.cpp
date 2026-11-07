@@ -1,4 +1,5 @@
 #include "skater_physics.h"
+#include "step_fields.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/addresses.h"
@@ -246,16 +247,68 @@ float step_length() noexcept {
     return address && memory::peek(address, seconds) ? seconds : 0.0f;
 }
 
-bool set_step_length(float seconds) noexcept {
-    const auto address = step_length_address();
-    float current{};
-    if (!address || !memory::peek(address, current)) return false;
-    if (current == seconds) return true;
+namespace {
+bool write_step(std::uintptr_t address, float seconds) noexcept {
     __try {
         *reinterpret_cast<volatile float*>(address) = seconds; // read by the physics thread each step
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+}
+
+namespace {
+// A step length asked for while a step listener puts asks in (0: none), and whether one does.
+std::atomic<float>& asked_step() {
+    static std::atomic<float> value{0.0f};
+    return value;
+}
+std::atomic<bool>& asks_on_steps() {
+    static std::atomic<bool> value{};
+    return value;
+}
+
+// The step put in, and what the skater's build worked out from its step (step_fields.h) with it, so the skater is as
+// one built at this step.
+bool put_in(const NoBailSkater& skater, std::uintptr_t address, float seconds) noexcept {
+    float current{};
+    if (!address || !memory::peek(address, current)) return false;
+    if (current == seconds) return true;
+    if (!write_step(address, seconds)) return false;
+    const auto outcome = step_fields::follow(skater, current, seconds);
+    try {
+        logging::log(logging::Level::info, logging::Channel::skater,
+            "Physics step {} -> {} s: {} values the skater was built with made to follow it ({}), {} already had, {} were neither, {} not found.",
+            current, seconds, outcome.changed, outcome.written, outcome.already, outcome.other, outcome.missing);
+    } catch (...) {
+    }
+    return true;
+}
+}
+
+bool set_step_length(float seconds) noexcept {
+    const auto address = step_length_address();
+    if (!address) return false;
+    if (asks_on_steps().load(std::memory_order_acquire)) {
+        // Put in at the next physics step, between two steps, with the flight's path (apply_asked_step).
+        asked_step().store(seconds, std::memory_order_release);
+        return true;
+    }
+    NoBailSkater skater;
+    if (!no_bail_skater(skater)) return false;
+    return put_in(skater, address, seconds);
+}
+
+void apply_asks_on_steps(bool on) noexcept {
+    asks_on_steps().store(on, std::memory_order_release);
+}
+
+void apply_asked_step(const NoBailSkater& skater) noexcept {
+    const float seconds = asked_step().exchange(0.0f, std::memory_order_acq_rel);
+    if (!(seconds > 0.0f)) return;
+    std::uintptr_t input{};
+    if (!memory::peek(skater.core + body::core_step_input_offset, input) || !input) return;
+    (void)put_in(skater, input + body::step_input_length_offset, seconds);
 }
 }

@@ -46,8 +46,8 @@ local now_line = {phase = "off", step = 0, length = 0}
 local last_tick_at = nil
 local drift = nil -- {most=, at=, rows=}: how far a replay is from the recording, while it plays
 
-local STEP_HEAD = "t\tdt\tx\ty\tz\tvx\tvy\tvz\tspeed\tstate\tair\twipe\trag\tsrc\thash\tboard_hash\tphase\tline_step\tline_length"
-local TICK_HEAD = "ms\tframe_ms\tphase\tline_step\tline_length\tsince_spawn\tslowed\tclock\tgame_speed\ttimeline\tcounting\tgoing_to\tx\ty\tz\tspeed\tair\tdrift_m\tlx\tly\trx\try\tlt\trt\tbuttons"
+local STEP_HEAD = "t\tdt\tx\ty\tz\tvx\tvy\tvz\tspeed\tstate\tair\twipe\trag\tsrc\thash\tboard_hash\tphase\tline_step\tline_length\theading\tacross\talong\tup_y\tyaw_rate\tbody_gap\thand_speed"
+local TICK_HEAD = "ms\tframe_ms\tphase\tline_step\tline_length\tsince_spawn\tslowed\tclock\tgame_speed\ttimeline\tcounting\tgoing_to\tx\ty\tz\tspeed\tair\tdrift_rough_m\tlx\tly\trx\try\tlt\trt\tbuttons\thand_speed_most\tbody_gap"
 local BUTTONS = {{"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"}, {"lb", "LB"}, {"rb", "RB"}, {"left_stick", "L3"}, {"right_stick", "R3"},
     {"up", "U"}, {"down", "D"}, {"left", "L"}, {"right", "R"}, {"start", "ST"}, {"back", "BK"}}
 
@@ -59,12 +59,15 @@ local function flag(value)
     return value and "1" or "0"
 end
 
+local hand_most = nil -- the hands' fastest against the pelvis since the last frame's row
 C.listen(function(s)
-    local speed = s.vx and math.sqrt(s.vx ^ 2 + (s.vy or 0) ^ 2 + (s.vz or 0) ^ 2)
+    if s.hand_speed then hand_most = math.max(hand_most or 0, s.hand_speed) end
+    local speed =s.vx and math.sqrt(s.vx ^ 2 + (s.vy or 0) ^ 2 + (s.vz or 0) ^ 2)
     push(steps, table.concat({
         string.format("%.4f", s.t), string.format("%.5f", s.dt or 0), n3(s.x), n3(s.y), n3(s.z), n3(s.vx), n3(s.vy), n3(s.vz), n3(speed),
         tostring(s.state or ""), flag(s.air), flag(s.wipe), flag(s.rag), tostring(s.src or ""), tostring(s.hash or ""), tostring(s.bhash or ""),
         now_line.phase, tostring(now_line.step), tostring(now_line.length),
+        s.vx and n3(math.deg(math.atan2(s.vx, s.vz or 0))) or "", n3(s.across), n3(s.along), n3(s.up_y), n3(s.yaw_rate), n3(s.body_gap), n3(s.hand_speed),
     }, "\t"))
 end)
 
@@ -80,7 +83,9 @@ local function pad_text(pad)
         table.concat(pressed, "+")}
 end
 
--- How far the skater is from where the recording had the board at the same step, while a replay plays.
+-- Roughly how far the skater is from where the recording had the board, while a replay plays: this frame's last step
+-- against the recording at the line's step as this frame read it, which can be a step or two apart, a metre or more at
+-- speed. The report's catch-up line takes ReSkate.dll's own measure instead (tas.status().replay_off), exact to the step.
 local function replay_drift(line)
     local s = C.last
     if line.phase ~= "running_up" or not s or not s.x or s.src ~= "board" then return nil end
@@ -102,7 +107,13 @@ local function record(now)
         drift.rows += 1
         if gap > drift.most then drift.most, drift.at = gap, line.step end
     elseif drift and line.phase ~= "running_up" then
-        R.line(string.format("[report] the replay was at most %.2f m from the recording (at step %d, %d frames measured)", drift.most, drift.at, drift.rows))
+        local status = reskate.tas.status()
+        if status.replay_off then
+            R.line(string.format("[report] the replay was at most %.3f m from the recording before a step was put back (at step %d)",
+                status.replay_off, status.replay_off_at or 0))
+        else
+            R.line(string.format("[report] the replay was at most %.2f m from the recording, roughly (at step %d, %d frames measured)", drift.most, drift.at, drift.rows))
+        end
         drift = nil
     end
     local pad = live.pad ~= nil and reskate.input.gamepad(live.pad) or nil
@@ -113,6 +124,10 @@ local function record(now)
         n3(p and p.x), n3(p and p.y), n3(p and p.z), n3(skater and skater.speed), skater and flag(skater.airborne) or "", gap and string.format("%.3f", gap) or "",
     }
     for _, value in pad_text(pad) do table.insert(row, value) end
+    -- The arms over the steps since the last frame: at full speed one or two, slowed one or none.
+    table.insert(row, n3(hand_most))
+    table.insert(row, n3(C.last and C.last.body_gap))
+    hand_most = nil
     push(ticks, table.concat(row, "\t"))
     last_tick_at = now
 end

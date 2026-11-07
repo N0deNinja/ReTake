@@ -28,6 +28,7 @@
 #include "Engine/Vfs/mod_catalog.h"
 #include "Engine/Core/Log/logging.h"
 #include <mutex>
+#include <thread>
 #include "Extension/Assets/live_mods.h"
 #include "Extension/Skater/game_speed.h"
 #include "Extension/Skater/motion_snapshot.h"
@@ -1106,6 +1107,10 @@ public:
         std::atomic<bool> capture_wanted{}, captured{};
         std::atomic<int> restore_wanted{};  // a TasRestore
         std::atomic<std::size_t> restores{};
+        // A run up, checked against its recording: before each step is put back, how far the board had gone from where
+        // the recording had it then (the step's own error, with no lag between the two), the most and its step.
+        std::atomic<float> replay_off{};
+        std::atomic<std::size_t> replay_off_at{};
         std::atomic<std::size_t> since_spawn{};
         // Every step of the recording, and whether a playing is held to them. The physics thread's: a run
         // always begins from a step of it (tas_wait).
@@ -1234,6 +1239,8 @@ public:
             // At the same step of the skater's life as when the line began.
             if (since >= m.line_at.load(std::memory_order_acquire)) {
                 m.locked = true;
+                m.replay_off.store(0.0f, std::memory_order_relaxed);
+                m.replay_off_at.store(0, std::memory_order_relaxed);
                 script.run_up(m.line_from.load(std::memory_order_acquire), m.line_to.load(std::memory_order_acquire), m.line_hand_over.load(std::memory_order_acquire));
                 m.line.store(Line::running_up, std::memory_order_release);
             }
@@ -1339,6 +1346,7 @@ public:
                 m.loads.fetch_add(1, std::memory_order_relaxed);
         }
         tas_step_history(m, skater, since);
+        skater_physics::apply_asked_step(skater); // a step length asked for, put in with the flight's path just below
         motion_snapshot::match_flight_step(skater, skater_physics::step_length());
         try {
             if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off && multiplayer_session_active()) tas_line_off(m); // never a held skater in a session
@@ -1365,6 +1373,15 @@ public:
                 m.frames.emplace_back();
                 (void)motion_snapshot::capture(skater, m.frames.back());
             } else if (script.mode == input::StepScript::Mode::playing && m.locked && script.step < m.frames.size()) {
+                std::array<float, 3> now{};
+                if (script.step > 0 && motion_snapshot::board_place(skater, now)) {
+                    const auto& t = m.frames[script.step].board[0].transform;
+                    const float off = std::sqrt((now[0] - t[12]) * (now[0] - t[12]) + (now[1] - t[13]) * (now[1] - t[13]) + (now[2] - t[14]) * (now[2] - t[14]));
+                    if (std::isfinite(off) && off > m.replay_off.load(std::memory_order_relaxed)) {
+                        m.replay_off.store(off, std::memory_order_relaxed);
+                        m.replay_off_at.store(script.step, std::memory_order_relaxed);
+                    }
+                }
                 if (motion_snapshot::restore(skater, m.frames[script.step], true)) m.restores.fetch_add(1, std::memory_order_relaxed);
             }
             input::step_script().step();
@@ -1390,6 +1407,7 @@ public:
         if (!allowed) return "the game does not have gameplay input";
         if (!listening.load(std::memory_order_acquire)) {
             if (!add_no_bail_step_listener(&tas_on_step)) return "the skater's physics steps are unavailable";
+            skater_physics::apply_asks_on_steps(true); // tas_on_step puts step lengths in from now on
             listening.store(true, std::memory_order_release);
         }
         return {};
@@ -1585,6 +1603,53 @@ public:
         out += "== end of the line ==\n";
         return files_write_bytes(plugin, path, out, line_save_most_bytes);
     }
+    // A dump reads thousands of blocks and writes 8 MB: far past a plugin call's 50 ms, so it runs on a thread of its
+    // own, one at a time, and the plugin asks how it went (tas_skater_dump_status).
+    struct SkaterDump {
+        std::mutex mutex;
+        bool running{};
+        std::string outcome; // "saved", or why not; empty before the first
+    };
+    static SkaterDump& skater_dump_state() {
+        static auto* value = new SkaterDump; // a thread may still be writing at exit
+        return *value;
+    }
+    std::string tas_skater_dump(std::string_view plugin, std::string_view path) override {
+        if (multiplayer_session_active()) return "never in a multiplayer session";
+        NoBailSkater skater;
+        if (!no_bail_skater(skater)) return "there is no skater to read";
+        std::filesystem::path root, file;
+        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
+        auto& state = skater_dump_state();
+        {
+            std::lock_guard lock(state.mutex);
+            if (state.running) return "a skater dump is still being written";
+            state.running = true;
+            state.outcome.clear();
+        }
+        std::thread([skater, file] {
+            std::string outcome = "saved";
+            try {
+                const auto bytes = state_dump::graph(skater, line_save_most_bytes);
+                std::error_code error;
+                std::filesystem::create_directories(file.parent_path(), error);
+                std::ofstream out(file, std::ios::binary | std::ios::trunc);
+                if (error || !out || !out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()))) outcome = "the file cannot be written";
+            } catch (...) {
+                outcome = "the skater could not be read";
+            }
+            auto& done = skater_dump_state();
+            std::lock_guard lock(done.mutex);
+            done.outcome = std::move(outcome);
+            done.running = false;
+        }).detach();
+        return {};
+    }
+    std::string tas_skater_dump_status() override {
+        auto& state = skater_dump_state();
+        std::lock_guard lock(state.mutex);
+        return state.running ? std::string("writing") : state.outcome;
+    }
     std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
         auto& m = tas_motion();
         std::lock_guard lock(m.frames_mutex);
@@ -1609,7 +1674,8 @@ public:
         }
         const char* mode = waiting ? "waiting" : s.mode == input::StepScript::Mode::recording ? "recording" : s.mode == input::StepScript::Mode::playing ? "playing" : "off";
         return {mode, s.step, s.length, s.stopped, tas_motion().captured.load(std::memory_order_acquire), tas_motion().restores.load(std::memory_order_relaxed),
-            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads()};
+            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads(),
+            tas_motion().replay_off.load(std::memory_order_relaxed), tas_motion().replay_off_at.load(std::memory_order_relaxed)};
     }
     std::string tas_save(unsigned slot) override {
         if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;

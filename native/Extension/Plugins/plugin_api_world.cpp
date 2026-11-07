@@ -3174,6 +3174,23 @@ struct WorldApi {
         const char* text = luaL_optlstring(L, 2, "", &length);
         return result(L, game(plugin).tas_line_save(plugin.id(), path, std::string_view(text, length)));
     }
+    // tas.skater_dump(path): research, the local skater's memory as far as it reaches, to a file in the plugin's data
+    // folder, up to 8 MB: skaters built at different step lengths, compared, show what the build works out from it.
+    static int tas_skater_dump(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.skater_dump");
+        need(L, plugin, "files", "reskate.tas.skater_dump");
+        const auto path = data_path(L, 1, false);
+        return result(L, game(plugin).tas_skater_dump(plugin.id(), path));
+    }
+    // tas.skater_dump_status(): the dump is written in the background: "writing", "saved", why it failed, or "".
+    static int tas_skater_dump_status(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.skater_dump_status");
+        const auto status = game(plugin).tas_skater_dump_status();
+        lua_pushlstring(L, status.data(), status.size());
+        return 1;
+    }
     static int tas_stop(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "tas", "reskate.tas.stop");
@@ -3189,6 +3206,10 @@ struct WorldApi {
         lua_setfield(L, -2, "virtual_time");
         lua_pushnumber(L, static_cast<double>(s.clock_reads));
         lua_setfield(L, -2, "clock_reads");
+        lua_pushnumber(L, static_cast<double>(s.replay_off));
+        lua_setfield(L, -2, "replay_off");
+        lua_pushnumber(L, static_cast<double>(s.replay_off_at));
+        lua_setfield(L, -2, "replay_off_at");
         lua_pushnumber(L, static_cast<double>(s.since_spawn));
         lua_setfield(L, -2, "since_spawn");
         lua_pushnumber(L, static_cast<double>(s.unread));
@@ -3560,7 +3581,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
     add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
         {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
         {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}});
+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status}});
     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
     add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                   {"ready", entities_ready}, {"blueprints", entities_blueprints},

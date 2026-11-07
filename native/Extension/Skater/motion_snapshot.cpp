@@ -78,6 +78,14 @@ template <std::size_t N> bool write_group(std::uintptr_t bodies, const std::arra
 }
 }
 
+bool board_place(const NoBailSkater& skater, std::array<float, 3>& place) noexcept {
+    Holders at;
+    std::array<float, 16> transform{};
+    if (!holders(skater, at) || !memory::peek(at.board + body::body_transform_offset, transform)) return false;
+    place = {transform[12], transform[13], transform[14]};
+    return std::isfinite(place[0]) && std::isfinite(place[1]) && std::isfinite(place[2]);
+}
+
 bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept {
     snapshot.valid = false;
     Holders at;

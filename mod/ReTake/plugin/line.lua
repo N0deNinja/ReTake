@@ -13,8 +13,7 @@ local START_STEP = 180 -- steps after the teleport a line starts, and every goin
 local COUNT_MS = 3000
 local HINT_MS = 8000
 local SLOW = 0.05       -- the timeline on the ground: smooth slow motion, the steps shorter
-local COUNT_CLOCK = 0.05 -- a countdown in a flight on the board: the clock alone, so its step stays right. Three steps a second
-local AIR_SOON_STEPS = 18 -- a countdown just before a takeoff counts as in a flight: it would change the step mid-flight
+local AIR_SOON_STEPS = 18 -- a moment just before a takeoff, noted in a report
 local LAST_RUN_STEPS = 60 -- the last of a catch-up runs at full speed
 local GO_MS = 800
 local MARK_EVERY = 6
@@ -45,6 +44,13 @@ local go_until = -math.huge
 local previous_phase = "off"
 local filming = nil -- {rows=, joins=}, while the whole line plays
 local probe = nil   -- {rows=, to=, go=}: the steps around a join, for the report
+-- The slow-motion test: the same moment of the line, taken over again and again, the countdown's slowing down
+-- at a different speed each time and the controller held as recorded throughout, so only the speed differs.
+local TEST_SPEEDS = {1, 0.5, 0.25, 0.1, 0.05}
+local TEST_SLOW_STEPS = 9 -- game time slowed: what the countdown's 3 s at 0.05 is (9 steps of 1/60 s)
+local TEST_STEPS = 60     -- each take, one second of game time from the moment
+local TEST_ROWS = 6000
+local test = nil -- {to=, index=, run=, results=, rows=, seek_at=, tries=}
 local player = nil  -- the timeline: {cursor=, dragging=, left=, confirm=, f11=, enter=, repeat_at=, ghost=, shown=, dir=}
 local closed_at = -math.huge
 local listen_at = -math.huge
@@ -53,11 +59,65 @@ local hint_text = "Start a line"
 local hint_until = U.now() + HINT_MS
 local width, height = 1920, 1080
 
+-- The speed changes by a quarter a tick at most (0.05 to 1 in about ten ticks) rather than all at once. Back to full
+-- speed at once, a step twenty times longer than the one before, the skater's arms were flung back as the controller
+-- came back (2026-11-07, in play; slowing down at once did nothing like it). Slowing down eases too. Going back is at
+-- once (`gently` false): it teleports, and the skater is built with the step it has then. `retake ease` switches the
+-- easing off and on, to compare.
+local EASE = 0.75
+local ease_on = true
+local eased_speed = 1 -- what the game runs at now; applied_speed is where it is going
+local ease_up = false -- speeding up eases too, this time
+
+-- In a flight on the board, the speed changes in one go: each change of step mid-flight is one more step of the flight's
+-- path to match, and easing in made ten of them (the board flung from 11 to 48 m/s, 2026-11-07).
+local function flying()
+    local state = C.last and C.last.state
+    return state == 200 or state == 201
+end
+
+local function set_speed(speed, gently)
+    applied_speed = speed
+    ease_up = gently == true
+    if flying() then
+        eased_speed = speed
+    elseif ease_on and speed < eased_speed then
+        eased_speed = math.max(speed, eased_speed * EASE)
+    elseif ease_on and ease_up and speed > eased_speed then
+        eased_speed = math.min(speed, eased_speed / EASE)
+    else
+        eased_speed = speed
+    end
+    return reskate.time.slow(eased_speed)
+end
+
+-- Once a tick: on towards the speed asked for.
+local function ease_tick()
+    if eased_speed ~= applied_speed and flying() then
+        eased_speed = applied_speed -- taking off mid-ease: the rest in one go
+        reskate.time.slow(eased_speed)
+    elseif eased_speed > applied_speed then
+        eased_speed = math.max(applied_speed, eased_speed * EASE)
+        reskate.time.slow(eased_speed)
+    elseif eased_speed < applied_speed then
+        eased_speed = ease_on and ease_up and math.min(applied_speed, eased_speed / EASE) or applied_speed
+        reskate.time.slow(eased_speed)
+    end
+end
+
+-- `on` true or false sets it; nil only says. Either way, what it is now.
+function L.ease(on)
+    if on ~= nil and on ~= ease_on then
+        ease_on = on
+        R.line(ease_on and "[line] speed changes ease in" or "[line] speed changes are at once")
+    end
+    return ease_on
+end
+
 local function slow_down(on)
     slowed = on
     reskate.tas.line_paused(on)
-    applied_speed = on and SLOW or 1
-    return reskate.time.slow(applied_speed)
+    return set_speed(on and SLOW or 1)
 end
 
 local function set_clock(scale)
@@ -77,6 +137,14 @@ end
 local function full_speed()
     set_clock(1)
     return slow_down(false)
+end
+
+-- Back to full speed with the skater riding on: eased up, as the countdown ends or slow motion goes off.
+local function ride_on()
+    set_clock(1)
+    slowed = false
+    reskate.tas.line_paused(false)
+    return set_speed(1, true)
 end
 
 local function find_pad()
@@ -172,8 +240,8 @@ local function seek(to, hand_over, retries)
     if hand_over then
         R.line(string.format("[line] back to %s of %s", clock_text(to), clock_text(line.length)))
         forget_after(to)
-        if to > 0 then table.insert(joins, to) end
-        probe = {rows = {}, to = to}
+        if to > 0 and not test then table.insert(joins, to) end
+        probe = not test and {rows = {}, to = to} or nil
         filming = nil
     else
         R.line(string.format("[line] playing the whole line, %s, %d joins", clock_text(to), #joins))
@@ -184,12 +252,13 @@ local function seek(to, hand_over, retries)
 end
 
 -- Slowed right down: 3, 2, 1, then full speed and the controller is yours.
-local function count_down(flying)
-    -- From the timeline it is already slow, in its way. Else smooth slow motion, but for a flight.
+-- Always smooth slow motion, in a flight too: the skater follows the shorter step (ReSkate.dll's step_fields and its
+-- flight path, match_flight_step), so the countdown no longer drops to the clock alone, three frames a second.
+local function count_down()
+    -- From the timeline it is already slow, in its way.
     reskate.tas.line_paused(true)
     if not slowed and clock_now == 1 then
-        local ok, why
-        if flying then ok, why = set_clock(COUNT_CLOCK) else ok, why = slow_down(true) end
+        local ok, why = slow_down(true)
         if not ok then
             reskate.log("[line] the game would not slow down: " .. tostring(why))
             reskate.tas.line_paused(false)
@@ -199,6 +268,156 @@ local function count_down(flying)
     end
     reskate.tas.line_hold()
     count = {ends = U.now() + COUNT_MS, began = U.now(), ticks = 0, how = clock_now ~= 1 and "clock" or "slow motion"}
+end
+
+-- The slow-motion test's arithmetic: headings in degrees, differences folded into -180 to 180.
+local function wrap(degrees)
+    return (degrees + 180) % 360 - 180
+end
+
+-- How far the travel is from the board's axis, either end of it: 0 rolling straight, 90 fully sideways.
+local function slip(travel, axis)
+    local off = math.abs(wrap(travel - axis))
+    return off > 90 and 180 - off or off
+end
+
+local function heading_of(s)
+    return math.deg(math.atan2(s.vx, s.vz))
+end
+
+local function flat_speed(s)
+    return math.sqrt(s.vx ^ 2 + s.vz ^ 2)
+end
+
+-- Finished or stopped: the results file, a line each take in the log, the controller back to the player.
+local function test_end(why)
+    local t = test
+    test = nil
+    if not t then return end
+    full_speed()
+    reskate.tas.line_paused(false)
+    if line.phase == "live" then reskate.tas.line_go() end
+    local lines = {}
+    local base = t.results[1]
+    for _, r in t.results do
+        local text = string.format("%.2fx: in the first 0.15 s the travel turned %+.1f deg and the board %+.1f deg, %.1f to %.1f m/s, slip at most %.1f deg, body gap at most %.2f m",
+            r.speed, r.travel_turn, r.board_turn, r.speed_in, r.speed_mid, r.slip_most, r.gap_most)
+        if base and r ~= base then
+            text ..= string.format("; a second on, %.2f m from the 1x take, heading %+.1f deg, speed %+.1f m/s",
+                U.dist(r.last.x, r.last.y, r.last.z, base.last.x, base.last.y, base.last.z),
+                wrap(heading_of(r.last) - heading_of(base.last)), flat_speed(r.last) - flat_speed(base.last))
+        end
+        table.insert(lines, text)
+    end
+    local head = {"# ReTake slow-motion test at " .. clock_text(t.to) .. (why and (": stopped, " .. why) or "")}
+    for _, text in lines do table.insert(head, "# " .. text) end
+    table.insert(head, "speed\tslowed\tstep\tt\tdt\tx\ty\tz\tvx\tvy\tvz\theading\tacross\talong\tup_y\tyaw_rate\tbody_gap\tstate\tair")
+    local name = "results/slowtest-" .. os.date("%Y%m%d-%H%M%S") .. ".tsv"
+    R.data(name, table.concat(head, "\n") .. "\n" .. table.concat(t.rows, "\n") .. "\n")
+    R.line(string.format("[slowtest] at %s, %d takes%s, saved in %s", clock_text(t.to), #t.results, why and (", stopped: " .. why) or "", name))
+    for _, text in lines do R.line("[slowtest] " .. text) end
+    R.flush()
+    reskate.console.print("ReTake: slow-motion test " .. (why and ("stopped: " .. why) or "done") .. ". " .. name)
+    for _, text in lines do reskate.console.print("  " .. text) end
+    hint_until = U.now() + HINT_MS
+    hint_text = "Slow-motion test saved.  F11: timeline"
+end
+
+-- At the moment again: the next take. Slowed as the countdown slows, for its 9 steps, then full speed;
+-- the controller held as recorded all the while.
+local function test_begin()
+    local speed = TEST_SPEEDS[test.index]
+    reskate.tas.line_paused(true)
+    if speed < 1 then
+        slowed = true
+        local ok, why = set_speed(speed) -- eased as the countdown is, so the take is what the player gets
+        if not ok then return test_end("the game would not slow down to " .. speed .. ": " .. tostring(why)) end
+    end
+    reskate.tas.line_hold()
+    test.run = {speed = speed, from = line.step, t0 = C.sim_t, slow = speed < 1}
+end
+
+-- One take's numbers, once it has run its second.
+local function test_take_done()
+    local r = test.run
+    test.run = nil
+    if r.first and r.mid and r.last then
+        table.insert(test.results, {speed = r.speed, last = r.last,
+            travel_turn = wrap(heading_of(r.mid) - heading_of(r.first)),
+            board_turn = r.mid[r.axis] and r.first[r.axis] and wrap(r.mid[r.axis] - r.first[r.axis]) or 0,
+            speed_in = flat_speed(r.first), speed_mid = flat_speed(r.mid), slip_most = r.slip_most or 0, gap_most = r.gap_most or 0})
+    end
+    test.index += 1
+    if test.index > #TEST_SPEEDS then return test_end() end
+    full_speed()
+    test.seek_at, test.tries = U.now(), 0
+end
+
+-- The steps of a take, every one of them.
+local function test_step(s)
+    local r = test and test.run
+    if not r or not s.x or not s.vx or line.phase ~= "live" then return end
+    if not r.first then
+        r.first = s
+        -- Which axis the board rolls along: the one the travel is nearer to as the take begins.
+        if s.along and s.across then r.axis = slip(heading_of(s), s.along) <= slip(heading_of(s), s.across) and "along" or "across" end
+    end
+    if line.step - r.from <= TEST_SLOW_STEPS then r.mid = s end
+    r.last = s
+    if r.axis and s[r.axis] and flat_speed(s) > 1 then r.slip_most = math.max(r.slip_most or 0, slip(heading_of(s), s[r.axis])) end
+    if s.body_gap then r.gap_most = math.max(r.gap_most or 0, s.body_gap) end
+    if #test.rows < TEST_ROWS then
+        local function f(value) return value and string.format("%.4f", value) or "" end
+        table.insert(test.rows, table.concat({tostring(r.speed), r.slow and "1" or "0", tostring(line.step - r.from), f(C.sim_t - r.t0), f(s.dt),
+            f(s.x), f(s.y), f(s.z), f(s.vx), f(s.vy), f(s.vz), f(heading_of(s)), f(s.across), f(s.along), f(s.up_y), f(s.yaw_rate), f(s.body_gap),
+            tostring(s.state or ""), s.air and "1" or "0"}, "\t"))
+    end
+end
+
+-- Once a tick while a test runs: going back for the next take, the slowing down ended on time, a take finished.
+local function test_tick(now)
+    if not test then return end
+    if not test.run then
+        if test.seek_at and now >= test.seek_at and not pending then
+            local ok, why = seek(test.to, true)
+            if ok then
+                test.seek_at = nil
+            else
+                test.tries += 1
+                if test.tries > 6 then return test_end("could not go back: " .. tostring(why)) end
+                test.seek_at = now + 600
+            end
+        end
+        return
+    end
+    if line.phase ~= "live" then return test_end("the line stopped (" .. line.phase .. ")") end
+    local done = line.step - test.run.from
+    if test.run.slow and done >= TEST_SLOW_STEPS then
+        test.run.slow = false
+        ride_on() -- as the countdown ends
+    end
+    if done >= TEST_STEPS then test_take_done() end
+end
+
+-- retake slowtest [time]: the test at that moment of the line (default 2 s before its end). Everything after
+-- the moment is thrown away, as a retake does.
+function L.slow_test(at)
+    if U.in_session() then return false, "ReTake is offline only" end
+    if test then return false, "a slow-motion test is already running" end
+    if not start then return false, "no line is recorded" end
+    if line.phase ~= "live" or line.length == 0 then return false, "record a line first, riding straight at the moment to test" end
+    local to = at and math.floor(at * STEPS + 0.5) or line.length - 2 * STEPS
+    if to < 1 or to > line.length then return false, string.format("pick a moment between 0:00.02 and %s", clock_text(line.length)) end
+    close_player()
+    count = nil
+    test = {to = to, index = 1, results = {}, rows = {}, seek_at = U.now(), tries = 0}
+    R.line(string.format("[slowtest] at %s of %s: %d takes, slowed for %d steps at %s", clock_text(to), clock_text(line.length), #TEST_SPEEDS,
+        TEST_SLOW_STEPS, table.concat(TEST_SPEEDS, ", ")))
+    return true
+end
+
+local function test_cancel(why)
+    if test then test_end(why) end
 end
 
 local function save_film()
@@ -235,6 +454,7 @@ end
 
 C.listen(function(s)
     if not s.x then return end
+    if test then test_step(s) end
     local function f(v) return string.format("%.4f", v or 0) end
     if filming and line.phase == "running_up" and #filming.rows < ROWS_KEPT then
         table.insert(filming.rows, {#filming.rows, f(s.x), f(s.y), f(s.z), f(s.vx), f(s.vy), f(s.vz), tostring(s.state or ""),
@@ -271,6 +491,7 @@ end
 
 -- Stops the line (a test needs the controller).
 function L.suspend()
+    test_cancel("the line was stopped")
     close_player()
     full_speed()
     count, pending = nil, nil
@@ -280,6 +501,7 @@ end
 -- A new line: stops here, and after the countdown you go.
 function L.new_line()
     if U.in_session() then return false, "ReTake is offline only" end
+    test_cancel("New line")
     full_speed() -- whatever comes of it, the game does not stay slowed down
     local s = reskate.skater.get()
     if not s then return false, "there is no skater yet" end
@@ -330,6 +552,7 @@ end
 -- Stops everything the mod is doing, at once: recording, going back, playing, the countdown, the slow motion and
 -- the tests. The controller is yours. The line stays on the timeline to go back in, or to replace.
 function L.stop_all()
+    test_cancel("Stop all")
     close_player()
     full_speed()
     count, pending, filming, probe = nil, nil, nil, nil
@@ -359,6 +582,7 @@ end
 function L.back(seconds)
     if U.in_session() then return false, "ReTake is offline only" end
     if player then return false, "the timeline is open" end
+    if test then return false, "a slow-motion test is running: F11 stops it" end
     if reporting() then return true end -- Ctrl+R while typing a report: nothing
     if line.phase == "off" or line.length == 0 then return false, "no line is recording: F11, New line here" end
     local base = line.length
@@ -368,6 +592,7 @@ end
 
 function L.play_whole()
     if line.phase == "off" or line.length == 0 then return false, "no line is recorded" end
+    if test then return false, "a slow-motion test is running: F11 stops it" end
     close_player()
     return seek(line.length, false)
 end
@@ -376,7 +601,7 @@ end
 local function carry_on()
     close_player()
     if line.phase == "live" then
-        count_down(board_in_air())
+        count_down()
         return true
     end
     full_speed()
@@ -385,6 +610,10 @@ end
 
 function L.toggle_player()
     if reporting() then return true end -- F11 while writing a report: the report keeps the keys
+    if test then
+        test_cancel("F11")
+        return true
+    end
     if player then return carry_on() end
     if U.now() - closed_at < 300 then return true end -- the press that closed it
     if U.in_session() then return false, "ReTake is offline only" end
@@ -621,6 +850,7 @@ function L.tick(busy)
         return
     end
     if busy then return end
+    ease_tick()
     local skater = reskate.skater.get()
     if skater then
         no_skater_since = nil
@@ -661,13 +891,14 @@ function L.tick(busy)
             R.line(string.format("[line] caught up %d steps in %.1f s: %.1fx asked %dx, %d steps the game read nothing before", p.to, seconds, p.to / STEPS / math.max(seconds, 0.01), catch_up, script.unread))
         end
         set_clock(1)
-        count_down(board_in_air() or p.air_soon)
+        if test then test_begin() else count_down() end
     end
+    test_tick(now)
     if count then count.ticks += 1 end
     if count and now >= count.ends then
         R.line(string.format("[line] countdown by %s: %.0f ticks a second", count.how, count.ticks / math.max((now - count.began) / 1000, 0.1)))
         count = nil
-        full_speed()
+        ride_on()
         reskate.tas.line_go()
         go_until = now + GO_MS
         if probe then probe.go = PROBE_AFTER end
@@ -684,12 +915,9 @@ function L.tick(busy)
     end
     previous_phase = line.phase
     -- The player's own slow motion, whenever nothing else is setting the speed.
-    if not slowed and clock_now == 1 and not player and not count and not going_back() then
+    if not slowed and clock_now == 1 and not player and not count and not test and not going_back() then
         local want = slowmo_on and slowmo_speed or 1
-        if want ~= applied_speed then
-            applied_speed = want
-            reskate.time.slow(want)
-        end
+        if want ~= applied_speed then set_speed(want, true) end
     end
     -- Rolling after the teleport (one in three did): going again costs only a moment.
     if line.phase == "counting" and pending and pending.retries < RETRIES and line.since_spawn >= START_STEP - 30 and line.since_spawn < START_STEP - 20 and skater.speed > 0.5 then
@@ -704,7 +932,7 @@ function L.tick(busy)
 end
 
 -- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
-local VERSION = "0.0.2"
+local VERSION = "0.0.3"
 local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
 local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
 local PANEL = {colour = "#0c0d11eb", fill = true, rounding = 16}
@@ -960,6 +1188,12 @@ function L.draw(d)
     end
     local k = height / 1080
     local middle = height * 0.24
+    if test then
+        local speed = TEST_SPEEDS[math.min(test.index, #TEST_SPEEDS)]
+        centred(d, string.format("Slow-motion test: take %d of %d, %s  (hands off; F11 stops it)", math.min(test.index, #TEST_SPEEDS), #TEST_SPEEDS,
+            speed < 1 and string.format("slowed to %gx", speed) or "full speed"), SMALL_STYLE, width / 2, middle)
+        return
+    end
     if count then
         local shown = centred(d, tostring(math.max(1, math.ceil((count.ends - U.now()) / 1000))), BIG_STYLE, width / 2, middle)
         centred(d, "Hands on the controller", SMALL_STYLE, width / 2, middle + shown.y + 8 * k)
@@ -990,7 +1224,7 @@ local pad_seen, pad_at = nil, -math.huge
 function L.live()
     local now = U.now()
     if now - pad_at > 1000 then pad_seen, pad_at = find_pad(), now end
-    return {line = line, slowed = slowed, clock = clock_now, speed = applied_speed, timeline = player ~= nil, counting = count ~= nil,
+    return {line = line, slowed = slowed, clock = clock_now, speed = eased_speed, timeline = player ~= nil, counting = count ~= nil,
         going_to = pending and pending.to, pad = pad_seen}
 end
 
@@ -1000,6 +1234,7 @@ function L.snapshot()
         phase = line.phase, length = line.length, step = line.step, since_spawn = line.since_spawn, previous_phase = previous_phase,
         slowed = slowed, clock = clock_now, game_speed = applied_speed, slowmo_on = slowmo_on, slowmo_speed = slowmo_speed,
         catch_up = catch_up, bails_off = no_bail, hint = hint_text, screen = string.format("%dx%d", width, height),
+        ease_on = ease_on, eased_speed = eased_speed,
         marks = #marks, retakes = #joins, bails = #bails, pad = find_pad(), filming_rows = filming and #filming.rows,
         probe_rows = probe and #probe.rows,
     }
@@ -1008,6 +1243,7 @@ function L.snapshot()
             air_soon = pending.air_soon, ms_since_asked = U.now() - pending.asked_at, ms_running = pending.run_at and U.now() - pending.run_at}
     end
     if count then state.countdown = {ms_left = count.ends - U.now(), how = count.how} end
+    if test then state.slow_test = {to = test.to, take = test.index, running = test.run ~= nil, rows = #test.rows} end
     if player then
         state.timeline = {cursor = player.cursor, following = player.following, opened_in_flight = player.was_air,
             ms_open = U.now() - player.opened, preview_shown = player.shown}
