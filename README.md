@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="docs/logo-256.png" width="128" alt="ReTake logo">
+  <img src="docs/logo.png" width="300" alt="ReTake">
 </p>
-
-<h1 align="center">ReTake</h1>
 
 <p align="center">
   <b>Mess up anywhere in your line, go back to any moment, and carry on from there.</b><br>

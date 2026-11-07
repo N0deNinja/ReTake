@@ -406,10 +406,10 @@ end
 local function layout()
     local k = height / 1080
     local m = 40 * k
-    local panel = {x0 = m, x1 = width - m, y0 = height - 238 * k, y1 = height - 24 * k}
+    local panel = {x0 = m, x1 = width - m, y0 = height - 290 * k, y1 = height - 24 * k} -- a tall header: the logo is big
     local left, right = panel.x0 + 26 * k, panel.x1 - 26 * k
-    local bar = {x0 = left, x1 = right, y0 = panel.y0 + 96 * k, y1 = panel.y0 + 104 * k}
-    local y0, y1 = panel.y0 + 152 * k, panel.y0 + 196 * k
+    local bar = {x0 = left, x1 = right, y0 = panel.y0 + 148 * k, y1 = panel.y0 + 156 * k}
+    local y0, y1 = panel.y0 + 204 * k, panel.y0 + 248 * k
     local gap = 10 * k
     local function at(x, w) return {x0 = x, x1 = x + w * k, y0 = y0, y1 = y1} end
     local b = {}
@@ -677,30 +677,30 @@ function L.tick(busy)
     end
 end
 
--- ReTake's look: ink panels, skate yellow for what matters, red for what stops or bails.
+-- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
 local VERSION = "0.0.1"
-local LOGO = "assets/retake_mark_2.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
-local YELLOW, INK_HEX, TEXT, MUTED, RED = "#ffd23f", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
+local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
+local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
 local PANEL = {colour = "#0c0d11eb", fill = true, rounding = 16}
 local PANEL_EDGE = {colour = "#ffffff1c", thickness = 1, rounding = 16}
 local SURFACE = {colour = "#ffffff14", fill = true, rounding = 10}
 local SURFACE_HOVER = {colour = "#ffffff26", fill = true, rounding = 10}
 local SURFACE_OFF = {colour = "#ffffff08", fill = true, rounding = 10}
-local PRIMARY = {colour = YELLOW, fill = true, rounding = 10}
+local PRIMARY = {colour = ACCENT, fill = true, rounding = 10}
 local PRIMARY_HOVER = {colour = "#ffe175", fill = true, rounding = 10}
 local DANGER_EDGE = {colour = "#ff5a5a90", thickness = 1.5, rounding = 10}
 local DANGER_HOVER = {colour = "#ff5a5a2a", fill = true, rounding = 10}
 local ARMED = {colour = RED, fill = true, rounding = 10}
 local TRACK = {colour = "#ffffff1f", fill = true, rounding = 4}
-local PLAYED = {colour = YELLOW, fill = true, rounding = 4}
-local PILL = {colour = "#ffd23f26", fill = true, rounding = 6}
+local PLAYED = {colour = ACCENT, fill = true, rounding = 4}
+local PILL = {colour = "#02f7da26", fill = true, rounding = 6}
 local CHIP_PAUSED = {colour = "#ffffff1a", fill = true, rounding = 6}
 local BUBBLE = {colour = "#000000e6", fill = true, rounding = 6}
 local HUD_PILL = {colour = "#0c0d11c0", fill = true, rounding = 16}
-local PATH_DONE = {colour = "#ffd23fa0", thickness = 2}
+local PATH_DONE = {colour = "#02f7daa0", thickness = 2}
 local PATH_AFTER = {colour = "#ffffff50", thickness = 1}
 local BONE = {colour = "#ffffff", thickness = 5}
-local DECK = {colour = YELLOW, thickness = 5}
+local DECK = {colour = ACCENT, thickness = 5}
 local HEAD_DOT = {colour = "#ffffff", fill = true}
 local BIG_STYLE = {colour = "#ffffff", size = 150, shadow = true}
 local SMALL_STYLE = {colour = "#ffffffd0", size = 26, shadow = true}
@@ -777,16 +777,14 @@ local function draw_player(d)
     d:rect(v(panel.x0, panel.y0), v(panel.x1, panel.y1), PANEL)
     d:rect(v(panel.x0, panel.y0), v(panel.x1, panel.y1), PANEL_EDGE)
 
-    -- The mark, the name and the version.
-    local top = panel.y0 + 22 * k
-    d:image(LOGO, v(left, top), v(left + 38 * k, top + 38 * k))
-    local name_style = txt(26, TEXT)
-    d:text(v(left + 50 * k, top + 3 * k), "ReTake", name_style)
-    local name_w = d:measure("ReTake", name_style).x
+    -- The logo (it has the name in it) and the version.
+    local top = panel.y0 + 32 * k -- the header row's text; its middle is top + 20k
+    local logo = 100 * k
+    d:image(LOGO, v(left - 8 * k, panel.y0 + 6 * k), v(left - 8 * k + logo, panel.y0 + 6 * k + logo))
     local ver = "v" .. VERSION
-    local ver_style = txt(15, YELLOW, "bold")
+    local ver_style = txt(15, ACCENT, "bold")
     local ver_size = d:measure(ver, ver_style)
-    local vx = left + 50 * k + name_w + 10 * k
+    local vx = left - 8 * k + logo + 6 * k
     d:rect(v(vx, top + 9 * k), v(vx + ver_size.x + 14 * k, top + 31 * k), PILL)
     d:text(v(vx + 7 * k, top + 20 * k - ver_size.y / 2), ver, ver_style)
 
@@ -813,7 +811,7 @@ local function draw_player(d)
     local ks = d:measure(keys, keys_style)
     d:text(v(bar.x1 - ks.x, top + 12 * k), keys, keys_style)
 
-    -- The timeline: what has played in yellow, retakes above, bails below, the playhead on top.
+    -- The timeline: what has played in teal, retakes above, bails below, the playhead on top.
     d:rect(v(bar.x0, bar.y0), v(bar.x1, bar.y1), TRACK)
     local span = math.max(1, line.length)
     local function x_of(step) return bar.x0 + (bar.x1 - bar.x0) * step / span end
@@ -823,7 +821,7 @@ local function draw_player(d)
         if head > bar.x0 + 2 then d:rect(v(bar.x0, bar.y0), v(head, bar.y1), PLAYED) end
         for _, step in joins do
             local x = x_of(step)
-            d:poly({v(x - 6 * k, bar.y0 - 14 * k), v(x + 6 * k, bar.y0 - 14 * k), v(x, bar.y0 - 4 * k)}, {colour = YELLOW, fill = true})
+            d:poly({v(x - 6 * k, bar.y0 - 14 * k), v(x + 6 * k, bar.y0 - 14 * k), v(x, bar.y0 - 4 * k)}, {colour = ACCENT, fill = true})
         end
         for _, step in bails do d:circle(v(x_of(step), bar.y1 + 11 * k), 4 * k, {colour = RED, fill = true}) end
         -- Where the mouse would put it.
@@ -846,7 +844,7 @@ local function draw_player(d)
         -- What the marks are.
         local legend = txt(13, MUTED, "body")
         local lx, ly = bar.x0, bar.y1 + 20 * k
-        d:poly({v(lx, ly + 2 * k), v(lx + 10 * k, ly + 2 * k), v(lx + 5 * k, ly + 10 * k)}, {colour = YELLOW, fill = true})
+        d:poly({v(lx, ly + 2 * k), v(lx + 10 * k, ly + 2 * k), v(lx + 5 * k, ly + 10 * k)}, {colour = ACCENT, fill = true})
         d:text(v(lx + 16 * k, ly - 1 * k), "Retake", legend)
         local rx = lx + 16 * k + d:measure("Retake", legend).x + 18 * k
         d:circle(v(rx + 4 * k, ly + 6 * k), 4 * k, {colour = RED, fill = true})
@@ -939,7 +937,7 @@ function L.draw(d)
         hud_pill(d, k, 40 * k, RED, clock_text(line.length), nil, "F11")
     end
     if slowmo_on and not count and not going_back() then
-        hud_pill(d, k, 80 * k, nil, string.format("SLOW-MO %d%%", math.floor(slowmo_speed * 100 + 0.5)), YELLOW)
+        hud_pill(d, k, 80 * k, nil, string.format("SLOW-MO %d%%", math.floor(slowmo_speed * 100 + 0.5)), ACCENT)
     end
 end
 
