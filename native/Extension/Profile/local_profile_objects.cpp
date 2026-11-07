@@ -1,0 +1,175 @@
+#include "runtime_internal.h"
+#include "Engine/Game/Build/20260929/local_placements.h"
+#include "Extension/Objects/local_placements_runtime.h"
+#include "Extension/Objects/ParkEditor/park_editor_runtime.h"
+#include "Extension/Objects/ParkEditor/park_editor_surface.h"
+#include <cmath>
+#include "Extension/World/local_world_layers.h"
+
+namespace dingosdk {
+using namespace profile_runtime;
+ObjectPersistenceModel local_profile_object_persistence() {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    ObjectPersistenceModel model;
+    model.available = local_runtime().active.load() && r.store && !r.failed && !r.save_failed;
+    model.enabled = r.enabled; model.map = r.map; model.clearing = r.clearing;
+    if (const auto it = r.document.maps.find(r.map); it != r.document.maps.end()) model.count = it->second.size();
+    model.busy = r.clearing || r.inflight.has_value();
+    for (const auto& row : r.rows) model.rows.push_back({row.token, row.object.item, row.object.position, row.saved_id != 0, row.spawned});
+    model.can_clear = model.available && world_layers_runtime().model.ready && !r.map.empty() &&
+        !model.busy && model.count != 0;
+    model.status = r.status;
+    if (r.save_failed) model.status = "Object save failed. The previous file is retained; restart after checking objects.sqlite3.";
+    if (!r.store || r.failed) model.status = "Object persistence is unavailable. Check objects.sqlite3 and the runtime log.";
+    return model;
+}
+bool set_local_object_persistence(bool enabled) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !r.store || r.failed || r.save_failed || park_editor_owns_placements()) return false;
+    try {
+        local_runtime().store->set_bool_option("ReSkate.ObjectPersistence", enabled);
+        r.enabled = enabled;
+        r.status = enabled ? "Object persistence enabled." : "Object persistence disabled. Saved layouts are retained.";
+        return true;
+    } catch (...) { r.status = "Could not save the object persistence option."; return false; }
+}
+bool clear_local_persisted_objects(std::string_view map) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !placement_session_ready() || r.map != map) return false;
+    std::set<std::uint64_t> tokens;
+    for (const auto& row : r.rows) if (row.saved_id) tokens.insert(row.token);
+    return begin_placement_delete(tokens);
+}
+bool delete_local_placed_object(std::string_view map, std::uint64_t token) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !placement_session_ready() || r.map != map ||
+        std::none_of(r.rows.begin(), r.rows.end(), [&](const auto& row) { return row.token == token; })) return false;
+    return begin_placement_delete({token});
+}
+bool teleport_local_skater(const std::array<float, 3>& position) {
+    return teleport_local_skater_transform({1,0,0,0,0,1,0,0,0,0,1,0,position[0],position[1],position[2],1});
+}
+bool teleport_local_skater_transform(const std::array<float,16>& transform, std::optional<bool> on_board) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !r.teleport || !r.transition_ctor || !r.transition_destroy) return false;
+    for (const auto v : transform)
+        if (!std::isfinite(v) || std::abs(v) > 1e6f) return false;
+    r.position_teleport = transform;
+    r.position_teleport_on_board = on_board;
+    r.position_teleport_at = GetTickCount64();
+    return true;
+}
+// Upright at the spot, facing `heading` (radians about world up): the root's rows are right
+// (cos h, 0, -sin h), up, forward (sin h, 0, cos h); h = 0 faces +Z.
+bool teleport_local_skater_heading(const std::array<float, 3>& position, float heading, std::optional<bool> on_board) {
+    if (!std::isfinite(heading)) return false;
+    const float sh = std::sin(heading), ch = std::cos(heading);
+    return teleport_local_skater_transform({ch, 0, -sh, 0, 0, 1, 0, 0, sh, 0, ch, 0, position[0], position[1], position[2], 1}, on_board);
+}
+bool local_skater_teleport_pending() {
+    std::lock_guard lock(local_runtime().native_mutex);
+    const auto& r = placements_runtime();
+    if (r.position_teleport) return true;
+    std::uintptr_t manager{}; std::uint32_t phase{};
+    return read(local_runtime().base + addr::local_placements::teleport_manager, manager) && manager &&
+        read(manager, phase) && phase != 0;
+}
+
+std::optional<float> local_ground_height(float x, float z, float top, float bottom) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !r.context) return {};
+    for (const auto v : {x, z, top, bottom})
+        if (!std::isfinite(v) || std::abs(v) > 1e5f) return {};
+    if (!(top > bottom)) return {};
+    static std::uintptr_t api_base{};
+    static editor::NativeSurfaceApi api;
+    if (api_base != local_runtime().base) { api = editor::surface_api(local_runtime().base); api_base = local_runtime().base; }
+    if (!api.ready) return {};
+    // The client physics world, resolved from the client TLS context like the park editor's
+    // surface probe (the server context has no world).
+    std::array<std::uintptr_t, 2> context{};
+    r.context(context.data());
+    if (!context[0]) return {};
+    const auto world = api.world(context[0]);
+    if (!world) return {};
+    // Closest hit from the top: the topmost surface (a roof or deck above the street wins).
+    const auto hit = editor::cast_surface(api, world, {x, top, z}, {x, bottom, z});
+    if (!hit) return {};
+    return (*hit)[1];
+}
+std::optional<std::array<float, 3>> local_surface_hit(const std::array<float, 3>& from, const std::array<float, 3>& to) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !r.context) return {};
+    for (const auto v : {from[0], from[1], from[2], to[0], to[1], to[2]})
+        if (!std::isfinite(v) || std::abs(v) > 1e5f) return {};
+    static std::uintptr_t api_base{};
+    static editor::NativeSurfaceApi api;
+    if (api_base != local_runtime().base) { api = editor::surface_api(local_runtime().base); api_base = local_runtime().base; }
+    if (!api.ready) return {};
+    std::array<std::uintptr_t, 2> context{};
+    r.context(context.data());
+    if (!context[0]) return {};
+    const auto world = api.world(context[0]);
+    if (!world) return {};
+    const auto hit = editor::cast_surface(api, world, {from[0], from[1], from[2]}, {to[0], to[1], to[2]});
+    if (!hit) return {};
+    return std::array<float, 3>{(*hit)[0], (*hit)[1], (*hit)[2]};
+}
+LocalSurfaceProbe probe_local_surface_counted(const std::array<float, 3>& from, const std::array<float, 3>& to,
+                                              const LocalSurfaceQuery& query) {
+    LocalSurfaceProbe result;
+    if (!editor::surface_query_filter(query.preset)) return result;
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !r.context) return result;
+    for (const auto v : {from[0], from[1], from[2], to[0], to[1], to[2]})
+        if (!std::isfinite(v) || std::abs(v) > 1e5f) return result;
+    static std::uintptr_t api_base{};
+    static editor::NativeSurfaceApi api;
+    static bool api_contact{};
+    // The contact readers' bytes are compared only once a caller asks to measure contact, and
+    // a changed image base clears that choice.
+    if (api_base != local_runtime().base || (query.measure_contact && !api_contact)) {
+        api = editor::surface_api(local_runtime().base, query.measure_contact);
+        api_base = local_runtime().base;
+        api_contact = query.measure_contact;
+    }
+    if (!api.ready) return result;
+    // The authoritative server context's world is null in this client query path. Resolve the
+    // current client TLS context instead of keeping an address across unloads.
+    std::array<std::uintptr_t, 2> context{};
+    r.context(context.data());
+    result.context = context[0];
+    if (!context[0]) return result;
+    result.world = api.world(context[0]);
+    if (!result.world) return result;
+    // The park editor's picking reader, for a caller that qualifies the shape it hit.
+    const auto shape_reader = query.read_shape ? &local_surface_hit_body : nullptr;
+    const auto cast = editor::cast_surface_counted(api, result.world, from, to, shape_reader, query.measure_contact, query.preset);
+    result.native_casts = cast.native_casts;
+    result.available = cast.surface.available;
+    result.hit = cast.surface.hit;
+    result.position = cast.surface.position;
+    result.fraction = cast.surface.fraction;
+    result.hit_shape = cast.surface.body;
+    result.normal = cast.surface.normal;
+    result.normal_available = cast.surface.normal_available;
+    return result;
+}
+bool teleport_to_local_placed_object(std::string_view map, std::uint64_t token) {
+    std::lock_guard lock(local_runtime().native_mutex);
+    auto& r = placements_runtime();
+    if (!local_runtime().active || !placement_session_ready() || r.map != map || r.clearing ||
+        std::none_of(r.rows.begin(), r.rows.end(), [&](const auto& row) { return row.token == token; })) return false;
+    r.teleport_token = token; r.teleport_queued_at = GetTickCount64();
+    r.status = "Teleport queued...";
+    return true;
+}
+}

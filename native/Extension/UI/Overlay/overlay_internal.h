@@ -1,0 +1,420 @@
+#pragma once
+#include "overlay.h"
+#include "Engine/Core/Console/command_registry.h"
+#include "Extension/Skater/free_flight.h"
+#include "gpu_diagnostics.h"
+#include "skate_menu.h"
+#include "skate_style.h"
+
+#include <Windows.h>
+#include <Xinput.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#include "Engine/Core/Hooks/hooks.h"
+#include <imgui.h>
+#include <backends/imgui_impl_dx12.h>
+#include <backends/imgui_impl_win32.h>
+
+#include <algorithm>
+#include <array>
+#include <optional>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <map>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+namespace dingosdk::overlay::detail {
+using Microsoft::WRL::ComPtr;
+
+using dingosdk::overlay::record_device_failure;
+
+using FactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+
+using CreateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+
+using CreateHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND,
+    const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+
+using FullscreenFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+
+using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+
+using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
+    const UINT*, IUnknown* const*);
+
+using DllNotificationFn = void(CALLBACK*)(ULONG, const void*, void*);
+
+using RegisterDllNotificationFn = LONG(NTAPI*)(ULONG, DllNotificationFn, void*, void**);
+
+using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
+
+using SetCursorPosFn = BOOL(WINAPI*)(int, int);
+
+struct Hook { void* target = nullptr; void* original = nullptr; };
+
+struct Frame {
+    ComPtr<ID3D12Resource> buffer;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+    UINT64 fence = 0;
+};
+
+struct Input { HWND window; UINT message; WPARAM wparam; LPARAM lparam; };
+
+struct Binding {
+    IUnknown* identity = nullptr;
+    ComPtr<ID3D12CommandQueue> queue;
+    HWND window = nullptr;
+};
+
+using ConsoleToken = dingosdk::console::CompletionToken;
+
+struct ConsoleRow {
+    dingosdk::ConsoleLogLine entry;
+    std::string formatted, plain;
+};
+
+// Retained intentionally for process lifetime: hook trampolines and callbacks
+// must never point at C++ objects destroyed by static teardown or DLL unload.
+
+struct State {
+    std::recursive_mutex render_mutex;
+    std::mutex hook_mutex;
+    std::mutex input_mutex;
+    std::recursive_mutex cursor_mutex;
+    bool cursor_released = false;
+    bool cursor_clip_pending = false;
+    RECT cursor_clip{};
+    std::deque<Input> input;
+    std::array<bool, 256> game_keys{}; // Window thread only; forwarded message state.
+    unsigned game_mouse_buttons = 0;
+    std::atomic<bool> visible{false};
+    std::atomic<bool> editor_visible{false}, editor_exit_requested{false}, editor_flight{false};
+    std::atomic<ULONGLONG> editor_input_time{0};
+    // Raw mouse seen on the game window (WM_INPUT). The park editor's look and
+    // buttons use it because Skate's controller mode stops the legacy cursor
+    // and button state from updating until the game is paused.
+    std::atomic<long> raw_mouse_x{0}, raw_mouse_y{0};
+    // The same movement for read_mouse_look, kept apart so the editor's and the flight look's reads
+    // do not take it; and the wheel, from raw packets and from WM_MOUSEWHEEL (in its 120 a notch).
+    std::atomic<long> look_mouse_x{0}, look_mouse_y{0}, look_wheel_raw{0}, look_wheel_message{0};
+    std::atomic<unsigned> raw_mouse_buttons{0}; // physical: 1 left, 2 right, 4 middle
+    std::atomic<ULONGLONG> raw_mouse_time{0};
+    // The mouse registration in effect has RIDEV_NOLEGACY: Windows does not
+    // move the cursor, so the overlay moves it from raw input while it owns it.
+    std::atomic<bool> mouse_legacy_blocked{false};
+    std::atomic<bool> console_visible{false};
+    std::atomic<bool> console_character_pending{false};
+    std::atomic<bool> console_escape_pending{false};
+    std::atomic<bool> console_focus_requested{false};
+    // Multiplayer text chat (chat_overlay.cpp): T opens it while in a session.
+    std::atomic<bool> chat_visible{false}, chat_available{false};
+    std::atomic<bool> chat_character_pending{false}, chat_escape_pending{false}, chat_focus_requested{false};
+    std::atomic<bool> chat_command_requested{false}; // opened with "/": the box starts with it
+    // The Multiplayer page drawn in the game's pause menu (hub_page.cpp). hub_pointer: it is
+    // on screen, so the overlay watches the mouse (position, buttons, wheel) while the game
+    // keeps it. hub_typing: one of its text boxes has the keyboard, which the overlay takes
+    // for that long, as for chat.
+    std::atomic<bool> hub_pointer{false}, hub_typing{false};
+    // The map download card is asking (map_download_card.cpp): the overlay has the pointer, with
+    // its own cursor, so the card's buttons can be clicked whatever is behind it.
+    std::atomic<bool> prompt_pointer{false};
+    // The item grids' search box (item_browser_overlay.cpp): "-" opens it while a grid has the focus.
+    std::atomic<bool> item_search_visible{false}, item_search_focus_requested{false};
+    std::atomic<bool> plugin_dialog_visible{false};
+    std::atomic<bool> item_search_character_pending{false}, item_search_escape_pending{false};
+    // The pickers' Author, Mod pack, Sort and Show at the top
+    // (item_browser_overlay.cpp). item_filters_visible: V or a click on one has them take the keys
+    // and the pointer until Esc, V or a click elsewhere. item_filters_back counts the Esc presses
+    // they get.
+    std::atomic<bool> item_filters_visible{false}, item_filters_escape_pending{false};
+    std::atomic<unsigned> item_filters_back{0};
+    // A plugin's full-screen screen is open (plugin_overlay.cpp): it has the input, as the menu.
+    std::atomic<bool> plugin_screen_visible{false};
+    std::atomic<bool> input_attached{false};
+    std::atomic<bool> stop{false};
+    std::atomic<HWND> window{nullptr};
+    struct WindowHook { WNDPROC previous{}; bool installed{}; };
+    std::recursive_mutex window_hook_mutex;
+    std::map<HWND, WindowHook> window_hooks;
+    std::atomic<bool> started{false};
+    bool ready = false;
+    bool ui_was_interactive = false;
+    std::uint32_t mapped_mouse_event = 0; // Render thread: the last queued mouse position mapped into the back buffer.
+    std::atomic<bool> failed{false};
+    bool win32_ready = false;
+    bool dx12_ready = false;
+    std::atomic<bool> freecam_controller_active{false};
+    std::atomic<bool> prompt_input_active{false}; // DingoSDKOverlaySetPromptInputCapture
+    bool show_on_ready = false;
+    bool force_windowed = false;
+    HANDLE stop_event = nullptr;
+    HANDLE provider_event = nullptr;
+    void* dll_notification_cookie = nullptr;
+    Hook factory, create, create_hwnd, present, present1, resize, resize1, fullscreen;
+    // The same four of other swapchain implementations: DXGI's own under a wrapper the game
+    // was given (Streamline's), which is what presents when something else presents for the
+    // game (Intel's frame generation does).
+    static constexpr std::size_t more_swapchains = 3;
+    std::array<Hook, more_swapchains> present_more, present1_more, resize_more, resize1_more;
+    Hook clip_cursor, set_cursor_pos;
+    std::vector<Binding> bindings;
+    IUnknown* swapchain_identity = nullptr;
+    HWND swapchain_window = nullptr;
+    std::atomic<bool> selected_window_destroyed{false};
+    // "ReSkate loaded" is queued as a notice the first time the overlay draws.
+    bool loaded_notice_posted = false;
+    std::chrono::steady_clock::time_point last_selected_present{};
+    std::chrono::steady_clock::time_point next_setup_attempt{};
+    ComPtr<IDXGISwapChain3> swapchain;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12DescriptorHeap> rtvs, srvs;
+    // The map download card's icon (map_download_card.cpp), in the SRV heap's second slot, and
+    // the buffer it was uploaded from, which lives until the next one replaces it.
+    ComPtr<ID3D12Resource> card_texture, card_upload;
+    // The menu's map pictures (menu_map_pictures.cpp) in the third slot, likewise.
+    ComPtr<ID3D12Resource> menu_map_texture, menu_map_upload;
+    // The icon of the mod the highlighted item is from (item_browser_overlay.cpp), in the fourth.
+    ComPtr<ID3D12Resource> mod_icon_texture, mod_icon_upload;
+    // Plugins' pictures (plugin_images.cpp), from the fifth slot on.
+    std::array<ComPtr<ID3D12Resource>, 16> plugin_textures, plugin_uploads;
+    // Thunderstore icons for the Mod Manager page (store_icons.cpp), after the screen look's slots.
+    std::array<ComPtr<ID3D12Resource>, 64> store_textures, store_uploads; // store_icon_slots
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    ComPtr<ID3D12Fence> fence;
+    HANDLE fence_event = nullptr;
+    UINT64 next_fence = 0;
+    std::uint64_t submitted_draws = 0;
+    std::uint64_t rendered_frames = 0;
+    std::vector<Frame> frames;
+    std::vector<UINT64> upload_fences;
+    ImGuiContext* context = nullptr;
+    dingosdk::overlay::CallbacksV3 callbacks;
+    dingosdk::overlay::Model model;
+    std::chrono::steady_clock::time_point last_model{};
+    dingosdk::overlay::SkateMenu menu;
+    dingosdk::overlay::ParkEditorUI editor;
+    std::deque<ConsoleRow> console_lines;
+    ImGuiTextFilter console_filter;
+    bool console_show_info = true, console_show_warnings = true, console_show_errors = true;
+    bool console_timestamps = true;
+    std::array<bool, dingosdk::logging::context_count> console_contexts = [] {
+        std::array<bool, dingosdk::logging::context_count> value{}; value.fill(true); return value;
+    }();
+    std::array<bool, dingosdk::logging::channel_count> console_sources = [] {
+        std::array<bool, dingosdk::logging::channel_count> value{}; value.fill(true); return value;
+    }();
+    int console_cursor = 0;
+    std::string console_clicked_completion;
+    int console_clicked_cursor = 0;
+    std::vector<std::string> console_suggestions;
+    std::vector<dingosdk::console::Suggestion> console_suggestion_rows;
+    float console_suggestions_fraction = 0.65f;
+    bool console_resizing_suggestions = false;
+    bool console_layout_valid = false;
+    ImVec2 console_position{}, console_size{};
+    std::array<char, 1024> console_input{};
+    std::deque<std::string> console_history;
+    int console_history_position = -1;
+    std::string console_history_draft;
+    std::uint64_t console_log_sequence = 0;
+    bool console_autoscroll = true;
+    bool console_scroll_to_bottom = false;
+    bool console_force_scroll = false;
+    bool console_was_at_bottom = true;
+    bool console_input_active = false;
+    std::vector<std::string> completion_candidates;
+    std::size_t completion_index = 0;
+    int completion_begin = 0;
+    int completion_end = 0;
+    std::string completion_last_buffer;
+
+};
+
+State& state();
+
+extern thread_local bool inside_present;
+
+inline constexpr DWORD render_fence_timeout_ms = 2000;
+
+inline constexpr std::size_t maximum_bindings = 16;
+
+inline constexpr std::size_t maximum_console_lines = 2048;
+
+inline constexpr std::size_t maximum_console_line_length = 8300;
+
+struct PresentGuard {
+    bool outermost = !inside_present;
+    PresentGuard() { if (outermost) inside_present = true; }
+    ~PresentGuard() { if (outermost) inside_present = false; }
+};
+
+template<typename Function> Function original(const Hook& hook) {
+    return reinterpret_cast<Function>(hook.original);
+}
+
+bool install(Hook& hook, void* target, void* detour);
+
+bool is_input(UINT message);
+
+bool interactive_visible(const State& s);
+
+bool owns_menu_cursor(const State& s);
+
+// Gives input back to the game; hide_menu also closes every overlay surface (overlay.cpp).
+void restore_input(bool hide_menu);
+
+// The game window's procedure while the overlay is attached (overlay_input.cpp).
+LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp);
+
+// Swapchain selection, device objects and the per-frame draw (overlay_render.cpp).
+bool completed(UINT64 value, DWORD timeout_ms);
+void destroy_graphics();
+// Screen captures (frame_grab.cpp): a frame is being asked for, so the overlay keeps working; the
+// presented frame's pixels handed over before the overlay draws on it; its GPU objects let go.
+bool frame_grab_pending();
+void grab_presented_frame(State& s, ID3D12Resource* buffer);
+void release_frame_grab();
+// The depth probe (depth_probe.cpp, `capture depth`): its hook, installed with the overlay's command
+// list; whether it needs this present; and its turn at it.
+void install_depth_probe(ID3D12GraphicsCommandList* list) noexcept;
+bool depth_probe_pending();
+void depth_probe_present(State& s, std::uint32_t width, std::uint32_t height);
+// The depth tap (depth_probe.cpp): while a frame grab runs, the game's main depth buffer is copied
+// every frame. depth_tap_present runs at each present (`wanted`: a grab is running); after the
+// frame's own work is known finished, depth_tap_latest maps the newest copy the GPU has made (or
+// gives null) until depth_tap_done.
+void depth_tap_present(State& s, std::uint32_t width, std::uint32_t height, bool wanted);
+const std::uint8_t* depth_tap_latest(std::uint32_t& width, std::uint32_t& height, std::uint32_t& pitch);
+void depth_tap_done();
+ComPtr<IUnknown> object_identity(IUnknown* object);
+Binding* find_binding(IUnknown* identity);
+void guarded_render(IDXGISwapChain* chain, UINT flags) noexcept;
+
+// The command console (overlay_console.cpp).
+void ingest_console_log(std::vector<dingosdk::overlay::ConsoleLogLine> lines);
+void draw_console();
+
+// Corner notices (overlay_notices.cpp).
+bool notices_pending();
+void draw_notices();
+
+// Multiplayer text chat in the bottom-right corner (chat_overlay.cpp).
+// chat_pending also refreshes the feed, so it runs every presented frame.
+bool chat_pending();
+void draw_chat();
+// The message to say OK to (message_card.cpp): whether one is up, and drawing it.
+bool message_pending();
+void draw_message();
+// The map download card (map_download_card.cpp): whether there is one this frame, and drawing it.
+bool map_download_pending();
+void draw_map_download();
+// The vote for the next map as its popup: the maps to pick from. False when it is not up (it
+// was answered or closed, or the vote is over), and the vote is drawn as the poll it is.
+bool draw_map_vote(const MultiplayerVote& vote);
+// Its icon on the way to the GPU: decoded pixels the render thread takes once, then says where
+// they went; lost when the device is torn down, after which they are handed out again.
+struct CardPixels {
+    std::vector<unsigned char> rgba;
+    UINT width{}, height{};
+    unsigned serial{};
+};
+bool take_card_pixels(CardPixels& pixels);
+void card_image_uploaded(ImTextureID texture, unsigned serial);
+void card_image_lost();
+// Decodes a PNG to RGBA; with `side`, scaled to a square of that many pixels.
+bool decode_picture(const std::string& png, CardPixels& out, UINT side);
+// The menu's map pictures (menu_map_pictures.cpp), the same way, in the SRV heap's third slot.
+bool take_menu_map_pixels(CardPixels& pixels);
+void menu_map_pixels_uploaded(ImTextureID texture, unsigned serial);
+void menu_map_pixels_lost();
+// The item card's mod icon (item_browser_overlay.cpp), the same way, in the fourth slot.
+bool take_mod_icon_pixels(CardPixels& pixels);
+// Plugins' pictures (plugin_images.cpp): the SRV heap's slots from plugin_image_first_slot on. A
+// draw asks for a picture by its file (its id once on the GPU, 0 until then); the render thread
+// takes one decoded picture a frame to upload and says where it went.
+inline constexpr UINT plugin_image_first_slot = 4, plugin_image_slots = 16;
+// Then the screen look's three (screen_look.h): its copy of the frame and the auto-iris's two targets.
+inline constexpr UINT screen_look_slot = plugin_image_first_slot + plugin_image_slots, screen_look_slots = 3;
+ImTextureID plugin_image(const std::string& path, ImVec2& size);
+struct PluginImageUpload {
+    std::string path;
+    int slot{};
+    CardPixels pixels;
+};
+std::optional<PluginImageUpload> take_plugin_image();
+// id 0: it failed; `later`: the slot was busy, so it waits for another frame.
+void plugin_image_uploaded(const std::string& path, int slot, ImTextureID id, bool later = false);
+void plugin_images_lost();
+// Thunderstore packages' icons for the pause menu's Mod Manager page (store_icons.cpp), the same way,
+// by their URL, in the SRV heap's slots from store_icon_first_slot on.
+inline constexpr UINT store_icon_first_slot = screen_look_slot + screen_look_slots, store_icon_slots = 64;
+ImTextureID store_icon(const std::string& url);
+// Then a viewmodel's pictures (viewmodel.h): three for each of its at most eight materials.
+inline constexpr UINT viewmodel_first_slot = store_icon_first_slot + store_icon_slots, viewmodel_slots = 24;
+struct StoreIconUpload {
+    std::string url;
+    int slot{};
+    CardPixels pixels;
+};
+std::optional<StoreIconUpload> take_store_icon();
+void store_icon_uploaded(const std::string& url, int slot, ImTextureID id, bool later = false);
+void store_icons_lost();
+// Mods being applied with the pause menu closed (hub_page.cpp): whether its card is up, and drawing it.
+bool mod_apply_card_pending();
+void draw_mod_apply_card();
+static_assert(std::tuple_size_v<decltype(State::store_textures)> == store_icon_slots);
+void mod_icon_uploaded(ImTextureID texture, unsigned serial);
+void mod_icon_lost();
+// Game debug text (game_text_overlay.cpp): polled every presented frame.
+bool game_text_pending();
+void draw_game_text();
+// ReSkate's S.K.A.T.E. throwdown HUD (skate_hud_overlay.cpp): polled every presented frame.
+bool skate_hud_pending();
+void draw_skate_hud();
+// ReSkate's nametags (nametag_overlay.cpp): polled every presented frame.
+bool nametags_pending();
+void draw_nametags();
+// The profiler's HUD (drawn whenever it is on) and window (only in an interactive frame),
+// perf_overlay.cpp.
+bool perf_hud_pending();
+void draw_perf_hud();
+void draw_perf_window();
+// The skater item grids' search bar and prompts (item_browser_overlay.cpp): polled every presented frame.
+enum class ItemBrowserKey { favorite, filter };
+bool item_browser_pending();
+bool item_browser_open();
+bool item_browser_filters_shown(); // the grid that has the focus is a picker with its filters
+// The game window's mouse moves and left clicks (client pixels) while the game has the mouse: the
+// pickers' filters watch them. Window procedure.
+void item_browser_mouse(UINT message, float x, float y);
+void item_browser_key(ItemBrowserKey key);
+void item_browser_search_cleared(); // Esc in the search box
+void draw_item_browser();
+// Queues a private multiplayer action from outside the menu (multiplayer_menu.cpp).
+bool queue_multiplayer_action(const char* action, const std::string& argument);
+bool queue_multiplayer_action(const char* action, const std::string& argument, const std::string& password);
+// The pause menu's Multiplayer page (hub_page.cpp): polled every presented frame.
+bool hub_page_pending();
+void draw_hub_page();
+}

@@ -1,0 +1,10 @@
+# Build output
+dist/
+native/build/
+*.log
+
+# Editors and Windows
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini

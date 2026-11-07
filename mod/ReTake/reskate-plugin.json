@@ -1,0 +1,22 @@
+{
+    "api": 1,
+    "entry": "plugin/main.lua",
+    "side": "client",
+    "permissions": [
+        "console",
+        "overlay",
+        "files",
+        "input",
+        "tas",
+        "session.read",
+        "skater.read",
+        "skater.teleport",
+        "skater.control",
+        "events.skater",
+        "events.physics",
+        "events.physics.geometry",
+        "game.speed",
+        "ui.screen",
+        "camera"
+    ]
+}

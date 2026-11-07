@@ -1,0 +1,2316 @@
+diff --git a/Engine/Core/Debug/client.cpp b/Engine/Core/Debug/client.cpp
+index 90a7557..6f44516 100644
+--- a/Engine/Core/Debug/client.cpp
++++ b/Engine/Core/Debug/client.cpp
+@@ -32,6 +32,8 @@ StartResult start(const std::filesystem::path& log_directory) noexcept {
+     try {
+         if (report) return StartResult::ready;
+         if (environment(L"RESKATE_CRASH_REPORTING") == L"0") return StartResult::disabled;
++        // ReTake: a build without its own endpoint reports nowhere, whatever the environment names.
++        if (!configured_url[0]) return StartResult::disabled;
+         auto url = environment(L"RESKATE_CRASH_REPORT_URL");
+         if (url.empty()) url = configured_url;
+         if (url.empty()) return StartResult::disabled;
+diff --git a/Engine/Core/Debug/trace.cpp b/Engine/Core/Debug/trace.cpp
+index a97216b..18bac1a 100644
+--- a/Engine/Core/Debug/trace.cpp
++++ b/Engine/Core/Debug/trace.cpp
+@@ -53,6 +53,7 @@ std::string timestamp(Clock::time_point time) {
+ void configure(State& s) {
+     using crash_report::environment;
+     if (environment(L"RESKATE_TRACING") != L"1" || environment(L"RESKATE_CRASH_REPORTING") == L"0") return;
++    if (!crash_report::configured_url[0]) return; // ReTake: as the crash reports, nowhere without its own endpoint
+     auto url = environment(L"RESKATE_CRASH_REPORT_URL");
+     if (url.empty()) url = crash_report::configured_url;
+     url = envelope_url(url);
+diff --git a/Engine/Game/Build/20260929/skater_state.h b/Engine/Game/Build/20260929/skater_state.h
+index b67509e..bb3f717 100644
+--- a/Engine/Game/Build/20260929/skater_state.h
++++ b/Engine/Game/Build/20260929/skater_state.h
+@@ -30,8 +30,30 @@ inline constexpr std::uintptr_t in_the_air_offset = 0x180;    // offboard state
+ // n * 0x130, each pointing back to its owner at +0x10 with its velocity (float[3], m/s) at +0x70 and
+ // its spin (angular velocity, float[3], radians per second) at +0x90. 0x140fc06b0 syncs a body with
+ // the physics world: by its pending flags (+0x60) it sets the velocity (8, 0x1425da600) from +0x70
+-// and the spin (0x20, 0x1425d8530) from +0x90.
++// and the spin (0x20, 0x1425d8530) from +0x90. Flag 1 sets rotation and position from the world matrix
++// at +0x20 (0x1425dcbf0); flag 4 sets the position from +0x50, keeping the rotation the physics has
++// (0x1425dc000). Read in the disassembly, 2026-11-06.
+ // The board has 9, body 0 its root; the skeleton 26, body n the ragdoll's body n (skater_body.h).
++// core + core_steps_since_built (uint32) counts the core's physics steps from its last build, at a spawn
++// or a teleport: one a step in every run compared on 2026-11-06. The core keeps its address across a
++// teleport, so the address does not show one.
++inline constexpr std::uintptr_t core_steps_since_built = 0x190;
++inline constexpr std::uintptr_t body_flags_offset = 0x60;
++inline constexpr std::uint32_t body_flag_rotation = 1, body_flag_position = 4, body_flag_velocity = 8, body_flag_spin = 0x20;
++// A flight on the board (no_bail.cpp, 2.7): the air state (core+0x308, its launch block at +0x30, the core's at core+0x3e8)
++// counts its frames at +0x4dc, one a step (0x48256b0), and reads the block's path at t = frame * dt (0x474ea20). The block's
++// dt (+0x18b4) is set when the skater is built (0x4753f94), so it does not follow a step changed since.
++inline constexpr std::uintptr_t core_jump_block_offset = 0x3e8;
++inline constexpr std::uintptr_t core_air_state_offset = 0x308;
++inline constexpr std::uintptr_t air_state_block_offset = 0x30;
++inline constexpr std::uintptr_t air_state_frame_offset = 0x4dc; // int32
++inline constexpr std::uintptr_t jump_block_dt_offset = 0x18b4;  // float, seconds
++// The block's current jump request (+0x1100, 0x4750ea0) has a frame time of its own, read at frame * dt by the air state
++// for its velocity and placing (0x4818ec5, 0x481e8cb, 0x4824981), and the flight's length in frames: every step the
++// air state takes frame / frames as how far along it is (0x4825831).
++inline constexpr std::uintptr_t jump_block_request_offset = 0x1100;
++inline constexpr std::uintptr_t request_frames_offset = 0x80;  // int32
++inline constexpr std::uintptr_t request_dt_offset = 0xe4;      // float, seconds
+ inline constexpr std::uintptr_t board_holder_offset = 0x430;  // core
+ inline constexpr std::uintptr_t board_physics_offset = 0x18;  // board holder
+ inline constexpr std::uintptr_t rig_physics_offset = 0x2f10;  // rig
+diff --git a/Extension/Plugins/Test/plugin_tests.cpp b/Extension/Plugins/Test/plugin_tests.cpp
+index 6c43ca0..782d97f 100644
+--- a/Extension/Plugins/Test/plugin_tests.cpp
++++ b/Extension/Plugins/Test/plugin_tests.cpp
+@@ -14,6 +14,7 @@
+ #include "Extension/Throwdowns/throwdown_kit.h"
+ #include "Engine/Vfs/mod_list.h"
+ #include "Engine/Game/Input/pad_output.h"
++#include "Engine/Game/Input/step_script.h"
+ #include "Engine/Game/Input/playstation_report.h"
+ #include "Engine/Game/Input/gameplay_options.h"
+ #ifdef _WIN32 // reads memory as the game does (Engine/Core/Platform/memory.h)
+@@ -926,6 +927,29 @@ struct FakeGame final : Game {
+     std::string set_animation_value(std::string_view name, double) override { return name == "Animation/Dingo/Float.Physics.Example" ? "" : "not a live numeric physics output"; }
+     int read_controller = -1;
+     std::optional<PadInput> written_pad; unsigned written_controller{};
++    std::string tas_calls;
++    std::string tas_record(std::string_view, unsigned controller, std::size_t length, std::size_t at) override { tas_calls += std::format("record {} {} {};", controller, length, at); return {}; }
++    std::string tas_play(std::string_view, unsigned controller, int lead, TasRestore restore, std::size_t at) override { tas_calls += std::format("play {} {} {} {};", controller, lead, static_cast<int>(restore), at); return {}; }
++    void tas_stop(std::string_view) override { tas_calls += "stop;"; }
++    std::string tas_line_start(std::string_view, unsigned controller, std::size_t at) override { tas_calls += std::format("line-start {} {};", controller, at); return {}; }
++    std::string tas_line_seek(std::size_t from, std::size_t to, std::size_t at, bool hand_over) override { tas_calls += std::format("line-seek {} {} {} {};", from, to, at, hand_over); return {}; }
++    std::string tas_line_go() override { tas_calls += "line-go;"; return {}; }
++    std::string tas_line_stop() override { tas_calls += "line-stop;"; return {}; }
++    std::string tas_line_paused(bool on) override { tas_calls += std::format("paused {};", on); return {}; }
++    std::string tas_line_hold() override { tas_calls += "hold;"; return {}; }
++    std::string tas_line_halt() override { tas_calls += "halt;"; return {}; }
++    std::string tas_no_bail(bool on) override { tas_calls += std::format("no-bail {};", on); return {}; }
++    std::string tas_clock(float scale) override { tas_calls += std::format("clock {};", scale); return {}; }
++    std::string tas_virtual_time(bool on) override { tas_calls += std::format("virtual {};", on); return {}; }
++    std::string tas_save(unsigned slot) override { tas_calls += std::format("save-slot {};", slot); return {}; }
++    std::string tas_load(unsigned slot, bool skeleton) override { tas_calls += std::format("load-slot {} {};", slot, skeleton); return {}; }
++    std::pair<std::size_t, std::size_t> tas_save_counts() override { return {5, 6}; }
++    std::string tas_history(bool on) override { tas_calls += std::format("history {};", on); return {}; }
++    std::string tas_rewind(std::size_t length) override { tas_calls += std::format("rewind {};", length); return {}; }
++    std::pair<std::size_t, std::size_t> tas_history_counts() override { return {600, 2}; }
++    std::string tas_dump(std::uint32_t every) override { tas_calls += std::format("dump {};", every); return {}; }
++    std::string tas_dump_save(std::string_view name) override { tas_calls += std::format("save {};", name); return {}; }
++    TasStatus tas_status() override { return {"playing", 7, 90, "recorded", true, 3, 2, {4, 9}, 500, true, 12}; }
+     std::string write_pad(std::string_view, unsigned controller, std::optional<PadInput> value) override { written_controller = controller; written_pad = value; return {}; }
+     std::optional<StickInput> joystick(int device) override {
+         if (device > 1) return std::nullopt;
+@@ -3980,6 +4004,237 @@ void plugins_write_normalized_controllers() {
+     check(!outputs.read(4, 1201, true), "stop releases native pads too");
+ }
+ 
++void plugins_script_input_by_physics_step() {
++    TestEnvironment environment;
++    Host host(environment, Side::client);
++    host.apply({script("scripter", R"(
++        assert(reskate.tas.record("playstation", 100))
++        assert(reskate.tas.play(2, -1))
++        assert(reskate.tas.play(1, 0, "board"))
++        assert(reskate.tas.play(1, 0, "all", 420))
++        assert(reskate.tas.play(1, 0, "lock", 420))
++        assert(reskate.tas.record(0, 50, 420))
++        assert(not pcall(reskate.tas.play, 1, 0, "pelvis"))
++        assert(not pcall(reskate.tas.play, 1, 0, "all", -1))
++        assert(not pcall(reskate.tas.record, 0, 50, 1.5))
++        assert(reskate.tas.status().since_spawn == 500)
++        assert(not pcall(reskate.tas.record, 4))
++        assert(not pcall(reskate.tas.record, 0, 18001))
++        assert(not pcall(reskate.tas.record, 0, 1.5))
++        assert(not pcall(reskate.tas.play, "xbox"))
++        assert(not pcall(reskate.tas.play, 0, 9))
++        local s = reskate.tas.status()
++        assert(s.mode == "playing" and s.step == 7 and s.length == 90 and s.stopped == "recorded")
++        assert(s.captured == true and s.restores == 3)
++        assert(s.unread == 2 and #s.first_unread == 2 and s.first_unread[2] == 9)
++        reskate.tas.stop()
++        assert(reskate.tas.virtual_time(true))
++        assert(reskate.tas.virtual_time(false))
++        assert(reskate.tas.status().virtual_time == true and reskate.tas.status().clock_reads == 12)
++        assert(reskate.tas.save())
++        assert(reskate.tas.save(4))
++        assert(reskate.tas.load())
++        assert(reskate.tas.load(2, "board"))
++        assert(not pcall(reskate.tas.save, 5))
++        assert(not pcall(reskate.tas.save, 1.5))
++        assert(not pcall(reskate.tas.load, 0))
++        assert(not pcall(reskate.tas.load, 1, "pelvis"))
++        local saves, loads = reskate.tas.saves()
++        assert(saves == 5 and loads == 6)
++        assert(reskate.tas.history(true))
++        assert(reskate.tas.rewind())
++        assert(reskate.tas.rewind(600))
++        assert(not pcall(reskate.tas.rewind, 0))
++        assert(not pcall(reskate.tas.rewind, 601))
++        assert(not pcall(reskate.tas.rewind, 1.5))
++        local held, rewinds = reskate.tas.history_counts()
++        assert(held == 600 and rewinds == 2)
++        assert(reskate.tas.dump(30))
++        assert(reskate.tas.dump_save("run-1_take.a"))
++        assert(not pcall(reskate.tas.dump, 0))
++        assert(not pcall(reskate.tas.dump_save, "../outside"))
++        assert(not pcall(reskate.tas.dump_save, ".hidden"))
++        assert(not pcall(reskate.tas.dump_save, "a\\b"))
++    )", R"("tas")")});
++    running(host, "scripter", environment);
++    const std::string script_calls = "record 4 100 0;play 2 -1 0 0;play 1 0 1 0;play 1 0 2 420;play 1 0 3 420;record 0 50 420;stop;virtual true;virtual false;save-slot 0;save-slot 3;load-slot 0 true;load-slot 1 false;history true;rewind 60;rewind 600;dump 30;save run-1_take.a;";
++    check(environment.fake.tas_calls == script_calls, "calls reach the game: " + environment.fake.tas_calls);
++
++    host.apply({script("outsider", R"(
++        local ok, why = pcall(reskate.tas.record, 0, 10)
++        assert(not ok and why:find('tas'), "tas is asked for")
++        ok, why = pcall(reskate.tas.status)
++        assert(not ok and why:find('tas'), "reading it is too")
++    )", R"("input", "input.write")")});
++    running(host, "outsider", environment);
++    check(environment.fake.tas_calls == script_calls, "no call without the permission");
++
++    host.apply({script("liner", R"(
++        assert(reskate.tas.line_start(1, 180))
++        assert(reskate.tas.line_seek(0, 10, 180, true))
++        assert(reskate.tas.line_seek(0, 10, 180, false))
++        assert(reskate.tas.line_go())
++        assert(reskate.tas.line_paused(true))
++        assert(reskate.tas.line_paused(false))
++        assert(reskate.tas.line_hold())
++        assert(reskate.tas.line_halt())
++        assert(reskate.tas.no_bail(true))
++        assert(reskate.tas.no_bail(false))
++        assert(reskate.tas.clock(0.05))
++        assert(reskate.tas.clock(4))
++        assert(reskate.tas.clock(1))
++        assert(not pcall(reskate.tas.clock, 0.001), "a clock that slow hangs the game")
++        assert(not pcall(reskate.tas.clock, 100))
++        assert(reskate.tas.line_stop())
++        assert(reskate.tas.line().phase == "off")
++        assert(reskate.tas.line_position(0) == nil)
++        assert(reskate.tas.line_bodies(0) == nil)
++        assert(not pcall(reskate.tas.line_seek, -1, 0, 0, true))
++        assert(not pcall(reskate.tas.line_bodies, 36001))
++    )", R"("tas")")});
++    running(host, "liner", environment);
++    check(environment.fake.tas_calls == script_calls + "line-start 1 180;line-seek 0 10 180 true;line-seek 0 10 180 false;line-go;paused true;paused false;hold;halt;no-bail true;no-bail false;clock 0.05;clock 4;clock 1;line-stop;",
++        "line calls reach the game: " + environment.fake.tas_calls);
++
++    using namespace dingosdk::input;
++    const auto pad = [](std::int16_t x) { PadOutput value{}; value.left_x = x; return value; };
++    {
++        // A line: going back plays it from the start, and goes on from there without what came after.
++        StepScript line;
++        check(line.record_line("one", 0, 100).empty(), "a line starts");
++        check(line.hold() && line.status().holding, "held until its start");
++        check(line.on_read(0, pad(50), true)->left_x == 0, "held, the game reads a neutral controller");
++        line.step();
++        check(line.status().length == 0, "a held step counts for nothing");
++        line.run_up(0, 0, true);
++        check(line.status().mode == StepScript::Mode::recording && !line.status().holding && line.status().length == 0, "a run up of nothing hands over at once");
++        line.go();
++        for (std::int16_t i = 1; i <= 6; ++i) {
++            (void)line.on_read(0, pad(i), true);
++            line.step();
++        }
++        check(line.status().length == 6, "six steps recorded");
++        check(line.hold(), "it holds to go back");
++        check(line.status().length == 6, "nothing is gone yet");
++        line.run_up(0, 4, true);
++        check(line.status().mode == StepScript::Mode::playing && line.status().step == 0, "it plays from the start");
++        check(line.on_read(0, pad(50), true)->left_x == 0, "neutral before the first step, as when recording");
++        line.step();
++        check(line.on_read(0, pad(50), true)->left_x == 1, "the first frame");
++        line.step();
++        check(line.on_read(0, pad(50), true)->left_x == 2, "the next");
++        line.step();
++        line.step();
++        check(line.status().mode == StepScript::Mode::recording && line.status().step == 4 && line.status().length == 4, "at the moment it records, without what came after");
++        check(line.on_read(0, pad(70), true)->left_x == 4, "with the last value it played");
++        line.step();
++        check(line.status().length == 5 && line.on_read(0, pad(71), true)->left_x == 4, "still that one until go, so the countdown changes nothing");
++        line.go();
++        line.step();
++        check(line.status().length == 6 && line.on_read(0, pad(72), true)->left_x == 71, "then the controller takes over");
++        line.set_paused(true);
++        line.interrupt();
++        check(!line.on_read(0, pad(1), false), "the pad is not replaced without the input");
++        check(!line.status().holding && line.status().mode == StepScript::Mode::recording, "paused, the input going costs nothing");
++        line.step();
++        check(line.status().length == 7, "and the steps count, with what the game read");
++        line.hold_input();
++        check(line.on_read(0, pad(90), true)->left_x == 0, "held, the game reads what it last read");
++        line.step();
++        check(line.status().length == 8 && line.on_read(0, pad(91), true)->left_x == 0, "whatever the controller does, until go");
++        line.go();
++        line.set_paused(false);
++        line.interrupt();
++        check(line.status().mode == StepScript::Mode::off && line.status().length == 8 && !line.on_read(0, pad(5), true), "the game's menu ends the recording, the line stays, and the controller is yours");
++        line.run_up(0, 8, false);
++        for (int i = 0; i < 8; ++i) line.step();
++        check(line.status().mode == StepScript::Mode::off && line.status().stopped == "played" && line.status().length == 8, "a whole playing ends and keeps it all");
++        check(line.hold() && line.status().holding, "and it can go back again from there");
++        line.interrupt();
++        check(line.status().mode == StepScript::Mode::recording && line.status().holding, "a menu closing as it goes back costs nothing");
++        line.halt();
++        check(line.status().mode == StepScript::Mode::off && !line.status().holding && line.status().length == 8, "stopping everything keeps the line");
++        check(!line.on_read(0, pad(5), true), "and the controller is yours");
++        check(line.hold() && line.status().holding, "and it can go back from there");
++        line.stop("one");
++        check(line.status().mode == StepScript::Mode::off, "it stops");
++    }
++    {
++        // A press that opens a menu goes to the game when it is pressed, and never again.
++        StepScript line;
++        PadOutput press = pad(7);
++        press.buttons = 0x1002; // D-pad down and A
++        check(line.record_line("one", 0, 100).empty(), "a line starts");
++        check(line.on_read(0, press, true)->buttons == 0, "neutral before the first step");
++        line.step();
++        check(line.on_read(0, press, true)->buttons == 0x1002, "when pressed, the game has it all");
++        line.step();
++        (void)line.hold();
++        line.run_up(0, 2, true);
++        line.step();
++        check(line.on_read(0, pad(0), true)->buttons == 0x1000 && line.status().mode == StepScript::Mode::playing, "played back, it has no D-pad");
++        line.step();
++        check(line.status().mode == StepScript::Mode::recording && line.on_read(0, pad(0), true)->buttons == 0x1000, "nor while waiting for the controller to take over");
++        line.go();
++        line.stop("one");
++    }
++    StepScript s;
++    check(!s.play("one", 0, 0).empty(), "nothing to play yet");
++    check(!s.record("one", 5, 10).empty(), "no such controller");
++    check(!s.record("one", 0, 0).empty() && !s.record("one", 0, StepScript::max_steps + 1).empty(), "script lengths are bounded");
++    check(s.record("one", 0, 3).empty(), "recording starts");
++    check(!s.record("two", 0, 3).empty(), "another owner cannot take a running script");
++    check(s.replacing(0) && !s.replacing(1), "recording answers that controller's reads");
++    check(s.on_read(0, pad(1), true)->left_x == 0, "neutral until the first step latches");
++    s.step();
++    check(!s.on_read(1, pad(99), true), "another controller goes through");
++    check(s.on_read(0, pad(2), true)->left_x == 1, "the value the first step latched, not the newer one");
++    check(s.on_read(0, pad(3), true)->left_x == 1, "every read until the next step gets it");
++    s.step();
++    check(s.on_read(0, pad(4), true)->left_x == 3, "the newest value when that step ran");
++    s.step();
++    check(s.status().mode == StepScript::Mode::off && s.status().stopped == "recorded" && s.status().length == 3, "it stops when full");
++    check(s.status().unread == 0, "every step of it had a read before it");
++    s.step();
++    check(s.status().length == 3, "steps after the end add nothing");
++    check(!s.on_read(0, pad(50), true), "off, the real pad goes through");
++
++    // A replay gives the reads exactly what the recording's reads got, step for step.
++    check(s.play("one", 0, 0).empty(), "playing starts");
++    check(s.replacing(0) && !s.replacing(1), "only that controller");
++    check(!s.on_read(1, pad(9), true), "another controller goes through");
++    check(s.on_read(0, pad(50), true)->left_x == 0, "neutral until the first step, as when recording");
++    s.step();
++    check(s.on_read(0, pad(50), true)->left_x == 1, "the first frame, whatever the pad reads");
++    check(s.on_read(0, pad(50), true)->left_x == 1, "every read in a step gets the same value");
++    s.step();
++    check(s.on_read(0, pad(50), true)->left_x == 3, "the next frame comes with the step");
++    s.step();
++    check(s.on_read(0, pad(50), true)->left_x == 4, "the last frame");
++    s.step();
++    check(s.status().mode == StepScript::Mode::off && s.status().stopped == "played", "it ends with the script");
++    check(s.play("one", 0, 0).empty(), "it plays again");
++    (void)s.on_read(0, pad(50), true);
++    s.step();
++    s.step();
++    (void)s.on_read(0, pad(50), true);
++    s.step();
++    check(s.status().unread == 1 && s.status().first_unread == std::vector<std::size_t>{1}, "a step with no read before it is counted, by its number");
++    s.stop("one");
++    check(!s.on_read(0, pad(50), true), "and the pad comes back");
++
++    check(s.play("one", 0, 1).empty(), "a lead reads ahead");
++    check(s.on_read(0, pad(0), true)->left_x == 1, "one step ahead");
++    s.stop("two");
++    check(s.status().mode == StepScript::Mode::playing, "only its owner stops it");
++    check(!s.on_read(0, pad(50), false) && s.status().mode == StepScript::Mode::off, "losing the input ends it");
++    check(s.status().stopped == "the game lost the input" && s.status().length == 3, "and says so, keeping the script");
++    check(s.play("one", 0, 0).empty(), "it can play again");
++    s.interrupt();
++    check(s.status().mode == StepScript::Mode::off, "a held read ends it too");
++    check(!StepScript::frame_at(0, 0, 5) && !StepScript::frame_at(1, -2, 5) && StepScript::frame_at(4, -2, 5) == 1 && StepScript::frame_at(4, 8, 5) == 4, "lead stays in the script");
++}
++
+ void controller_reports_preserve_non_controls() {
+     using namespace dingosdk;
+     for (int variant = 0; variant < 5; ++variant) {
+@@ -7822,6 +8077,7 @@ int main() {
+         run(plugins_place_world_entities);
+         run(plugins_have_what_a_prop_hunt_needs);
+         run(plugins_write_normalized_controllers);
++        run(plugins_script_input_by_physics_step);
+         run(controller_reports_preserve_non_controls);
+         run(plugins_read_frames_and_hold_gameplay_options);
+ #ifdef _WIN32
+diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
+index 8abd30b..65b8aed 100644
+--- a/Extension/Plugins/plugin_api_world.cpp
++++ b/Extension/Plugins/plugin_api_world.cpp
+@@ -2930,6 +2930,278 @@ struct WorldApi {
+         lua_setfield(L, -2, "playstation");
+         return 1;
+     }
++    // ---- tas: a controller's input by physics step, single player only -----------------------------------
++    static unsigned tas_controller(lua_State* L, int at) {
++        if (lua_type(L, at) == LUA_TSTRING) {
++            if (std::string_view(lua_tostring(L, at)) != "playstation") luaL_error(L, "controller is 0 to 3, or playstation");
++            return 4;
++        }
++        const double n = luaL_optnumber(L, at, 0);
++        if (!std::isfinite(n) || n < 0 || n > 3 || n != std::floor(n)) luaL_error(L, "controller is 0 to 3, or playstation");
++        return static_cast<unsigned>(n);
++    }
++    // `at`: begin at this many physics steps since the skater was built, not now.
++    static std::size_t tas_start_step(lua_State* L, int index) {
++        const double at = luaL_optnumber(L, index, 0);
++        if (!(at >= 0 && at <= 36000) || at != std::floor(at)) luaL_argerror(L, index, "a start is 0 to 36000 steps since the spawn");
++        return static_cast<std::size_t>(at);
++    }
++    // tas.record(controller, steps, at): records what the game reads from it, one value each physics step.
++    static int tas_record(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.record");
++        const auto controller = tas_controller(L, 1);
++        const double steps = luaL_optnumber(L, 2, 18000);
++        if (!(steps >= 1 && steps <= 18000) || steps != std::floor(steps)) luaL_argerror(L, 2, "a script is 1 to 18000 steps");
++        return result(L, game(plugin).tas_record(plugin.id(), controller, static_cast<std::size_t>(steps), tas_start_step(L, 3)));
++    }
++    // tas.play(controller, lead, restore, at): gives the script back to the game from its first step. `lead`
++    // is in steps. `restore` puts back the motion taken when it was recorded: "board", "all" or nil.
++    static int tas_play(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.play");
++        const auto controller = tas_controller(L, 1);
++        const double lead = luaL_optnumber(L, 2, 0);
++        if (!(lead >= -8 && lead <= 8) || lead != std::floor(lead)) luaL_argerror(L, 2, "a lead is -8 to 8 steps");
++        auto restore = TasRestore::none;
++        if (!lua_isnoneornil(L, 3)) {
++            const std::string_view word = luaL_checkstring(L, 3);
++            if (word == "board") restore = TasRestore::board;
++            else if (word == "all") restore = TasRestore::all;
++            else if (word == "lock") restore = TasRestore::lock;
++            else luaL_argerror(L, 3, "a restore is \"board\", \"all\", \"lock\" or nil");
++        }
++        return result(L, game(plugin).tas_play(plugin.id(), controller, static_cast<int>(lead), restore, tas_start_step(L, 4)));
++    }
++    // tas.save(slot): takes the skater's bodies, at the next physics step. tas.load(slot, what) puts them
++    // back: "all" (the default) with the skeleton's, or "board". Slots are 1 to 4. tas.saves() says how many
++    // of each have been written, as a save or load is only asked for here.
++    static unsigned tas_slot(lua_State* L, int index) {
++        const double slot = luaL_optnumber(L, index, 1);
++        if (!(slot >= 1 && slot <= 4) || slot != std::floor(slot)) luaL_argerror(L, index, "a slot is 1 to 4");
++        return static_cast<unsigned>(slot) - 1;
++    }
++    static int tas_save(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.save");
++        return result(L, game(plugin).tas_save(tas_slot(L, 1)));
++    }
++    static int tas_load(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.load");
++        const auto slot = tas_slot(L, 1);
++        const std::string_view what = luaL_optstring(L, 2, "all");
++        if (what != "all" && what != "board") luaL_argerror(L, 2, "a load is \"all\" or \"board\"");
++        return result(L, game(plugin).tas_load(slot, what == "all"));
++    }
++    static int tas_saves(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.saves");
++        const auto [saves, loads] = game(plugin).tas_save_counts();
++        lua_pushnumber(L, static_cast<double>(saves));
++        lua_pushnumber(L, static_cast<double>(loads));
++        return 2;
++    }
++    // tas.history(on): keeps the skater's bodies for the last ten seconds. tas.rewind(steps) goes back that
++    // many physics steps (1 to 600) in it, dropping what it goes back over. tas.history_counts() says how
++    // many steps are held, and how many rewinds have been written.
++    static int tas_history(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.history");
++        return result(L, game(plugin).tas_history(lua_toboolean(L, 1) != 0));
++    }
++    static int tas_rewind(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.rewind");
++        const double steps = luaL_optnumber(L, 1, 60);
++        if (!(steps >= 1 && steps <= 600) || steps != std::floor(steps)) luaL_argerror(L, 1, "a rewind is 1 to 600 steps");
++        return result(L, game(plugin).tas_rewind(static_cast<std::size_t>(steps)));
++    }
++    static int tas_history_counts(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.history_counts");
++        const auto [held, rewinds] = game(plugin).tas_history_counts();
++        lua_pushnumber(L, static_cast<double>(held));
++        lua_pushnumber(L, static_cast<double>(rewinds));
++        return 2;
++    }
++    // tas.virtual_time(on): research: the clock moves only with the skater's physics steps. Off when the
++    // plugin stops. Never in a session.
++    static int tas_virtual_time(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.virtual_time");
++        return result(L, game(plugin).tas_virtual_time(lua_toboolean(L, 1) != 0));
++    }
++    // tas.dump(every): research: the skater's raw memory is taken through the next run, the first steps
++    // and then every `every` steps. tas.dump_save(name) writes it to logs/tas_state/<name>.tasd. A plugin
++    // never sees the bytes.
++    static int tas_dump(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.dump");
++        const double every = luaL_optnumber(L, 1, 15);
++        if (!(every >= 1 && every <= 3600) || every != std::floor(every)) luaL_argerror(L, 1, "every is 1 to 3600 steps");
++        return result(L, game(plugin).tas_dump(static_cast<std::uint32_t>(every)));
++    }
++    static int tas_dump_save(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.dump_save");
++        const std::string_view name = luaL_checkstring(L, 1);
++        bool fine = !name.empty() && name.size() <= 80 && name.front() != '.';
++        for (const char c : name)
++            fine = fine && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
++        if (!fine) luaL_argerror(L, 1, "a name is 1 to 80 letters, digits, '-', '_' and '.'");
++        return result(L, game(plugin).tas_dump_save(name));
++    }
++    // A line. tas.line_start(controller, at) records from that step since the skater was last built, after the
++    // caller's teleport. tas.line() says what it is doing. tas.line_seek(from, to, at, hand_over), after the
++    // caller's teleport to step `from`, waits for that step since the build, plays locked up to step `to`, and with
++    // `hand_over` records on from there, forgetting what came after, with the last value it played until
++    // tas.line_go(), as after tas.line_hold(). tas.line_paused(on) says the timeline has the input. line_position and line_bodies say where a step had
++    // the board and the skeleton.
++    static std::size_t tas_steps(lua_State* L, int index) {
++        const double steps = luaL_checknumber(L, index);
++        if (!(steps >= 0 && steps <= 36000) || steps != std::floor(steps)) luaL_argerror(L, index, "a step of a line is 0 to 36000");
++        return static_cast<std::size_t>(steps);
++    }
++    static int tas_line_start(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_start");
++        return result(L, game(plugin).tas_line_start(plugin.id(), tas_controller(L, 1), tas_steps(L, 2)));
++    }
++    static int tas_line_seek(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_seek");
++        return result(L, game(plugin).tas_line_seek(tas_steps(L, 1), tas_steps(L, 2), tas_steps(L, 3), lua_toboolean(L, 4) != 0));
++    }
++    static int tas_line_go(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_go");
++        return result(L, game(plugin).tas_line_go());
++    }
++    static int tas_line_stop(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_stop");
++        return result(L, game(plugin).tas_line_stop());
++    }
++    // tas.line_halt() ends what a line is doing, keeping what it holds. tas.clock(scale), 0.05 to 8, runs the game's
++    // clock at that speed without changing the length of a step; 1 gives back what it found.
++    static int tas_line_halt(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_halt");
++        return result(L, game(plugin).tas_line_halt());
++    }
++    // tas.no_bail(on): the game's wipeouts off while the plugin keeps it so.
++    static int tas_no_bail(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.no_bail");
++        return result(L, game(plugin).tas_no_bail(lua_toboolean(L, 1) != 0));
++    }
++    static int tas_clock(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.clock");
++        const double scale = luaL_checknumber(L, 1);
++        if (!(scale >= 0.05 && scale <= 8)) luaL_argerror(L, 1, "the clock runs at 0.05 to 8");
++        return result(L, game(plugin).tas_clock(static_cast<float>(scale)));
++    }
++    static int tas_line_hold(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_hold");
++        return result(L, game(plugin).tas_line_hold());
++    }
++    static int tas_line_paused(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_paused");
++        return result(L, game(plugin).tas_line_paused(lua_toboolean(L, 1) != 0));
++    }
++    static int tas_line(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line");
++        const auto s = game(plugin).tas_line();
++        lua_createtable(L, 0, 4);
++        lua_pushlstring(L, s.phase.data(), s.phase.size());
++        lua_setfield(L, -2, "phase");
++        lua_pushnumber(L, static_cast<double>(s.length));
++        lua_setfield(L, -2, "length");
++        lua_pushnumber(L, static_cast<double>(s.step));
++        lua_setfield(L, -2, "step");
++        lua_pushnumber(L, static_cast<double>(s.since_spawn));
++        lua_setfield(L, -2, "since_spawn");
++        return 1;
++    }
++    static int tas_line_position(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_position");
++        const auto at = game(plugin).tas_line_position(tas_steps(L, 1));
++        if (!at) {
++            lua_pushnil(L);
++            return 1;
++        }
++        lua_pushvector(L, (*at)[0], (*at)[1], (*at)[2]);
++        return 1;
++    }
++    // {board = 16 numbers, skeleton = 26 positions}, or nil.
++    static int tas_line_bodies(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_bodies");
++        const auto at = game(plugin).tas_line_bodies(tas_steps(L, 1));
++        if (!at) {
++            lua_pushnil(L);
++            return 1;
++        }
++        lua_createtable(L, 0, 2);
++        lua_createtable(L, 16, 0);
++        for (std::size_t i = 0; i < at->board.size(); ++i) {
++            lua_pushnumber(L, at->board[i]);
++            lua_rawseti(L, -2, static_cast<int>(i + 1));
++        }
++        lua_setfield(L, -2, "board");
++        lua_createtable(L, 26, 0);
++        for (std::size_t i = 0; i < at->skeleton.size(); ++i) {
++            lua_pushvector(L, at->skeleton[i][0], at->skeleton[i][1], at->skeleton[i][2]);
++            lua_rawseti(L, -2, static_cast<int>(i + 1));
++        }
++        lua_setfield(L, -2, "skeleton");
++        return 1;
++    }
++    static int tas_stop(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.stop");
++        game(plugin).tas_stop(plugin.id());
++        return 0;
++    }
++    static int tas_status(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.status");
++        const auto s = game(plugin).tas_status();
++        lua_createtable(L, 0, 11);
++        lua_pushboolean(L, s.virtual_time);
++        lua_setfield(L, -2, "virtual_time");
++        lua_pushnumber(L, static_cast<double>(s.clock_reads));
++        lua_setfield(L, -2, "clock_reads");
++        lua_pushnumber(L, static_cast<double>(s.since_spawn));
++        lua_setfield(L, -2, "since_spawn");
++        lua_pushnumber(L, static_cast<double>(s.unread));
++        lua_setfield(L, -2, "unread");
++        lua_createtable(L, static_cast<int>(s.first_unread.size()), 0);
++        for (std::size_t i = 0; i < s.first_unread.size(); ++i) {
++            lua_pushnumber(L, static_cast<double>(s.first_unread[i]));
++            lua_rawseti(L, -2, static_cast<int>(i + 1));
++        }
++        lua_setfield(L, -2, "first_unread");
++        lua_pushboolean(L, s.captured);
++        lua_setfield(L, -2, "captured");
++        lua_pushnumber(L, static_cast<double>(s.restores));
++        lua_setfield(L, -2, "restores");
++        lua_pushlstring(L, s.mode.data(), s.mode.size());
++        lua_setfield(L, -2, "mode");
++        lua_pushnumber(L, static_cast<double>(s.step));
++        lua_setfield(L, -2, "step");
++        lua_pushnumber(L, static_cast<double>(s.length));
++        lua_setfield(L, -2, "length");
++        lua_pushlstring(L, s.stopped.data(), s.stopped.size());
++        lua_setfield(L, -2, "stopped");
++        return 1;
++    }
+     // A whole replacement for a real controller, in the same units as input.gamepad().
+     static int input_write(lua_State* L) {
+         auto& plugin = plugin_of(L);
+@@ -3274,6 +3546,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+     add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
+     add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
+     add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
++    add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
++        {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
++        {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
++        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}});
+     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
+     add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
+                                   {"ready", entities_ready}, {"blueprints", entities_blueprints},
+diff --git a/Extension/Plugins/plugin_approval.cpp b/Extension/Plugins/plugin_approval.cpp
+index 173bdd7..6decf4f 100644
+--- a/Extension/Plugins/plugin_approval.cpp
++++ b/Extension/Plugins/plugin_approval.cpp
+@@ -63,6 +63,7 @@ constexpr Capability capabilities[] = {
+     {"camera", "CAMERA", Risk::amber, "Control the camera"},
+     {"input", "INPUT", Risk::amber, "Bind your keys, pads and mouse, and read text input"},
+     {"input.write", "INPUT", Risk::amber, "Replace your controller input while you play"},
++    {"tas", "INPUT", Risk::amber, "Record your controller input and play it back, offline"},
+     // Red: it can relabel anything the game shows, its store's buttons and prices included.
+     {"strings", "SCREEN", Risk::red, "Change the text the game shows, in its menus and its store"},
+     {"capture", "SCREEN", Risk::amber, "Record your screen"},
+@@ -292,6 +293,7 @@ std::string approval_prompt(const std::vector<PermissionGroup>& groups) {
+         } else if (group.category == "INPUT") {
+             if (has("input")) actions.push_back("bind keys, pads, and mouse, and read text input");
+             if (has("input.write")) actions.push_back("replace your controller input while you play");
++            if (has("tas")) actions.push_back("record your controller input and play it back, offline");
+         } else if (group.category == "SCREEN") {
+             if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
+             if (has("capture")) actions.push_back("record your screen");
+diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
+index 61689ee..cd67ef8 100644
+--- a/Extension/Plugins/plugin_game.h
++++ b/Extension/Plugins/plugin_game.h
+@@ -143,7 +143,37 @@ struct PhysicsStep {
+     struct Pose { EffectMatrix transform{}; Vec3 velocity{}; };
+     std::map<std::string, Pose, std::less<>> poses; // all available local bodies, including airborne ones
+     std::optional<std::uint32_t> state;
++    std::optional<Pose> board; // the board's root, which poses leaves out
++    std::optional<Vec3> board_spin;
++    std::string motion_hash; // every body's exact motion, as hexadecimal; empty when unread
++    std::string board_hash;  // the same of the board's bodies alone
+ };
++// What a script of controller input by physics step is doing (reskate.tas).
++struct TasStatus {
++    std::string mode; // "off", "recording" or "playing"
++    std::size_t step{}, length{};
++    std::string stopped; // why the last run ended: "recorded", "played", "stopped" or "the game lost the input"
++    bool captured{};     // the bodies' motion was taken when the recording began
++    std::size_t restores{}; // restores written since the game started; a failed one does not count
++    std::size_t unread{};   // steps of the run the game read no input before
++    std::vector<std::size_t> first_unread; // the first of them
++    std::size_t since_spawn{}; // physics steps since the skater was last built (a spawn, a teleport)
++    bool virtual_time{};       // the clock is driven by the physics steps
++    std::uint64_t clock_reads{}; // reads of the clock the hook has seen
++};
++// A line: one recording from a standing start that can go back to any step of it (reskate.tas.line).
++struct TasLine {
++    std::string phase; // "off", "live", "seeking", "counting", "running_up" or "played"
++    std::size_t length{}, step{}, since_spawn{};
++};
++// Where a step of a line had the skater: the board's world matrix, and each skeleton body's place.
++struct TasBodies {
++    std::array<float, 16> board{};
++    std::array<std::array<float, 3>, 26> skeleton{};
++};
++// What a script's playing puts back of the motion taken when it was recorded.
++// `lock`: every step of the playing, the bodies are put back as that step was recorded, so nothing can drift.
++enum class TasRestore { none, board, all, lock };
+ // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
+ // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
+ struct LaunchShape {
+@@ -1076,6 +1106,34 @@ public:
+     virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
+     virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
+     virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
++    // `at`: start at this many steps since the skater was built, not now (0). Mode "waiting" until then.
++    virtual std::string tas_record(std::string_view /*plugin*/, unsigned /*controller*/, std::size_t /*steps*/, std::size_t /*at*/) { return unavailable; }
++    virtual std::string tas_play(std::string_view /*plugin*/, unsigned /*controller*/, int /*lead*/, TasRestore, std::size_t /*at*/) { return unavailable; }
++    virtual void tas_stop(std::string_view /*plugin*/) {}
++    // Save and load the skater's bodies at any moment. `slot` from 0. Applied at the next physics step.
++    virtual std::string tas_save(unsigned /*slot*/) { return unavailable; }
++    virtual std::string tas_load(unsigned /*slot*/, bool /*skeleton*/) { return unavailable; }
++    virtual std::pair<std::size_t, std::size_t> tas_save_counts() { return {0, 0}; } // saves and loads written
++    // A rolling history of the skater's bodies, and going back in it by steps at the next physics step.
++    virtual std::string tas_history(bool /*on*/) { return unavailable; }
++    virtual std::string tas_rewind(std::size_t /*steps*/) { return unavailable; }
++    virtual std::pair<std::size_t, std::size_t> tas_history_counts() { return {0, 0}; } // steps held, rewinds written
++    virtual std::string tas_virtual_time(bool /*on*/) { return unavailable; }
++    virtual std::string tas_dump(std::uint32_t /*every*/) { return unavailable; }
++    virtual std::string tas_dump_save(std::string_view /*name*/) { return unavailable; }
++    virtual TasStatus tas_status() { return {"off", 0, 0, {}, false, 0, 0, {}, 0, false, 0}; }
++    virtual std::string tas_line_start(std::string_view /*plugin*/, unsigned /*controller*/, std::size_t /*at*/) { return unavailable; }
++    virtual std::string tas_line_seek(std::size_t /*from*/, std::size_t /*to*/, std::size_t /*at*/, bool /*hand_over*/) { return unavailable; }
++    virtual std::string tas_line_go() { return unavailable; }
++    virtual std::string tas_line_stop() { return unavailable; }
++    virtual std::string tas_line_paused(bool /*paused*/) { return unavailable; }
++    virtual std::string tas_line_hold() { return unavailable; }
++    virtual std::string tas_line_halt() { return unavailable; }
++    virtual std::string tas_clock(float /*scale*/) { return unavailable; }
++    virtual std::string tas_no_bail(bool /*on*/) { return unavailable; }
++    virtual TasLine tas_line() { return {"off", 0, 0, 0}; }
++    virtual std::optional<TasBodies> tas_line_bodies(std::size_t /*step*/) { return std::nullopt; }
++    virtual std::optional<std::array<float, 3>> tas_line_position(std::size_t /*step*/) { return std::nullopt; }
+     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
+     // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
+     virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
+diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
+index 5c0acee..2a82d2e 100644
+--- a/Extension/Plugins/plugin_game_runtime.cpp
++++ b/Extension/Plugins/plugin_game_runtime.cpp
+@@ -30,6 +30,10 @@
+ #include <mutex>
+ #include "Extension/Assets/live_mods.h"
+ #include "Extension/Skater/game_speed.h"
++#include "Extension/Skater/motion_snapshot.h"
++#include "Extension/Skater/state_dump.h"
++#include "Extension/Skater/virtual_time.h"
++#include "Engine/Game/Build/20260929/skater_state.h"
+ #include "Extension/Skater/launches.h"
+ #include "Extension/Skater/pad_hide.h"
+ #include "Engine/Game/Skater/first_person_cycle.h"
+@@ -46,6 +50,7 @@
+ #include "Extension/Music/spotify_station.h"
+ #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
+ #include "Extension/Profile/local_profile_runtime.h"
++#include "Engine/Game/Settings/simulation_time.h"
+ #include "Extension/Settings/named_settings.h"
+ #include "Engine/Game/Settings/multiplayer_settings_lock.h"
+ #include "Extension/Skater/ai_skaters.h"
+@@ -75,6 +80,7 @@
+ #include "Extension/UI/Overlay/viewmodel.h"
+ #include "Extension/UI/Overlay/scripted_pad.h"
+ #include "Engine/Game/Input/pad_output.h"
++#include "Engine/Game/Input/step_script.h"
+ #include "Engine/Game/Skater/animation_values.h"
+ #include "Extension/Skater/grind_target.h"
+ #include "Engine/Game/Input/gameplay_options.h"
+@@ -87,6 +93,7 @@
+ #include <shellapi.h>
+ #include <algorithm>
+ #include <array>
++#include <charconv>
+ #include <cmath>
+ #include <format>
+ #include <fstream>
+@@ -697,6 +704,12 @@ public:
+             for (std::size_t i = 1; i < skater_body::count; ++i) {
+                 const auto& c = s.body.bodies[i];
+                 if (const auto& pose = s.poses[i]) step.poses.emplace(skater_body::names[i], PhysicsStep::Pose{pose->transform, pose->velocity});
++                if (i == 1) {
++                    if (s.board) step.board = PhysicsStep::Pose{s.board->transform, s.board->velocity};
++                    if (s.board_spin) step.board_spin = Vec3{(*s.board_spin)[0], (*s.board_spin)[1], (*s.board_spin)[2]};
++                    if (s.motion_hash) step.motion_hash = std::format("{:016x}", *s.motion_hash);
++                    if (s.board_hash) step.board_hash = std::format("{:016x}", *s.board_hash);
++                }
+                 if (!c.touching) continue;
+                 const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
+                 step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
+@@ -1085,6 +1098,520 @@ public:
+             axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
+         return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
+     }
++    // ---- input by physics step ------------------------------------------------------------------------
++    // What the physics thread does for the script at the next step: the first step of a recording takes
++    // the bodies' motion, and the first step of a playing puts it back.
++    struct TasMotion {
++        motion_snapshot::Snapshot snapshot; // the physics thread's, but for captured
++        std::atomic<bool> capture_wanted{}, captured{};
++        std::atomic<int> restore_wanted{};  // a TasRestore
++        std::atomic<std::size_t> restores{};
++        std::atomic<std::size_t> since_spawn{};
++        // Every step of the recording, and whether a playing is held to them. The physics thread's: a run
++        // always begins from a step of it (tas_wait).
++        std::vector<motion_snapshot::Snapshot> frames;
++        bool locked{};
++        // Save and load at any moment: the next physics step takes a slot, or puts one back.
++        static constexpr std::size_t slots = 4;
++        std::array<motion_snapshot::Snapshot, slots> saved; // the physics thread's, but for saved_valid
++        std::array<std::atomic<bool>, slots> saved_valid{};
++        std::atomic<int> save_wanted{};  // a slot + 1
++        std::atomic<int> load_wanted{};  // a slot + 1
++        std::atomic<bool> load_skeleton{};
++        std::atomic<std::size_t> saves{}, loads{};
++        // The last ten seconds, a snapshot a step, so a player can go back without having saved. Written
++        // and read by the physics thread alone: the client thread only asks.
++        static constexpr std::size_t history_steps = 600;
++        std::vector<motion_snapshot::Snapshot> history;
++        std::size_t history_next{}, history_count{};
++        // A rewind goes through the game's own teleport, which keeps all the skater's stored places right: the
++        // caller teleports to the moment, and once the game has built the skater there, the bodies go back.
++        static constexpr std::size_t rewind_settle_steps = 3, rewind_give_up_steps = 300;
++        std::size_t rewind_at{}, rewind_waited{};
++        bool rewind_rebuilt{};
++        std::atomic<bool> rewind_waiting{};
++        std::atomic<bool> history_on{};
++        std::atomic<int> rewind_wanted{}; // steps
++        std::atomic<std::size_t> history_length{}, rewinds{};
++        // A run waiting for its step since the spawn, so runs begin at the same point of a skater's life.
++        struct Waiting {
++            bool recording{};
++            std::string owner;
++            unsigned controller{};
++            std::size_t steps{}, at{};
++            int lead{};
++            TasRestore restore{TasRestore::none};
++        };
++        std::mutex waiting_mutex;
++        std::optional<Waiting> waiting;
++        // A line: one recording that starts from a standing skater and goes on. The game keeps its own idea of
++        // where the skater is and what it does, which writing the bodies does not reach: a skater going back
++        // straight to a moment it was moving at flies off when let go. So going back starts where the line
++        // started and plays it, locked, up to that moment, and the game's state comes along step by step.
++        enum class Line : int { off, live, seeking, counting, running_up, played };
++        enum class LineAsk : int { none, start, seek, stop, halt };
++        static constexpr std::size_t line_settle_steps = 3, line_give_up_steps = 300;
++        std::atomic<Line> line{Line::off};
++        std::atomic<LineAsk> line_ask{LineAsk::none};
++        std::string line_owner; // set with LineAsk::start, under waiting_mutex
++        unsigned line_controller{};
++        std::atomic<std::size_t> line_length{}, line_step{};
++        std::atomic<std::size_t> line_from{}, line_to{}, line_at{};
++        std::atomic<bool> line_hand_over{};
++        bool line_rebuilt{};
++        std::size_t line_waited{};
++        std::mutex frames_mutex; // frames shrinking, against a read from the client thread
++        float line_time{}; // game time since the last frame of a line, so slow motion records at the same pace
++    };
++    static TasMotion& tas_motion() { static auto* value = new TasMotion; return *value; }
++    static void tas_line_off(TasMotion& m) {
++        std::string owner;
++        {
++            std::lock_guard lock(m.waiting_mutex);
++            owner = m.line_owner;
++        }
++        input::step_script().stop(owner);
++        m.line.store(TasMotion::Line::off, std::memory_order_release);
++    }
++    // What a line does this step: its asks first, then the phase it is in. It never holds the skater: a stop
++    // is the game's slow motion, and a run up is a locked playing.
++    static void tas_line_step(TasMotion& m, std::size_t since) {
++        using Line = TasMotion::Line;
++        using Ask = TasMotion::LineAsk;
++        auto& script = input::step_script();
++        switch (m.line_ask.exchange(Ask::none, std::memory_order_acq_rel)) {
++        case Ask::start: {
++            std::string owner;
++            unsigned controller{};
++            {
++                std::lock_guard lock(m.waiting_mutex);
++                owner = m.line_owner;
++                controller = m.line_controller;
++            }
++            if (script.record_line(owner, controller, input::StepScript::max_steps).empty() && script.hold()) {
++                std::lock_guard lock(m.frames_mutex);
++                m.frames.clear();
++                m.frames.reserve(input::StepScript::max_steps);
++                m.locked = false;
++                m.line_rebuilt = false;
++                m.line_waited = 0;
++                m.line.store(Line::seeking, std::memory_order_release);
++            }
++            break;
++        }
++        case Ask::stop:
++            tas_line_off(m);
++            break;
++        case Ask::halt:
++            script.halt();
++            if (m.line.load(std::memory_order_acquire) != Line::off) m.line.store(Line::played, std::memory_order_release);
++            break;
++        case Ask::seek:
++            if (m.line.load(std::memory_order_acquire) != Line::off && script.hold()) {
++                m.line_rebuilt = false;
++                m.line_waited = 0;
++                m.line.store(Line::seeking, std::memory_order_release);
++            }
++            break;
++        case Ask::none:
++            break;
++        }
++        const auto status = script.status();
++        switch (m.line.load(std::memory_order_acquire)) {
++        case Line::off:
++        case Line::played:
++            break;
++        case Line::live:
++            // Full, or the input went (the game's menu): it stops there, and the line stays to go back in.
++            if (status.mode == input::StepScript::Mode::off) m.line.store(Line::played, std::memory_order_release);
++            break;
++        case Line::seeking:
++            ++m.line_waited;
++            if ((m.line_rebuilt && since >= TasMotion::line_settle_steps) || m.line_waited > TasMotion::line_give_up_steps)
++                m.line.store(Line::counting, std::memory_order_release);
++            break;
++        case Line::counting:
++            // At the same step of the skater's life as when the line began.
++            if (since >= m.line_at.load(std::memory_order_acquire)) {
++                m.locked = true;
++                script.run_up(m.line_from.load(std::memory_order_acquire), m.line_to.load(std::memory_order_acquire), m.line_hand_over.load(std::memory_order_acquire));
++                m.line.store(Line::running_up, std::memory_order_release);
++            }
++            break;
++        case Line::running_up:
++            if (status.mode == input::StepScript::Mode::recording) m.line.store(Line::live, std::memory_order_release);
++            else if (status.mode == input::StepScript::Mode::off) m.line.store(Line::played, std::memory_order_release);
++            break;
++        }
++    }
++    static void tas_begin_recording(std::string_view owner, unsigned controller, std::size_t steps, std::string& why) {
++        why = input::step_script().record(owner, controller, steps);
++        if (why.empty()) {
++            tas_motion().frames.clear();
++            tas_motion().frames.reserve(steps);
++            tas_motion().locked = false;
++            tas_motion().captured.store(false, std::memory_order_release);
++            tas_motion().capture_wanted.store(true, std::memory_order_release);
++        }
++    }
++    static void tas_begin_playing(std::string_view owner, unsigned controller, int lead, TasRestore restore, std::string& why) {
++        why = input::step_script().play(owner, controller, lead);
++        if (why.empty()) {
++            tas_motion().locked = restore == TasRestore::lock;
++            // A locked playing puts back its first step itself, with all the others.
++            if (restore != TasRestore::lock) tas_motion().restore_wanted.store(static_cast<int>(restore), std::memory_order_release);
++        }
++    }
++    // A rewind drops what it goes back over, so asking again goes further back. A step that can't be read
++    // ends the history: an old snapshot is never put back across a gap.
++    static void tas_step_history(TasMotion& m, const NoBailSkater& skater, std::size_t since) noexcept {
++        if (!m.history_on.load(std::memory_order_acquire)) return;
++        const auto size = TasMotion::history_steps;
++        if (m.rewind_waiting.load(std::memory_order_acquire)) {
++            ++m.rewind_waited;
++            if (m.rewind_rebuilt && since >= TasMotion::rewind_settle_steps) {
++                if (motion_snapshot::restore(skater, m.history[m.rewind_at], true)) m.rewinds.fetch_add(1, std::memory_order_relaxed);
++                m.rewind_waiting.store(false, std::memory_order_release);
++            } else if (m.rewind_waited > TasMotion::rewind_give_up_steps) {
++                m.rewind_waiting.store(false, std::memory_order_release); // the teleport never came: carry on from here
++            }
++            return; // nothing from a skater on its way back is kept
++        }
++        if (const auto wanted = m.rewind_wanted.exchange(0, std::memory_order_acq_rel); wanted > 0 && m.history_count > 0) {
++            // history_next - 1 is the newest; going back `wanted` steps, at most to the oldest.
++            const auto back = std::min<std::size_t>(static_cast<std::size_t>(wanted), m.history_count - 1);
++            m.rewind_at = (m.history_next + size - 1 - back) % size;
++            m.history_next = (m.rewind_at + 1) % size;
++            m.history_count -= back;
++            m.history_length.store(m.history_count, std::memory_order_release);
++            m.rewind_rebuilt = false;
++            m.rewind_waited = 0;
++            m.rewind_waiting.store(true, std::memory_order_release);
++            return;
++        }
++        if (!motion_snapshot::capture(skater, m.history[m.history_next])) {
++            m.history_count = 0;
++            m.history_length.store(0, std::memory_order_release);
++            return;
++        }
++        m.history_next = (m.history_next + 1) % size;
++        m.history_count = std::min(m.history_count + 1, size);
++        m.history_length.store(m.history_count, std::memory_order_release);
++    }
++    static void tas_on_step(const NoBailSkater& skater, float, bool) noexcept {
++        virtual_time::on_step();
++        auto& m = tas_motion();
++        std::uint32_t built{};
++        const std::size_t since = memory::peek(skater.core + addr::skater_state::core_steps_since_built, built) ? built : 0;
++        // A skater built anew (a respawn, a teleport): what was taken before refers to objects now gone.
++        if (since + 1 < m.since_spawn.load(std::memory_order_relaxed)) {
++            if (m.rewind_waiting.load(std::memory_order_acquire)) m.rewind_rebuilt = true;
++            m.line_rebuilt = true;
++        }
++        m.since_spawn.store(since, std::memory_order_release);
++        try {
++            std::lock_guard lock(m.waiting_mutex);
++            if (m.waiting && since == m.waiting->at) {
++                std::string why;
++                if (m.waiting->recording) tas_begin_recording(m.waiting->owner, m.waiting->controller, m.waiting->steps, why);
++                else tas_begin_playing(m.waiting->owner, m.waiting->controller, m.waiting->lead, m.waiting->restore, why);
++                m.waiting.reset();
++            }
++        } catch (...) {
++        }
++        if (m.capture_wanted.exchange(false, std::memory_order_acq_rel)) {
++            m.captured.store(motion_snapshot::capture(skater, m.snapshot), std::memory_order_release);
++            // A recording goes through the restore its replays will: what the sync rounds, it rounds here too.
++            if (m.captured.load(std::memory_order_acquire)) (void)motion_snapshot::restore(skater, m.snapshot, false);
++        }
++        if (const auto wanted = m.restore_wanted.exchange(0, std::memory_order_acq_rel))
++            if (motion_snapshot::restore(skater, m.snapshot, wanted == static_cast<int>(TasRestore::all)))
++                m.restores.fetch_add(1, std::memory_order_relaxed);
++        if (const auto wanted = m.save_wanted.exchange(0, std::memory_order_acq_rel)) {
++            const auto slot = static_cast<std::size_t>(wanted - 1);
++            const bool taken = motion_snapshot::capture(skater, m.saved[slot]);
++            m.saved_valid[slot].store(taken, std::memory_order_release);
++            if (taken) m.saves.fetch_add(1, std::memory_order_relaxed);
++        }
++        if (const auto wanted = m.load_wanted.exchange(0, std::memory_order_acq_rel)) {
++            const auto slot = static_cast<std::size_t>(wanted - 1);
++            if (motion_snapshot::restore(skater, m.saved[slot], m.load_skeleton.load(std::memory_order_acquire)))
++                m.loads.fetch_add(1, std::memory_order_relaxed);
++        }
++        tas_step_history(m, skater, since);
++        motion_snapshot::match_flight_step(skater, skater_physics::step_length());
++        try {
++            if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off && multiplayer_session_active()) tas_line_off(m); // never a held skater in a session
++            if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off || m.line_ask.load(std::memory_order_acquire) != TasMotion::LineAsk::none)
++                tas_line_step(m, since);
++            // Taken and put back at the same point of the step, so step N of a playing starts as it did.
++            const auto script = input::step_script().status();
++            // A line records by game time: in slow motion a frame only every so many steps, so a replay at full
++            // speed goes through what happened meanwhile at the speed the rest of it goes.
++            if (m.line.load(std::memory_order_acquire) == TasMotion::Line::live && script.mode == input::StepScript::Mode::recording && !script.holding) {
++                constexpr float frame = 1.0f / 60.0f;
++                // (No skater to read it from: every step is a frame, as at full speed.)
++                const float length = skater_physics::step_length();
++                m.line_time += length > 0 ? length : frame;
++                if (m.line_time < frame * 0.99f) return;
++                m.line_time = std::max(0.0f, m.line_time - frame);
++            }
++            if (script.mode == input::StepScript::Mode::recording && !script.holding) {
++                // A run up that handed over: what came after that step is gone.
++                if (m.frames.size() > script.length) {
++                    std::lock_guard lock(m.frames_mutex);
++                    m.frames.resize(script.length);
++                }
++                m.frames.emplace_back();
++                (void)motion_snapshot::capture(skater, m.frames.back());
++            } else if (script.mode == input::StepScript::Mode::playing && m.locked && script.step < m.frames.size()) {
++                if (motion_snapshot::restore(skater, m.frames[script.step], true)) m.restores.fetch_add(1, std::memory_order_relaxed);
++            }
++            input::step_script().step();
++            const auto s = input::step_script().status();
++            m.line_length.store(s.length, std::memory_order_release);
++            m.line_step.store(s.step, std::memory_order_release);
++            if (s.mode != input::StepScript::Mode::off && !s.holding) state_dump::on_step(skater, s.step);
++        } catch (...) {
++        }
++    }
++    std::string tas_dump(std::uint32_t every) override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        state_dump::arm(every);
++        return {};
++    }
++    // `name` is checked by the API: letters, digits, '-', '_' and '.', and no leading dot.
++    std::string tas_dump_save(std::string_view name) override {
++        return state_dump::save(game_folder() / L"logs" / L"tas_state" / std::filesystem::path(std::string(name) + ".tasd"));
++    }
++    static std::string tas_refusal(bool allowed) {
++        static std::atomic<bool> listening{};
++        if (multiplayer_session_active()) return "never in a multiplayer session";
++        if (!allowed) return "the game does not have gameplay input";
++        if (!listening.load(std::memory_order_acquire)) {
++            if (!add_no_bail_step_listener(&tas_on_step)) return "the skater's physics steps are unavailable";
++            listening.store(true, std::memory_order_release);
++        }
++        return {};
++    }
++    // Waits for its step since the spawn, or says it has gone by; the caller asks again after a new spawn.
++    static std::string tas_wait(TasMotion::Waiting waiting) {
++        auto& m = tas_motion();
++        if (m.since_spawn.load(std::memory_order_acquire) >= waiting.at) return "that step since the spawn has gone by";
++        std::lock_guard lock(m.waiting_mutex);
++        m.waiting = std::move(waiting);
++        return {};
++    }
++    std::string tas_record(std::string_view plugin, unsigned controller, std::size_t steps, std::size_t at) override {
++        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
++        if (at) return tas_wait({true, std::string(plugin), controller, steps, at, 0, TasRestore::none});
++        std::string why;
++        tas_begin_recording(plugin, controller, steps, why);
++        return why;
++    }
++    std::string tas_play(std::string_view plugin, unsigned controller, int lead, TasRestore restore, std::size_t at) override {
++        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
++        if (restore != TasRestore::none && !tas_motion().captured.load(std::memory_order_acquire))
++            return "the motion was not taken when the script was recorded";
++        if (at) return tas_wait({false, std::string(plugin), controller, 0, at, lead, restore});
++        std::string why;
++        tas_begin_playing(plugin, controller, lead, restore, why);
++        return why;
++    }
++    void tas_stop(std::string_view plugin) override {
++        {
++            std::lock_guard lock(tas_motion().waiting_mutex);
++            if (tas_motion().waiting && tas_motion().waiting->owner == plugin) tas_motion().waiting.reset();
++            if (tas_motion().line_owner == plugin) {
++                tas_motion().line.store(TasMotion::Line::off, std::memory_order_release);
++                tas_motion().line_ask.store(TasMotion::LineAsk::none, std::memory_order_release);
++            }
++        }
++        input::step_script().stop(plugin);
++        input::step_script().set_paused(false);
++        (void)tas_clock(1.0f);
++        (void)tas_no_bail(false);
++    }
++    std::string tas_line_start(std::string_view plugin, unsigned controller, std::size_t at) override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        auto& m = tas_motion();
++        {
++            std::lock_guard lock(m.waiting_mutex);
++            m.waiting.reset();
++            m.line_owner = std::string(plugin);
++            m.line_controller = controller;
++        }
++        m.line_from.store(0, std::memory_order_release);
++        m.line_to.store(0, std::memory_order_release);
++        m.line_at.store(at, std::memory_order_release);
++        m.line_hand_over.store(true, std::memory_order_release);
++        m.line_ask.store(TasMotion::LineAsk::start, std::memory_order_release);
++        return {};
++    }
++    std::string tas_line_seek(std::size_t from, std::size_t to, std::size_t at, bool hand_over) override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        auto& m = tas_motion();
++        if (to > m.line_length.load(std::memory_order_acquire) || from > to) return "that is not a part of the line";
++        m.line_from.store(from, std::memory_order_release);
++        m.line_to.store(to, std::memory_order_release);
++        m.line_at.store(at, std::memory_order_release);
++        m.line_hand_over.store(hand_over, std::memory_order_release);
++        m.line_ask.store(TasMotion::LineAsk::seek, std::memory_order_release);
++        return {};
++    }
++    std::string tas_line_go() override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        input::step_script().go();
++        return {};
++    }
++    std::string tas_line_stop() override {
++        tas_motion().line_ask.store(TasMotion::LineAsk::stop, std::memory_order_release);
++        return {};
++    }
++    std::string tas_line_halt() override {
++        tas_motion().line_ask.store(TasMotion::LineAsk::halt, std::memory_order_release);
++        return {};
++    }
++    // The game's clock alone: slower for a wait, faster to catch up. The simulation's rate stays, so the step a
++    // skater takes does not change: its flight through the air is a path read once a step, and a shorter step
++    // through the same path flings it (15.6 to 201 m/s, 2026-11-06). Fewer steps come each real second, and the
++    // game's update with them: at 0.05, three a second. Faster, the steps a second have to be let through too.
++    std::optional<std::array<std::string, 2>> tas_clock_found_;
++    static constexpr const char* tas_clock_scale = "SimulationTime.TimeScale";
++    static constexpr const char* tas_clock_fps = "SimulationTime.MaxSimFps";
++    std::string tas_clock(float scale) override {
++        if (scale == 1.0f) {
++            if (tas_clock_found_) {
++                (void)change_named_setting(tas_clock_scale, (*tas_clock_found_)[0], false);
++                (void)change_named_setting(tas_clock_fps, (*tas_clock_found_)[1], false);
++                tas_clock_found_.reset();
++            }
++            return {};
++        }
++        if (multiplayer_session_active()) return "never in a multiplayer session";
++        if (!tas_clock_found_) {
++            auto found_scale = named_setting_value(tas_clock_scale);
++            auto found_fps = named_setting_value(tas_clock_fps);
++            if (!found_scale || !found_fps) return "the game's clock is not ready";
++            tas_clock_found_ = std::array<std::string, 2>{std::move(*found_scale), std::move(*found_fps)};
++        }
++        const auto rate = simulation_time::rate_of(skater_physics::step_length());
++        const auto fps = scale > 1.0f ? std::to_string(std::lround(static_cast<float>(rate ? rate : 60u) * scale)) : (*tas_clock_found_)[1];
++        std::array<char, 32> text{};
++        const auto written = std::to_chars(text.data(), text.data() + text.size(), scale);
++        if (written.ec != std::errc{}) return "that clock speed cannot be written";
++        // Up: the steps let through first. Down: the same, as the old limit does no harm for the moment it lasts.
++        if (const auto why = change_named_setting(tas_clock_fps, fps, false); why.starts_with("error: ")) return why;
++        if (const auto why = change_named_setting(tas_clock_scale, std::string_view(text.data(), static_cast<std::size_t>(written.ptr - text.data())), false); why.starts_with("error: ")) return why;
++        return {};
++    }
++    // The game's wipeouts off, the switch a player has in the menu and the console (nobail). Given back with the plugin.
++    bool tas_no_bail_held_{};
++    std::string tas_no_bail(bool on) override {
++        if (on && multiplayer_session_active()) return "never in a multiplayer session";
++        if (on == tas_no_bail_held_) return {};
++        auto why = queue(overlay::DebugAction::set_no_bail, on);
++        if (why.empty()) tas_no_bail_held_ = on;
++        return why;
++    }
++    std::string tas_line_paused(bool paused) override {
++        if (auto why = tas_refusal(true); !why.empty() && paused) return why;
++        input::step_script().set_paused(paused);
++        return {};
++    }
++    std::string tas_line_hold() override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        input::step_script().hold_input();
++        return {};
++    }
++    TasLine tas_line() override {
++        using Line = TasMotion::Line;
++        auto& m = tas_motion();
++        if (tas_clock_found_ && multiplayer_session_active()) (void)tas_clock(1.0f);
++        const char* phase = "off";
++        switch (m.line.load(std::memory_order_acquire)) {
++        case Line::off: break;
++        case Line::live: phase = "live"; break;
++        case Line::seeking: phase = "seeking"; break;
++        case Line::counting: phase = "counting"; break;
++        case Line::running_up: phase = "running_up"; break;
++        case Line::played: phase = "played"; break;
++        }
++        return {phase, m.line_length.load(std::memory_order_acquire), m.line_step.load(std::memory_order_acquire), m.since_spawn.load(std::memory_order_acquire)};
++    }
++    std::optional<std::array<float, 3>> tas_line_position(std::size_t step) override {
++        auto& m = tas_motion();
++        std::lock_guard lock(m.frames_mutex);
++        if (step >= m.line_length.load(std::memory_order_acquire) || step >= m.frames.size() || !m.frames[step].valid) return std::nullopt;
++        const auto& t = m.frames[step].board[0].transform;
++        return std::array<float, 3>{t[12], t[13], t[14]};
++    }
++    std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
++        auto& m = tas_motion();
++        std::lock_guard lock(m.frames_mutex);
++        if (step >= m.line_length.load(std::memory_order_acquire) || step >= m.frames.size() || !m.frames[step].valid) return std::nullopt;
++        const auto& frame = m.frames[step];
++        TasBodies bodies;
++        std::copy(frame.board[0].transform.begin(), frame.board[0].transform.end(), bodies.board.begin());
++        for (std::size_t i = 0; i < bodies.skeleton.size(); ++i) {
++            const auto& t = frame.skeleton[i].transform;
++            bodies.skeleton[i] = {t[12], t[13], t[14]};
++        }
++        return bodies;
++    }
++    TasStatus tas_status() override {
++        if (virtual_time::active() && multiplayer_session_active()) (void)virtual_time::set(false);
++        (void)tas_refusal(true); // the count since the spawn needs the listener from the first ask
++        const auto s = input::step_script().status();
++        bool waiting{};
++        {
++            std::lock_guard lock(tas_motion().waiting_mutex);
++            waiting = tas_motion().waiting.has_value();
++        }
++        const char* mode = waiting ? "waiting" : s.mode == input::StepScript::Mode::recording ? "recording" : s.mode == input::StepScript::Mode::playing ? "playing" : "off";
++        return {mode, s.step, s.length, s.stopped, tas_motion().captured.load(std::memory_order_acquire), tas_motion().restores.load(std::memory_order_relaxed),
++            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads()};
++    }
++    std::string tas_save(unsigned slot) override {
++        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
++        if (slot >= TasMotion::slots) return "a slot is 1 to 4";
++        tas_motion().save_wanted.store(static_cast<int>(slot) + 1, std::memory_order_release);
++        return {};
++    }
++    std::string tas_load(unsigned slot, bool skeleton) override {
++        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
++        if (slot >= TasMotion::slots) return "a slot is 1 to 4";
++        if (!tas_motion().saved_valid[slot].load(std::memory_order_acquire)) return "nothing is saved in that slot";
++        tas_motion().load_skeleton.store(skeleton, std::memory_order_release);
++        tas_motion().load_wanted.store(static_cast<int>(slot) + 1, std::memory_order_release);
++        return {};
++    }
++    std::string tas_history(bool on) override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        auto& m = tas_motion();
++        if (on && m.history.empty()) m.history.resize(TasMotion::history_steps); // before the flag: the physics thread only looks after it
++        m.history_on.store(on, std::memory_order_release);
++        return {};
++    }
++    std::string tas_rewind(std::size_t steps) override {
++        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
++        auto& m = tas_motion();
++        if (!m.history_on.load(std::memory_order_acquire)) return "the history is off";
++        if (m.rewind_waiting.load(std::memory_order_acquire)) return "still going back";
++        if (m.history_length.load(std::memory_order_acquire) < 2) return "there is nothing to go back to";
++        m.rewind_wanted.store(static_cast<int>(std::min<std::size_t>(steps, TasMotion::history_steps)), std::memory_order_release);
++        return {};
++    }
++    std::pair<std::size_t, std::size_t> tas_history_counts() override {
++        return {tas_motion().history_length.load(std::memory_order_acquire), tas_motion().rewinds.load(std::memory_order_relaxed)};
++    }
++    std::pair<std::size_t, std::size_t> tas_save_counts() override {
++        return {tas_motion().saves.load(std::memory_order_relaxed), tas_motion().loads.load(std::memory_order_relaxed)};
++    }
++    std::string tas_virtual_time(bool on) override {
++        if (on && multiplayer_session_active()) return "never in a multiplayer session";
++        return virtual_time::set(on) ? std::string{} : std::string("the clock could not be hooked");
++    }
+     std::optional<StickInput> joystick(int device) override {
+         if (!joystick::game_in_foreground()) return std::nullopt;
+         const auto sample = joystick::poll(device);
+@@ -1876,6 +2403,8 @@ public:
+     }
+     void release(std::string_view plugin) override {
+         input::pad_outputs().release(plugin);
++        tas_stop(plugin);
++        if (virtual_time::active()) (void)virtual_time::set(false);
+         grind_target::release(plugin);
+         input::gameplay_options().release(plugin);
+         placement_physics::release(plugin);
+diff --git a/Extension/Plugins/plugin_host.cpp b/Extension/Plugins/plugin_host.cpp
+index 17c1e98..67de8af 100644
+--- a/Extension/Plugins/plugin_host.cpp
++++ b/Extension/Plugins/plugin_host.cpp
+@@ -366,6 +366,16 @@ void Host::follow_game() {
+                     poses[name] = std::move(pose);
+                 }
+                 detailed["poses"] = std::move(poses);
++                if (step.board) {
++                    auto board = Json::object(), matrix = Json::array();
++                    for (const float v : step.board->transform) matrix.push_back(v);
++                    board["transform"] = std::move(matrix);
++                    board["velocity"] = Json::array({step.board->velocity[0], step.board->velocity[1], step.board->velocity[2]});
++                    if (step.board_spin) board["spin"] = Json::array({(*step.board_spin)[0], (*step.board_spin)[1], (*step.board_spin)[2]});
++                    detailed["board"] = std::move(board);
++                }
++                if (!step.motion_hash.empty()) detailed["hash"] = step.motion_hash;
++                if (!step.board_hash.empty()) detailed["board_hash"] = step.board_hash;
+             }
+             each([&](Plugin& plugin, const std::string&) {
+                 plugin.game_event("physics_step", "events.physics", plugin.has("events.physics.geometry") ? detailed : data);
+diff --git a/Extension/Plugins/plugin_manifest.cpp b/Extension/Plugins/plugin_manifest.cpp
+index a9fc444..ea3b92e 100644
+--- a/Extension/Plugins/plugin_manifest.cpp
++++ b/Extension/Plugins/plugin_manifest.cpp
+@@ -38,14 +38,14 @@ namespace {
+ // Extension/Objects/placement_physics.h); a claimed object's moved pose is never saved to the park.
+ // "marker.read" reads the local skater's marker saves and returns (reskate.marker.events).
+ // "ui.models" publishes bounded plugin-namespaced floats for authored native UI (not stock fields).
+-constexpr std::array<std::string_view, 61> permissions{
++constexpr std::array<std::string_view, 62> permissions{
+     "console", "storage", "overlay", "menu", "ui.screen", "input", "input.write", "hud", "events.tricks", "events.skater",
+     "skater.read", "skater.teleport", "skater.control", "skater.animation", "trainer", "camera",
+     "world.raycast", "world.physics", "world.physics.observe", "world.objects", "world.entities", "world.environment", "world.ai", "travel", "session.read",
+     "session.skaters", "session.nametags", "net.session", "net.http", "voice.control", "chat.read",
+     "chat.send", "chat.local", "chat.commands", "server", "server.parks", "throwdowns", "replay", "music", "progression.read", "settings.read", "audio.ui", "audio", "outfit", "board", "mods.read",
+     "events.physics", "game.speed", "files", "variants", "settings.write", "room", "capture", "effects", "events.physics.geometry", "viewmodel", "strings", "outfit.stand_ins",
+-    "objects.physics", "marker.read", "ui.models"};
++    "objects.physics", "marker.read", "ui.models", "tas"};
+ }
+ 
+ bool known_permission(std::string_view name) noexcept {
+diff --git a/Extension/Skater/skater_physics.cpp b/Extension/Skater/skater_physics.cpp
+index d358e81..2cd648a 100644
+--- a/Extension/Skater/skater_physics.cpp
++++ b/Extension/Skater/skater_physics.cpp
+@@ -110,6 +110,55 @@ bool read_motion(const NoBailSkater& skater, Vec3& board, Vec3& pelvis, Vec3& sp
+             skater_body::index(skater_body::Bone::hips), pelvis, &spin);
+ }
+ 
++// FNV-1a over the raw bytes of the bodies' motion: floats compared to the last bit, as a run repeated
++// exactly would have them. `physics` holds `count` bodies, or the hash is given up.
++void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
++    const auto* bytes = static_cast<const unsigned char*>(data);
++    for (std::size_t i = 0; i < size; ++i) {
++        hash ^= bytes[i];
++        hash *= 1099511628211ull;
++    }
++}
++bool hash_bodies(std::uint64_t& hash, std::uintptr_t physics, std::uintptr_t vtable, std::uint32_t count) noexcept {
++    std::uintptr_t type{}, bodies{};
++    std::uint32_t found{};
++    if (!memory::peek(physics, type) || type != vtable || !memory::peek(physics + state::physics_bodies_offset, bodies) ||
++        !memory::peek(bodies, found) || found != count)
++        return false;
++    for (std::uint32_t i = 0; i < count; ++i) {
++        const auto at = bodies + i * state::physics_body_size;
++        std::array<float, 16> transform{};
++        Vec3 velocity{}, spin{};
++        if (!memory::peek(at + body::body_transform_offset, transform) || !memory::peek(at + state::body_velocity_offset, velocity) ||
++            !memory::peek(at + state::body_spin_offset, spin))
++            return false;
++        hash_bytes(hash, transform.data(), sizeof(transform));
++        hash_bytes(hash, velocity.data(), sizeof(velocity));
++        hash_bytes(hash, spin.data(), sizeof(spin));
++    }
++    return true;
++}
++void read_exact_motion(const NoBailSkater& skater, Step& step) noexcept {
++    std::uintptr_t holder{}, board_physics{}, rig_physics{}, bodies{};
++    if (!memory::peek(skater.core + state::board_holder_offset, holder) || !memory::peek(holder + state::board_physics_offset, board_physics) ||
++        !memory::peek(skater.rig + state::rig_physics_offset, rig_physics))
++        return;
++    Vec3 velocity{}, spin{};
++    if (body_motion(board_physics, skater.base + state::board_physics_vtable, state::board_body_count, state::board_root_body, velocity, &spin) &&
++        memory::peek(board_physics + state::physics_bodies_offset, bodies)) {
++        Step::Pose pose;
++        pose.velocity = velocity;
++        if (memory::peek(bodies + state::board_root_body * state::physics_body_size + body::body_transform_offset, pose.transform)) {
++            step.board = pose;
++            step.board_spin = spin;
++        }
++    }
++    std::uint64_t hash = 14695981039346656037ull;
++    if (!hash_bodies(hash, board_physics, skater.base + state::board_physics_vtable, state::board_body_count)) return;
++    step.board_hash = hash;
++    if (hash_bodies(hash, rig_physics, skater.base + state::rig_physics_vtable, state::rig_body_count)) step.motion_hash = hash;
++}
++
+ // Where the local skater's physics step length is kept now (a float, seconds of game time), 0 while
+ // there is no local skater.
+ std::uintptr_t step_length_address() noexcept {
+@@ -187,6 +236,7 @@ Step read_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept
+         }
+     }
+     (void)read_contacts(skater, step.body);
++    read_exact_motion(skater, step);
+     return step;
+ }
+ 
+diff --git a/Extension/Skater/skater_physics.h b/Extension/Skater/skater_physics.h
+index 48d462b..c806ade 100644
+--- a/Extension/Skater/skater_physics.h
++++ b/Extension/Skater/skater_physics.h
+@@ -26,6 +26,13 @@ struct Step {
+     struct Pose { std::array<float, 16> transform{}; game::Vec3 velocity{}; };
+     std::array<std::optional<Pose>, skater_body::count> poses;
+     skater_body::Contacts body; // what each body touched in the step
++    // The board's root, which poses leaves out, and how it turns.
++    std::optional<Pose> board;
++    std::optional<game::Vec3> board_spin;
++    // A hash of every body's exact place, velocity and spin, board and skeleton: two steps with the
++    // same hash have the same motion to the last bit. Empty when the bodies could not all be read.
++    std::optional<std::uint64_t> motion_hash;
++    std::optional<std::uint64_t> board_hash; // the same of the board's bodies alone
+ };
+ 
+ // Requires the validated build and No Bail started: verifies the layout once.
+diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
+index b70545c..2a40fff 100644
+--- a/Extension/UI/Overlay/input_capture.cpp
++++ b/Extension/UI/Overlay/input_capture.cpp
+@@ -4,6 +4,8 @@
+ #include "held_input.h"
+ #include "scripted_pad.h"
+ #include "Engine/Game/Input/pad_output.h"
++#include "Engine/Game/Input/step_script.h"
++#include "Engine/Game/Multiplayer/session_tools.h"
+ #include "Extension/UI/NativeMenu/throwdown_menu.h"
+ #include "Extension/Throwdowns/throwdown_kit.h"
+ #include "Engine/Game/Input/playstation_report.h"
+@@ -188,7 +190,11 @@ bool output_allowed() noexcept {
+ void replace_pad(unsigned controller, dingosdk::overlay::GamepadValues& pad) noexcept {
+     if (overlay_input_access) return;
+     const auto saved_error = GetLastError();
+-    const auto output = input::pad_outputs().read(controller, GetTickCount64(), output_allowed());
++    const bool allowed = output_allowed();
++    const input::PadOutput real{pad.buttons, pad.left_trigger, pad.right_trigger, pad.left_x, pad.left_y, pad.right_x, pad.right_y};
++    // A script by physics step goes over a replacement by the clock.
++    auto output = input::step_script().on_read(controller, real, allowed && !multiplayer_session_active());
++    if (const auto leased = input::pad_outputs().read(controller, GetTickCount64(), allowed); !output) output = leased;
+     SetLastError(saved_error);
+     if (output) pad = {output->buttons, output->left_trigger, output->right_trigger,
+         output->left_x, output->left_y, output->right_x, output->right_y};
+@@ -211,7 +217,7 @@ void filter_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+ // A finished native PlayStation read of the game's: neutral while a menu holds the input, else
+ // through the gamepad filter.
+ void handle_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+-    if (block_polled_input()) { (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
++    if (block_polled_input()) { input::step_script().interrupt(); (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
+     else {
+         filter_hid(read, size);
+         int stick{};
+@@ -394,7 +400,7 @@ void filter_pad(bool outer, DWORD user, XINPUT_STATE* output) noexcept {
+     g.sThumbRY = pad.right_y;
+     // Synthetic changes must be noticed even when the physical packet stays unchanged.
+     // Keep physical packet numbers when no replacement is active.
+-    if (input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
++    if (input::step_script().replacing(static_cast<unsigned>(user)) || input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
+         output->dwPacketNumber = static_cast<DWORD>(GetTickCount64());
+ }
+ // Another program's hook on XInput that was put in front of the capture's own after it was
+@@ -419,6 +425,7 @@ DWORD WINAPI captured_front(DWORD user, XINPUT_STATE* output) {
+     // Only the game gets a scripted pad (the character room's walk): ReSkate's own reads get the real one.
+     if (outer && output && scripted_pad(user, *output)) return ERROR_SUCCESS;
+     if (result == ERROR_SUCCESS && output && capture) {
++        input::step_script().interrupt();
+         (void)input::pad_outputs().read(0, GetTickCount64(), false);
+         output->Gamepad = {};
+         output->dwPacketNumber ^= 0x80000000u;
+diff --git a/Extension/UI/Overlay/plugin_overlay.cpp b/Extension/UI/Overlay/plugin_overlay.cpp
+index b3565bf..d547980 100644
+--- a/Extension/UI/Overlay/plugin_overlay.cpp
++++ b/Extension/UI/Overlay/plugin_overlay.cpp
+@@ -29,8 +29,19 @@ ImU32 shadow_of(ImU32 colour) {
+     const auto alpha = static_cast<ImU32>(((colour >> IM_COL32_A_SHIFT) & 0xff) * 0.75f);
+     return IM_COL32(0, 0, 0, alpha);
+ }
++// The plain fonts are baked small: a bigger size takes one baked at least that big, so it is never stretched.
++ImFont* sharp_font(ImFont* font, float size, const plugin_ui::Shape& shape) {
++    if (shape.style.font != 0 && shape.style.font != 2) return font; // the brushed titles have their own large one
++    if (size <= font->FontSize * 1.05f) return font;
++    const auto& menu = detail::state().menu;
++    if (menu.heading && size <= menu.heading->FontSize * 1.05f) return menu.heading;
++    if (menu.heading_large && size <= menu.heading_large->FontSize * 1.05f) return menu.heading_large;
++    if (menu.hud_digits && size > 80 && shape.text.find_first_not_of("0123456789GO") == std::string::npos) return menu.hud_digits;
++    return menu.hud ? menu.hud : font;
++}
+ void text(ImDrawList* draw, ImFont* font, float k, ImVec2 where, const plugin_ui::Shape& shape) {
+     const float size = shape.style.size * k;
++    font = sharp_font(font, size, shape);
+     if (shape.style.wrap > 0) {
+         // Wrapped: from its top left, as d:measure counts it.
+         const float wrap = shape.style.wrap * k;
+diff --git a/Extension/UI/Overlay/skate_menu.cpp b/Extension/UI/Overlay/skate_menu.cpp
+index 99ea53e..27102c7 100644
+--- a/Extension/UI/Overlay/skate_menu.cpp
++++ b/Extension/UI/Overlay/skate_menu.cpp
+@@ -1048,6 +1048,10 @@ void load_skate_fonts(SkateMenu& menu) {
+     menu.bold_large = font(L"FONT_HEADING", "arialbd.ttf", 17 * large_font_ratio);
+     menu.heading_large = font(L"FONT_HEADING", "arialbd.ttf", 22 * large_font_ratio);
+     menu.title_large = font(L"FONT_BRUSH", "arialbi.ttf", 44 * large_font_ratio, latin);
++    static const ImWchar ascii[]{0x0020, 0x007E, 0};
++    static const ImWchar big[]{'0', '9', 'G', 'G', 'O', 'O', 0};
++    menu.hud = font(L"FONT_HEADING", "arialbd.ttf", 72, ascii);
++    menu.hud_digits = embedded_font(L"FONT_HEADING", 220.f, big);
+ }
+ 
+ namespace menu {
+diff --git a/Extension/UI/Overlay/skate_menu.h b/Extension/UI/Overlay/skate_menu.h
+index 34add7c..280bcb1 100644
+--- a/Extension/UI/Overlay/skate_menu.h
++++ b/Extension/UI/Overlay/skate_menu.h
+@@ -110,6 +110,8 @@ struct SkateMenu {
+     ImFont* title = nullptr;    // brushed page titles
+     ImFont* heading = nullptr;  // tile and section headers
+     ImFont* countdown = nullptr; // full-resolution fallback countdown digits
++    ImFont* hud = nullptr;        // plugins' larger text, 72 pixels (plugin_overlay.cpp)
++    ImFont* hud_digits = nullptr; // and their largest: digits and GO, 220 pixels
+     ImFont* mono = nullptr;
+     // The same faces drawn larger (large_font_ratio times), swapped in while the menu is full
+     // screen, where everything is scaled up: text stays sharp instead of stretched.
+diff --git a/cmake/CrashReport.cmake b/cmake/CrashReport.cmake
+index 284fb8e..958d8dd 100644
+--- a/cmake/CrashReport.cmake
++++ b/cmake/CrashReport.cmake
+@@ -1,5 +1,6 @@
+ # The sentry_key is the project's public DSN key: it grants report submission only. Never use an auth token.
+-set(crash_report_default_url "https://sentry.reskate.dev/api/2/minidump/?sentry_key=8efcb389bdc033445093a7af0c66f9be")
++# ReTake: a fork never reports to ReSkate's Sentry, whose team did not write this code. Empty disables uploads.
++set(crash_report_default_url "")
+ if(NOT "$ENV{RESKATE_CRASH_REPORT_URL}" STREQUAL "")
+     set(crash_report_default_url "$ENV{RESKATE_CRASH_REPORT_URL}")
+ endif()
+diff --git a/cmake/Runtime.cmake b/cmake/Runtime.cmake
+index e908ad3..ffc977a 100644
+--- a/cmake/Runtime.cmake
++++ b/cmake/Runtime.cmake
+@@ -157,6 +157,9 @@ add_library(dingosdk_runtime SHARED
+     Extension/Skater/layer_materials.cpp
+     Extension/Skater/board_pose.cpp
+     Extension/Skater/skater_physics.cpp
++    Extension/Skater/motion_snapshot.cpp
++    Extension/Skater/state_dump.cpp
++    Extension/Skater/virtual_time.cpp
+     Extension/Skater/xray.cpp
+     Extension/Skater/xray_render.cpp
+     Extension/Skater/xray_skeleton.cpp
+diff --git a/Engine/Game/Input/step_script.h b/Engine/Game/Input/step_script.h
+new file mode 100644
+index 0000000..4b4f470
+--- /dev/null
++++ b/Engine/Game/Input/step_script.h
+@@ -0,0 +1,261 @@
++#pragma once
++#include "pad_output.h"
++#include <cstddef>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// One controller's values by physics step, latched: while a script runs the game's reads get one value
++// from one step to the next, the controller's when recording and the script's when playing. So the
++// game sees the same values at the same steps either way: a recording and its replays differ in nothing
++// the input can cause. It costs a recording up to one step of input lag. PadOutputs' replacement lasts
++// by the clock and follows the client tick, so its value reaches the game some way into a step that
++// differs from run to run. No plugin code runs on these threads.
++namespace dingosdk::input {
++class StepScript {
++public:
++    enum class Mode : unsigned char { off, recording, playing };
++    struct Status {
++        Mode mode{Mode::off};
++        std::size_t step{}, length{};
++        std::string owner, stopped;
++        // Steps of this run the game read nothing before: an input that reached it a step late or never.
++        std::size_t unread{};
++        std::vector<std::size_t> first_unread;
++        bool holding{}; // a line waiting: no step counts
++    };
++    static constexpr std::size_t unread_kept = 64;
++    static constexpr std::size_t max_steps = 36000; // ten minutes at the game's 60 steps a second
++    static constexpr int max_lead = 8;
++
++    // Client thread: starts recording this controller, replacing the script held.
++    std::string record(std::string_view owner, unsigned controller, std::size_t steps) {
++        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
++        if (steps == 0 || steps > max_steps) return "a script is 1 to 36000 steps";
++        std::lock_guard lock(mutex_);
++        if (const auto why = taken(owner); !why.empty()) return why;
++        frames_.clear();
++        frames_.reserve(steps);
++        limit_ = steps;
++        latest_ = {};
++        latched_ = {};
++        begin(owner, controller, Mode::recording, 0);
++        return {};
++    }
++    // Client thread: gives the script back from its first step. `lead` reads that many steps ahead.
++    std::string play(std::string_view owner, unsigned controller, int lead) {
++        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
++        if (lead < -max_lead || lead > max_lead) return "a lead is -8 to 8 steps";
++        std::lock_guard lock(mutex_);
++        if (const auto why = taken(owner); !why.empty()) return why;
++        if (frames_.empty()) return "no script is recorded";
++        begin(owner, controller, Mode::playing, lead);
++        return {};
++    }
++    // Physics thread: whatever a line is doing ends; what it holds stays to go back to.
++    void halt() {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off) end("stopped");
++    }
++    // Client thread: ends what `owner` runs. What was recorded stays to be played.
++    void stop(std::string_view owner) {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off && owner_ == owner) end("stopped");
++        if (owner_ == owner) line_ = false;
++    }
++    // Client thread: records as a line, which can be gone back in. Losing the input (the game's own menu)
++    // ends the recording as it ends any, and what was skated stays to go back to.
++    std::string record_line(std::string_view owner, unsigned controller, std::size_t steps) {
++        auto why = record(owner, controller, steps);
++        if (why.empty()) {
++            std::lock_guard lock(mutex_);
++            line_ = true;
++        }
++        return why;
++    }
++    // Physics thread: a line holds: no step counts and the game reads a neutral controller, until it runs
++    // up. What was recorded stays. False with nothing recorded and nothing running.
++    bool hold() {
++        std::lock_guard lock(mutex_);
++        if (mode_ == Mode::off && frames_.empty()) return false;
++        mode_ = Mode::recording;
++        holding_ = true;
++        run_to_ = 0;
++        step_ = frames_.size();
++        return true;
++    }
++    // Physics thread: plays from step `from` up to step `to`. Then, with `hand_over`, what came after `to` is
++    // forgotten and it records on from there with the last value it played, until go(); without, it ends as a
++    // playing does.
++    void run_up(std::size_t from, std::size_t to, bool hand_over) {
++        std::lock_guard lock(mutex_);
++        to = to < frames_.size() ? to : frames_.size();
++        holding_ = false;
++        lead_ = 0;
++        reads_ = 1;
++        unread_ = 0;
++        first_unread_.clear();
++        hand_over_ = hand_over;
++        if (from >= to) {
++            finish_run_up(to);
++            return;
++        }
++        mode_ = Mode::playing;
++        step_ = from;
++        run_to_ = to;
++    }
++    // After a run up: the controller's from the next step on.
++    void go() {
++        std::lock_guard lock(mutex_);
++        use_last_ = false;
++    }
++    // The timeline is open: the input being taken costs a line nothing, the game reading a neutral controller.
++    void set_paused(bool paused) {
++        std::lock_guard lock(mutex_);
++        paused_ = paused;
++    }
++    // Until go(): what the game last read, whatever the controller does, as after a run up.
++    void hold_input() {
++        std::lock_guard lock(mutex_);
++        use_last_ = true;
++        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++    }
++    // Physics thread, once a step of the local skater.
++    void step() {
++        std::lock_guard lock(mutex_);
++        if (holding_) return;
++        if (mode_ != Mode::off && reads_ == 0) {
++            ++unread_;
++            if (first_unread_.size() < unread_kept) first_unread_.push_back(step_);
++        }
++        reads_ = 0;
++        if (mode_ == Mode::recording) {
++            if (use_last_) latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++            else latched_ = latest_;
++            frames_.push_back(latched_);
++            step_ = frames_.size();
++            if (frames_.size() >= limit_) end("recorded");
++        } else if (mode_ == Mode::playing) {
++            ++step_;
++            if (run_to_) {
++                if (step_ >= run_to_) finish_run_up(run_to_);
++            } else if (step_ > frames_.size()) {
++                end("played");
++            }
++        }
++    }
++    // Input threads, at each read the game makes: what the game should see instead, if anything.
++    // `real` is what the controller reads. Not allowed (a menu, another window, a session) ends the run,
++    // so an old input is never played after it.
++    std::optional<PadOutput> on_read(unsigned controller, const PadOutput& real, bool allowed) {
++        std::lock_guard lock(mutex_);
++        if (mode_ == Mode::off) return std::nullopt;
++        if (!allowed) {
++            lose();
++            return std::nullopt;
++        }
++        if (controller != controller_) return std::nullopt;
++        ++reads_;
++        latest_ = real; // a run up hands over to the controller as it is by then
++        if (mode_ == Mode::recording) {
++            if (holding_) return PadOutput{};
++            return use_last_ ? without_menus(latched_) : latched_;
++        }
++        // Neutral until the first step, as a recording's reads are.
++        const auto frame = frame_at(step_, lead_, frames_.size());
++        return frame ? without_menus(frames_[*frame]) : PadOutput{};
++    }
++    // Input threads: a read the game was kept from, by a menu or the overlay.
++    void interrupt() {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off) lose();
++    }
++    // A running script answers this controller's reads.
++    bool replacing(unsigned controller) {
++        std::lock_guard lock(mutex_);
++        return mode_ != Mode::off && controller_ == controller;
++    }
++    Status status() {
++        std::lock_guard lock(mutex_);
++        return {mode_, step_, frames_.size(), owner_, stopped_, unread_, first_unread_, holding_};
++    }
++
++    // The frame for the reads after `step` steps have run: frame N was latched at step N + 1. Empty
++    // before the script's first frame.
++    static std::optional<std::size_t> frame_at(std::size_t step, int lead, std::size_t size) noexcept {
++        const auto at = static_cast<std::ptrdiff_t>(step) - 1 + lead;
++        if (at < 0 || size == 0) return std::nullopt;
++        return static_cast<std::size_t>(at) < size ? static_cast<std::size_t>(at) : size - 1;
++    }
++
++private:
++    // What is replayed never opens anything: the D-pad, Start and Back open the game's menus and its replay, and
++    // a press kept in a recording would open them again at every replay of it.
++    static constexpr std::uint16_t menu_buttons = 0x003f;
++    static PadOutput without_menus(PadOutput pad) noexcept {
++        pad.buttons = static_cast<std::uint16_t>(pad.buttons & ~menu_buttons);
++        return pad;
++    }
++    std::string taken(std::string_view owner) const {
++        return mode_ != Mode::off && owner_ != owner ? owner_ + " runs a script" : std::string{};
++    }
++    void begin(std::string_view owner, unsigned controller, Mode mode, int lead) {
++        owner_ = std::string(owner);
++        controller_ = controller;
++        mode_ = mode;
++        lead_ = lead;
++        step_ = 0;
++        holding_ = false;
++        line_ = false;
++        use_last_ = false;
++        run_to_ = 0;
++        reads_ = 0;
++        unread_ = 0;
++        first_unread_.clear();
++        stopped_.clear();
++    }
++    void end(const char* why) {
++        mode_ = Mode::off;
++        holding_ = false;
++        run_to_ = 0;
++        stopped_ = why;
++    }
++    // Over, so an old input is never played after it; what was recorded stays. A line waiting to go back, or with
++    // the timeline open, has nothing to lose.
++    void lose() {
++        if (line_ && paused_) {
++            latest_ = {}; // what the game reads meanwhile
++            return;
++        }
++        if (line_ && holding_) return;
++        end("the game lost the input");
++    }
++    void finish_run_up(std::size_t to) {
++        run_to_ = 0;
++        if (!hand_over_) {
++            step_ = to;
++            end("played");
++            return;
++        }
++        if (to < frames_.size()) frames_.resize(to);
++        step_ = to;
++        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++        use_last_ = true;
++        mode_ = Mode::recording;
++    }
++
++    std::mutex mutex_;
++    std::vector<PadOutput> frames_;
++    PadOutput latest_{}, latched_{};
++    std::string owner_, stopped_;
++    std::vector<std::size_t> first_unread_;
++    std::size_t step_{}, limit_{}, reads_{}, unread_{}, run_to_{};
++    unsigned controller_{};
++    int lead_{};
++    Mode mode_{Mode::off};
++    bool holding_{}, line_{}, hand_over_{}, use_last_{}, paused_{};
++};
++inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
++}
+diff --git a/Extension/Skater/motion_snapshot.cpp b/Extension/Skater/motion_snapshot.cpp
+new file mode 100644
+index 0000000..0d7da1c
+--- /dev/null
++++ b/Extension/Skater/motion_snapshot.cpp
+@@ -0,0 +1,130 @@
++#include "motion_snapshot.h"
++#include "Engine/Core/Log/logging.h"
++#include "Engine/Core/Platform/memory.h"
++#include "Engine/Game/Build/addresses.h"
++#include "Engine/Game/Build/20260929/skater_body.h"
++#include "Engine/Game/Build/20260929/skater_state.h"
++#include <Windows.h>
++#include <cmath>
++#include <cstring>
++
++namespace dingosdk::motion_snapshot {
++namespace {
++namespace body = addr::skater_body;
++namespace state = addr::skater_state;
++
++bool poke_bytes(std::uintptr_t address, const void* data, std::size_t size) noexcept {
++    __try {
++        std::memcpy(reinterpret_cast<void*>(address), data, size);
++        return true;
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        return false;
++    }
++}
++bool usable(const Body& value) noexcept {
++    for (const float v : value.transform)
++        if (!std::isfinite(v)) return false;
++    for (const float v : value.velocity)
++        if (!std::isfinite(v)) return false;
++    for (const float v : value.spin)
++        if (!std::isfinite(v)) return false;
++    return true;
++}
++// Where a physics object's bodies start, when it is what it should be.
++std::uintptr_t bodies_of(std::uintptr_t physics, std::uintptr_t vtable, std::uint32_t count) noexcept {
++    std::uintptr_t type{}, bodies{};
++    std::uint32_t found{};
++    if (!memory::peek(physics, type) || type != vtable || !memory::peek(physics + state::physics_bodies_offset, bodies) ||
++        !memory::peek(bodies, found) || found != count)
++        return 0;
++    return bodies;
++}
++struct Holders {
++    std::uintptr_t board{}, skeleton{};
++};
++bool holders(const NoBailSkater& skater, Holders& result) noexcept {
++    std::uintptr_t holder{}, board{}, rig{};
++    if (!memory::peek(skater.core + state::board_holder_offset, holder) || !memory::peek(holder + state::board_physics_offset, board) ||
++        !memory::peek(skater.rig + state::rig_physics_offset, rig))
++        return false;
++    result.board = bodies_of(board, skater.base + state::board_physics_vtable, state::board_body_count);
++    result.skeleton = bodies_of(rig, skater.base + state::rig_physics_vtable, state::rig_body_count);
++    return result.board && result.skeleton;
++}
++template <std::size_t N> bool read_group(std::uintptr_t bodies, std::array<Body, N>& group) noexcept {
++    for (std::size_t i = 0; i < N; ++i) {
++        const auto at = bodies + i * state::physics_body_size;
++        auto& b = group[i];
++        if (!memory::peek(at + body::body_transform_offset, b.transform) || !memory::peek(at + state::body_velocity_offset, b.velocity) ||
++            !memory::peek(at + state::body_spin_offset, b.spin) || !usable(b))
++            return false;
++    }
++    return true;
++}
++template <std::size_t N> bool write_group(std::uintptr_t bodies, const std::array<Body, N>& group) noexcept {
++    for (std::size_t i = 0; i < N; ++i) {
++        const auto at = bodies + i * state::physics_body_size;
++        const auto& b = group[i];
++        std::uint32_t flags{};
++        if (!memory::peek(at + state::body_flags_offset, flags) ||
++            !poke_bytes(at + body::body_transform_offset, b.transform.data(), sizeof(b.transform)) ||
++            !poke_bytes(at + state::body_velocity_offset, b.velocity.data(), sizeof(b.velocity)) ||
++            !poke_bytes(at + state::body_spin_offset, b.spin.data(), sizeof(b.spin)))
++            return false;
++        flags |= state::body_flag_rotation | state::body_flag_position | state::body_flag_velocity | state::body_flag_spin;
++        if (!poke_bytes(at + state::body_flags_offset, &flags, sizeof(flags))) return false;
++    }
++    return true;
++}
++}
++
++bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept {
++    snapshot.valid = false;
++    Holders at;
++    if (!holders(skater, at) || !read_group(at.board, snapshot.board) || !read_group(at.skeleton, snapshot.skeleton)) return false;
++    snapshot.valid = true;
++    return true;
++}
++
++void match_flight_step(const NoBailSkater& skater, float step) noexcept {
++    if (!std::isfinite(step) || step < 1e-5f || step > 0.1f) return;
++    std::uintptr_t block{}, air{}, air_block{};
++    float dt{};
++    if (!memory::peek(skater.core + state::core_jump_block_offset, block) || !block || !memory::peek(skater.core + state::core_air_state_offset, air) || !air ||
++        !memory::peek(air + state::air_state_block_offset, air_block) || air_block != block || !memory::peek(block + state::jump_block_dt_offset, dt))
++        return;
++    if (dt == step || !std::isfinite(dt) || dt < 1e-5f || dt > 0.1f) return;
++    // All of it together, at the same time along the path: the frame, the flight's length, and both frame times.
++    const double ratio = static_cast<double>(dt) / step;
++    const auto scaled = [&](std::int32_t value) { return static_cast<std::int32_t>(std::lround(static_cast<double>(value) * ratio)); };
++    std::int32_t frame{}, frames{}, new_frame{}, new_frames{};
++    float request_dt{}, new_request_dt{};
++    std::uintptr_t request{};
++    if (memory::peek(air + state::air_state_frame_offset, frame) && frame > 0 && frame < 10000000) {
++        new_frame = scaled(frame);
++        (void)poke_bytes(air + state::air_state_frame_offset, &new_frame, sizeof(new_frame));
++    }
++    if (memory::peek(block + state::jump_block_request_offset, request) && request) {
++        if (memory::peek(request + state::request_frames_offset, frames) && frames > 0 && frames < 10000000) {
++            new_frames = scaled(frames);
++            (void)poke_bytes(request + state::request_frames_offset, &new_frames, sizeof(new_frames));
++        }
++        if (memory::peek(request + state::request_dt_offset, request_dt) && std::isfinite(request_dt) && request_dt >= 1e-5f && request_dt <= 0.1f) {
++            new_request_dt = static_cast<float>(request_dt / ratio);
++            (void)poke_bytes(request + state::request_dt_offset, &new_request_dt, sizeof(new_request_dt));
++        }
++    }
++    (void)poke_bytes(block + state::jump_block_dt_offset, &step, sizeof(step));
++    try {
++        logging::log(logging::Level::info, logging::Channel::skater, "Flight step {} -> {} s: frame {} -> {}, frames {} -> {}, request step {} -> {}.",
++            dt, step, frame, new_frame, frames, new_frames, request_dt, new_request_dt);
++    } catch (...) {
++    }
++}
++
++bool restore(const NoBailSkater& skater, const Snapshot& snapshot, bool skeleton) noexcept {
++    Holders at;
++    if (!snapshot.valid || !holders(skater, at)) return false;
++    return write_group(at.board, snapshot.board) && (!skeleton || write_group(at.skeleton, snapshot.skeleton));
++}
++}
+diff --git a/Extension/Skater/motion_snapshot.h b/Extension/Skater/motion_snapshot.h
+new file mode 100644
+index 0000000..4ff187f
+--- /dev/null
++++ b/Extension/Skater/motion_snapshot.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include "Extension/Skater/no_bail.h"
++#include "Engine/Game/Abi/linear_transform.h"
++#include <array>
++#include <cstdint>
++
++// The exact motion of the local skater's physics bodies, taken and put back: every body's world matrix,
++// velocity and spin, board and skeleton. It does not hold what the game keeps beside the bodies (the
++// animation graph, the trick and state machines, contacts), so a restore puts the bodies back and leaves
++// those as they are. Physics thread, inside a step (a no_bail step listener): the game's body
++// synchronizer applies a restore at the next step.
++namespace dingosdk::motion_snapshot {
++struct Body {
++    std::array<float, 16> transform{};
++    game::Vec3 velocity{}, spin{};
++};
++struct Snapshot {
++    std::array<Body, 9> board{};
++    std::array<Body, 26> skeleton{};
++    bool valid{};
++};
++// False when a body could not be read or does not hold the layout expected.
++bool capture(const NoBailSkater& skater, Snapshot& snapshot) noexcept;
++// `skeleton`: the skeleton's bodies too, not only the board's. False when nothing was written.
++// A flight's path goes on at the speed of the skater's step: its frame time becomes `step`, and its frame count
++// the one that is the same time along the path. Nothing is written while they agree. Physics thread.
++void match_flight_step(const NoBailSkater& skater, float step) noexcept;
++bool restore(const NoBailSkater& skater, const Snapshot& snapshot, bool skeleton) noexcept;
++}
+diff --git a/Extension/Skater/state_dump.cpp b/Extension/Skater/state_dump.cpp
+new file mode 100644
+index 0000000..f76bca2
+--- /dev/null
++++ b/Extension/Skater/state_dump.cpp
+@@ -0,0 +1,111 @@
++#include "state_dump.h"
++#include "Engine/Core/Platform/memory.h"
++#include "Engine/Game/Build/addresses.h"
++#include "Engine/Game/Build/20260929/skater_body.h"
++#include "Engine/Game/Build/20260929/skater_movement.h"
++#include "Engine/Game/Build/20260929/skater_state.h"
++#include <array>
++#include <atomic>
++#include <cstring>
++#include <fstream>
++#include <mutex>
++#include <vector>
++
++namespace dingosdk::state_dump {
++namespace {
++namespace body = addr::skater_body;
++namespace state = addr::skater_state;
++namespace movement = addr::skater_movement;
++
++constexpr std::size_t chunk = 0x100;
++
++struct Dump {
++    std::mutex mutex;
++    std::vector<unsigned char> bytes;
++    std::atomic<bool> armed{};
++    std::uint32_t every{};
++};
++Dump& dump() {
++    static auto* value = new Dump;
++    return *value;
++}
++template <class T> void append(std::vector<unsigned char>& out, const T& value) {
++    const auto* raw = reinterpret_cast<const unsigned char*>(&value);
++    out.insert(out.end(), raw, raw + sizeof(T));
++}
++// Unreadable chunks stay 0xCD: a block's size is a generous guess at the object's, and may run past it.
++void add_block(std::vector<unsigned char>& out, std::uint32_t step, std::uint32_t id, std::uintptr_t address, std::uint32_t size) {
++    if (address < 0x10000) return;
++    append(out, step);
++    append(out, id);
++    append(out, static_cast<std::uint64_t>(address));
++    append(out, size);
++    const auto at = out.size();
++    out.resize(at + size, 0xCD);
++    for (std::size_t done = 0; done < size; done += chunk) {
++        const auto length = std::min<std::size_t>(chunk, size - done);
++        (void)memory::peek_bytes(address + done, out.data() + at + done, length);
++    }
++}
++std::uintptr_t pointer_at(std::uintptr_t address) noexcept {
++    std::uintptr_t value{};
++    return memory::peek(address, value) ? value : 0;
++}
++}
++
++void arm(std::uint32_t every) {
++    auto& d = dump();
++    std::lock_guard lock(d.mutex);
++    d.bytes.clear();
++    d.bytes.reserve(16u << 20);
++    const char magic[4] = {'T', 'A', 'S', 'D'};
++    d.bytes.insert(d.bytes.end(), magic, magic + 4);
++    d.every = every;
++    d.armed.store(true, std::memory_order_release);
++}
++
++void on_step(const NoBailSkater& skater, std::size_t step) noexcept {
++    auto& d = dump();
++    if (!d.armed.load(std::memory_order_acquire)) return;
++    try {
++        std::lock_guard lock(d.mutex);
++        if (!wanted(step, d.every) || d.bytes.size() >= max_bytes) return;
++        auto& out = d.bytes;
++        const auto number = static_cast<std::uint32_t>(step);
++        // The ids stay as they are: the comparing script names them.
++        add_block(out, number, 0, skater.context, 0x2000);
++        add_block(out, number, 1, skater.core, 0x4200);
++        add_block(out, number, 2, skater.rig, 0x4700);
++        add_block(out, number, 3, pointer_at(skater.core + state::trick_state_offset), 0x800);
++        add_block(out, number, 4, pointer_at(skater.core + movement::skater_parent), 0x400);
++        const auto board_holder = pointer_at(skater.core + state::board_holder_offset);
++        add_block(out, number, 5, board_holder, 0x400);
++        const auto board_physics = pointer_at(board_holder + state::board_physics_offset);
++        add_block(out, number, 6, board_physics, 0x100);
++        add_block(out, number, 7, pointer_at(board_physics + state::physics_bodies_offset),
++            state::board_body_count * static_cast<std::uint32_t>(state::physics_body_size) + 0x20);
++        const auto rig_physics = pointer_at(skater.rig + state::rig_physics_offset);
++        add_block(out, number, 8, rig_physics, 0x2000);
++        add_block(out, number, 9, pointer_at(rig_physics + state::physics_bodies_offset),
++            state::rig_body_count * static_cast<std::uint32_t>(state::physics_body_size) + 0x20);
++        add_block(out, number, 10, pointer_at(rig_physics + body::contact_struct_offset), 0x2000);
++        add_block(out, number, 11, pointer_at(skater.core + body::core_step_input_offset), 0x100);
++        add_block(out, number, 12, skater.entity, 0x800);
++    } catch (...) {
++    }
++}
++
++std::string save(const std::filesystem::path& file) {
++    auto& d = dump();
++    d.armed.store(false, std::memory_order_release);
++    std::lock_guard lock(d.mutex);
++    if (d.bytes.size() <= 4) return "nothing was taken";
++    std::error_code error;
++    std::filesystem::create_directories(file.parent_path(), error);
++    if (error) return "the folder could not be made: " + error.message();
++    std::ofstream stream(file, std::ios::binary | std::ios::trunc);
++    stream.write(reinterpret_cast<const char*>(d.bytes.data()), static_cast<std::streamsize>(d.bytes.size()));
++    d.bytes.clear();
++    return stream.good() ? std::string{} : std::string("the file could not be written");
++}
++}
+diff --git a/Extension/Skater/state_dump.h b/Extension/Skater/state_dump.h
+new file mode 100644
+index 0000000..fc9f615
+--- /dev/null
++++ b/Extension/Skater/state_dump.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include "Extension/Skater/no_bail.h"
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <string_view>
++
++// Research: the local skater's raw memory at chosen physics steps of a run, saved to a file for
++// comparing runs. It finds what a restore must also put back for a run to repeat exactly. It only reads.
++//
++// The file is the magic "TASD", then records: u32 step, u32 block id, u64 address, u32 size, the bytes.
++// Bytes that could not be read are left as 0xCD. Blocks are ids into state_dump::block_names.
++namespace dingosdk::state_dump {
++inline constexpr std::size_t max_bytes = 64u << 20;
++// Client thread: the next run's steps are taken: the first few, then every `every` steps.
++void arm(std::uint32_t every);
++// Physics thread, in a step (a no_bail step listener): `step` counts from the run's start.
++void on_step(const NoBailSkater& skater, std::size_t step) noexcept;
++// Client thread: ends the taking and writes what was taken. Empty when it worked, else why not.
++std::string save(const std::filesystem::path& file);
++// Whether `step` of a run is one taken, by the rule arm() describes.
++constexpr bool wanted(std::size_t step, std::uint32_t every) noexcept {
++    return step <= 5 || (every != 0 && step % every == 0);
++}
++}
+diff --git a/Extension/Skater/virtual_time.cpp b/Extension/Skater/virtual_time.cpp
+new file mode 100644
+index 0000000..def3025
+--- /dev/null
++++ b/Extension/Skater/virtual_time.cpp
+@@ -0,0 +1,114 @@
++#include "virtual_time.h"
++#include "Engine/Core/Hooks/hooks.h"
++#include "Engine/Core/Log/logging.h"
++#include <Windows.h>
++#include <atomic>
++#include <mutex>
++
++namespace dingosdk::virtual_time {
++namespace {
++using QueryCounter = BOOLEAN(NTAPI*)(LARGE_INTEGER*);
++
++struct Clock {
++    QueryCounter real{};
++    std::atomic<bool> on{};
++    std::atomic<std::int64_t> now{};          // what is read while on
++    std::atomic<std::int64_t> offset{};       // real minus what is read, while off
++    std::atomic<std::int64_t> last_advance{}; // the real clock when `now` last moved
++    std::atomic<std::uint64_t> reads{};
++    std::int64_t step{}, frequency{}, stall{};
++    bool hooked{};
++    std::mutex mutex;
++};
++Clock& clock() {
++    static auto* value = new Clock;
++    return *value;
++}
++std::int64_t read_real() noexcept {
++    LARGE_INTEGER value{};
++    clock().real(&value);
++    return value.QuadPart;
++}
++// Any thread, as often as the game likes: no locks.
++BOOLEAN NTAPI counter_hook(LARGE_INTEGER* out) {
++    auto& c = clock();
++    const auto result = c.real(out);
++    if (!result || !out) return result;
++    c.reads.fetch_add(1, std::memory_order_relaxed);
++    const auto real = out->QuadPart;
++    if (!c.on.load(std::memory_order_acquire)) {
++        out->QuadPart = real - c.offset.load(std::memory_order_relaxed);
++        return result;
++    }
++    // No step for a while: a load or a pause. One thread at a time moves time on, by whole steps.
++    auto last = c.last_advance.load(std::memory_order_relaxed);
++    if (real - last > c.stall && c.last_advance.compare_exchange_strong(last, real, std::memory_order_acq_rel))
++        c.now.fetch_add(c.step, std::memory_order_acq_rel);
++    out->QuadPart = c.now.load(std::memory_order_acquire);
++    return result;
++}
++bool install() noexcept {
++    auto& c = clock();
++    if (c.hooked) return true;
++    LARGE_INTEGER frequency{};
++    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return false;
++    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
++    const auto target = ntdll ? reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlQueryPerformanceCounter")) : nullptr;
++    if (!target) return false;
++    c.frequency = frequency.QuadPart;
++    c.step = ticks_per_step(frequency.QuadPart);
++    c.stall = frequency.QuadPart / 10; // a tenth of a second with no step
++    void* original{};
++    {
++        HookBatch batch;
++        if (hook_prepare(target, reinterpret_cast<void*>(&counter_hook), &original) != HookOk) return false;
++        c.real = reinterpret_cast<QueryCounter>(original);
++        if (hook_enable(target) != HookOk) return false;
++    }
++    c.hooked = true;
++    logging::write(logging::Level::info, logging::Channel::skater, "Virtual time: the performance counter is hooked.");
++    return true;
++}
++}
++
++bool set(bool on) noexcept {
++    auto& c = clock();
++    try {
++        std::lock_guard lock(c.mutex);
++        if (!install()) return false;
++        if (on == c.on.load(std::memory_order_acquire)) return true;
++        const auto real = read_real();
++        if (on) {
++            c.now.store(real - c.offset.load(std::memory_order_relaxed), std::memory_order_release);
++            c.last_advance.store(real, std::memory_order_release);
++        } else {
++            c.offset.store(real - c.now.load(std::memory_order_acquire), std::memory_order_release);
++        }
++        c.on.store(on, std::memory_order_release);
++        return true;
++    } catch (...) {
++        return false;
++    }
++}
++
++bool active() noexcept { return clock().on.load(std::memory_order_acquire); }
++
++void on_step() noexcept {
++    auto& c = clock();
++    if (!c.on.load(std::memory_order_acquire)) return;
++    c.now.fetch_add(c.step, std::memory_order_acq_rel);
++    // Held to real time, in the odd case the game is running ahead of it. Never for long.
++    const auto last = c.last_advance.load(std::memory_order_acquire);
++    const auto due = last + c.step;
++    auto real = read_real();
++    const auto give_up = real + c.step * 2;
++    while (real < due && real < give_up) {
++        if (due - real > c.frequency / 500) Sleep(1);
++        else YieldProcessor();
++        real = read_real();
++    }
++    c.last_advance.store(real, std::memory_order_release);
++}
++
++std::uint64_t reads() noexcept { return clock().reads.load(std::memory_order_relaxed); }
++}
+diff --git a/Extension/Skater/virtual_time.h b/Extension/Skater/virtual_time.h
+new file mode 100644
+index 0000000..edd549c
+--- /dev/null
++++ b/Extension/Skater/virtual_time.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <cstdint>
++
++// Research: the process's performance counter driven by the skater's physics steps. While on, the time
++// any thread reads moves only when a physics step runs, by the same amount each step, so what the game
++// works out from the clock between steps (a frame's length, for filters and animation) is the same in every
++// run. Each step is held back to real time, so the game runs at its usual speed. If no step comes (a load,
++// a pause), time creeps on from the real clock, so nothing waiting on it waits for ever.
++namespace dingosdk::virtual_time {
++// Pure: the counter ticks a step moves time by. A step of the game's fixed 60 a second, rounded up and one
++// more, so that a frame's time never falls short of its step.
++constexpr std::int64_t ticks_per_step(std::int64_t frequency) noexcept {
++    return (frequency + 59) / 60 + 1;
++}
++// Client thread. The hook goes in at the first use and stays; off, it gives the real clock on from where
++// the virtual one reached, so time never runs backwards. False when the hook could not go in.
++bool set(bool on) noexcept;
++bool active() noexcept;
++// Physics thread, once a step.
++void on_step() noexcept;
++// Reads of the clock answered since the game started, whether on or off: 0 means the hook sees nothing.
++std::uint64_t reads() noexcept;
++}

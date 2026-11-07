@@ -1,0 +1,531 @@
+#include "music_inject.h"
+#include "app_audio_capture.h"
+#include "spotify_device.h"
+#include "external_audio.h"
+#include "youtube_music.h"
+#include "external_player.h"
+#include "spotify_station.h"
+#include "Engine/Core/Hooks/hooks.h"
+#include "Engine/Core/Log/logging.h"
+#include "Engine/Core/Platform/memory.h"
+#include "Engine/Game/Build/20260929/audio_core.h"
+#include "Engine/Game/Build/addresses.h"
+#include <Windows.h>
+#include <intrin.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <format>
+
+namespace dingosdk::music_inject {
+namespace {
+namespace ac = addr::audio_core;
+using Process = std::uint64_t (*)(std::uintptr_t player, std::uintptr_t mixer);
+using Command = void (*)(std::uintptr_t player, int command, std::uintptr_t arguments);
+using Exit = void (WINAPI*)(UINT code);
+Process process_original{};
+Command command_original{};
+Exit exit_original{};
+std::atomic<bool> installed{}, hooked{};
+std::atomic<int> which{1};
+std::atomic<float> loudness{1.0f};
+// The sound file of the station's own song: the one a player is asked for just after the game
+// begins that song (the asking is a moment after, on the same thread or the next frame).
+std::atomic<std::uint64_t> expect_until{};
+char station_file[120]{};
+std::atomic<std::uint64_t> last_replaced{}; // GetTickCount64 of the last block replaced
+std::atomic<std::uint64_t> replaced_blocks{}, replaced_frames{};
+
+// The game's players of sound files seen so far, for the log and the console: what each was
+// last asked to play and what it produces. Written by the game's threads, read by the client
+// thread; a name read while it is being written is a muddle for one line and no more.
+struct Player {
+    std::atomic<std::uintptr_t> address{};
+    char name[120]{};
+    std::atomic<std::uint32_t> requests{}, said{};
+    std::atomic<std::uint64_t> blocks{}, replaced{};
+    std::atomic<std::uint32_t> channels{}, rate{}, seconds{};
+};
+std::array<Player, 96> players{};
+
+Player* player_of(std::uintptr_t address) noexcept {
+    for (auto& player : players) {
+        auto held = player.address.load(std::memory_order_relaxed);
+        if (held == address) return &player;
+        if (!held && player.address.compare_exchange_strong(held, address, std::memory_order_relaxed)) return &player;
+        if (held == address) return &player;
+    }
+    return nullptr;
+}
+
+template <class T> T at(std::uintptr_t address) noexcept {
+    T value;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value;
+}
+
+// A block the player has just produced into `buffer` is written over with what Spotify is
+// playing. The audio thread: no locks, no allocation.
+bool replace(std::uint64_t reader, std::uintptr_t buffer, std::uint32_t frames, std::uint32_t channels, float rate) noexcept {
+    __try {
+        const auto data = at<std::uintptr_t>(buffer + ac::buffer_data);
+        const bool together = at<std::uint8_t>(buffer + ac::buffer_together) != 0;
+        const auto stride = at<std::uint16_t>(buffer + ac::buffer_stride);
+        if (!data || (together && stride < frames)) return false;
+        const auto channel = [&](std::uint32_t index) {
+            return together ? reinterpret_cast<float*>(data + std::size_t{stride} * index * 4) : at<float*>(data + std::size_t{index} * 8);
+        };
+        float* const left = channel(0);
+        float* const right = channel(1);
+        if (!left || !right) return false;
+        app_audio::read(reader, left, right, frames, rate);
+        if (const float gain = loudness.load(std::memory_order_relaxed); gain != 1.0f)
+            for (std::uint32_t i = 0; i < frames; ++i) {
+                left[i] *= gain;
+                right[i] *= gain;
+            }
+        for (std::uint32_t i = 2; i < channels; ++i)
+            if (float* const other = channel(i)) std::memset(other, 0, std::size_t{frames} * 4);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::atomic<bool> sp_active{false}, sp_mute_loops{true};
+std::atomic<float> sp_left{1.0f}, sp_right{1.0f}, sp_lpf_l{1.0f}, sp_lpf_r{1.0f}, sp_env{0.0f};
+std::atomic<int> sp_itd{0};
+std::atomic<std::uint64_t> sp_expires_at{0};
+// Counted up each time the speaker is turned on after being off (or lapsed), so the audio thread
+// starts every stream's filters afresh instead of playing what was left in them from before.
+std::atomic<std::uint32_t> sp_generation{1};
+// GetTickCount64 of the last block of the station's own song put through the speaker.
+std::atomic<std::uint64_t> station_heard{};
+
+// The speaker's filters for one stream (a reader: a player's file in one mix). Every song of 45 s
+// or more goes through the speaker, both files of a crossfade among them: with one set of filters
+// between them, each stream's delay and reverb played the others' sound, with clicks.
+// Only the audio thread touches one, and only while it holds `busy`, so set_spatial never does.
+// (All zero until first used, where it is reset, so the table costs the DLL nothing on disk.)
+struct Speaker {
+    std::atomic<std::uint64_t> key{}, used{}; // whose it is (0: nobody's), and when it last ran
+    std::atomic<bool> busy{};
+    std::uint32_t generation{}, ring_wp{};
+    float cur_left{}, cur_right{}, lpf_l_state{}, lpf_r_state{};
+    float hpf_in_l{}, hpf_in_r{}, hpf_out_l{}, hpf_out_r{}, mid_l{}, mid_r{}, rev_lp{};
+    std::array<float, 4096> delay_l{}, delay_r{}, rev_buf{};
+};
+std::array<Speaker, 8> speakers{};
+
+void reset(Speaker& speaker, std::uint32_t generation) noexcept {
+    speaker.generation = generation;
+    speaker.ring_wp = 0;
+    // From the stream as it was before the speaker, ramped to the speaker's gain over a block.
+    speaker.cur_left = speaker.cur_right = 1.0f;
+    speaker.lpf_l_state = speaker.lpf_r_state = 0.0f;
+    speaker.hpf_in_l = speaker.hpf_in_r = speaker.hpf_out_l = speaker.hpf_out_r = 0.0f;
+    speaker.mid_l = speaker.mid_r = speaker.rev_lp = 0.0f;
+    speaker.delay_l.fill(0.0f);
+    speaker.delay_r.fill(0.0f);
+    speaker.rev_buf.fill(0.0f);
+}
+
+// The stream's own filters, held (busy) until the caller lets them go; a stream not seen before
+// takes the ones used longest ago. Null when another thread holds them, and the block is left as
+// it is. The audio thread: no locks, no allocation.
+Speaker* speaker_of(std::uint64_t reader, std::uint64_t now) noexcept {
+    const std::uint64_t key = reader ? reader : 1;
+    const auto generation = sp_generation.load(std::memory_order_acquire);
+    Speaker* found{};
+    for (auto& speaker : speakers)
+        if (speaker.key.load(std::memory_order_relaxed) == key) {
+            found = &speaker;
+            break;
+        }
+    if (!found) {
+        found = &speakers[0];
+        for (auto& speaker : speakers)
+            if (speaker.used.load(std::memory_order_relaxed) < found->used.load(std::memory_order_relaxed)) found = &speaker;
+    }
+    if (found->busy.exchange(true, std::memory_order_acquire)) return nullptr;
+    if (found->key.load(std::memory_order_relaxed) != key || found->generation != generation) {
+        reset(*found, generation);
+        found->key.store(key, std::memory_order_relaxed);
+    }
+    found->used.store(now, std::memory_order_relaxed);
+    return found;
+}
+
+void silence_block(std::uintptr_t buffer, std::uint32_t frames, std::uint32_t channels) noexcept {
+    __try {
+        const auto data = at<std::uintptr_t>(buffer + ac::buffer_data);
+        const bool together = at<std::uint8_t>(buffer + ac::buffer_together) != 0;
+        const auto stride = at<std::uint16_t>(buffer + ac::buffer_stride);
+        if (!data || (together && stride < frames) || !frames) return;
+        for (std::uint32_t c = 0; c < channels; ++c)
+            if (float* const ptr = together ? reinterpret_cast<float*>(data + std::size_t{stride} * c * 4) : at<float*>(data + std::size_t{c} * 8))
+                std::memset(ptr, 0, std::size_t{frames} * 4);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void spatialize_block(Speaker& speaker, std::uintptr_t buffer, std::uint32_t frames, std::uint32_t channels) noexcept {
+    __try {
+        const auto data = at<std::uintptr_t>(buffer + ac::buffer_data);
+        const bool together = at<std::uint8_t>(buffer + ac::buffer_together) != 0;
+        const auto stride = at<std::uint16_t>(buffer + ac::buffer_stride);
+        if (!data || (together && stride < frames) || !frames) return;
+        const auto channel = [&](std::uint32_t index) {
+            return together ? reinterpret_cast<float*>(data + std::size_t{stride} * index * 4) : at<float*>(data + index * 8);
+        };
+        float* const left = channel(0);
+        float* const right = channel(1);
+        if (!left || !right) return;
+        const float target_l = sp_left.load(std::memory_order_relaxed), target_r = sp_right.load(std::memory_order_relaxed);
+        const float al = sp_lpf_l.load(std::memory_order_relaxed), ar = sp_lpf_r.load(std::memory_order_relaxed);
+        const float env_wet = sp_env.load(std::memory_order_relaxed);
+        const int itd = sp_itd.load(std::memory_order_relaxed);
+        const std::uint32_t dl = itd < 0 ? static_cast<std::uint32_t>(-itd) : 0u;
+        const std::uint32_t dr = itd > 0 ? static_cast<std::uint32_t>(itd) : 0u;
+        const float step_l = (target_l - speaker.cur_left) / static_cast<float>(frames);
+        const float step_r = (target_r - speaker.cur_right) / static_cast<float>(frames);
+        const float cab_mix = std::clamp(0.45f + 0.55f * env_wet, 0.0f, 0.90f);
+        auto& delay_l = speaker.delay_l;
+        auto& delay_r = speaker.delay_r;
+        auto& rev_buf = speaker.rev_buf;
+        for (std::uint32_t i = 0; i < frames; ++i) {
+            const std::uint32_t wp = speaker.ring_wp;
+            speaker.cur_left += step_l;
+            speaker.cur_right += step_r;
+            const float mid = 0.5f * (left[i] + right[i]);
+            float sl = left[i] + 0.65f * (mid - left[i]), sr = right[i] + 0.65f * (mid - right[i]);
+            speaker.hpf_out_l = sl - speaker.hpf_in_l + 0.985f * speaker.hpf_out_l; speaker.hpf_in_l = sl;
+            speaker.hpf_out_r = sr - speaker.hpf_in_r + 0.985f * speaker.hpf_out_r; speaker.hpf_in_r = sr;
+            speaker.mid_l += 0.032f * (speaker.hpf_out_l - speaker.mid_l); speaker.mid_r += 0.032f * (speaker.hpf_out_r - speaker.mid_r);
+            sl += cab_mix * ((speaker.hpf_out_l + 0.28f * speaker.mid_l) - sl);
+            sr += cab_mix * ((speaker.hpf_out_r + 0.28f * speaker.mid_r) - sr);
+            delay_l[wp & 4095] = sl; delay_r[wp & 4095] = sr;
+            speaker.lpf_l_state += al * (delay_l[(wp - dl) & 4095] - speaker.lpf_l_state);
+            speaker.lpf_r_state += ar * (delay_r[(wp - dr) & 4095] - speaker.lpf_r_state);
+            const float t1 = rev_buf[(wp - 624u) & 4095], t2 = rev_buf[(wp - 1392u) & 4095];
+            const float t3 = rev_buf[(wp - 2256u) & 4095], t4 = rev_buf[(wp - 3264u) & 4095];
+            const float rl = 0.42f * t1 - 0.30f * t2 + 0.24f * t3 - 0.16f * t4;
+            const float rr = 0.38f * t2 - 0.32f * t1 + 0.22f * t4 - 0.18f * t3;
+            speaker.rev_lp += 0.30f * (0.5f * (speaker.lpf_l_state * speaker.cur_left + speaker.lpf_r_state * speaker.cur_right) + 0.22f * t4 - speaker.rev_lp);
+            rev_buf[wp & 4095] = speaker.rev_lp;
+            left[i] = speaker.lpf_l_state * speaker.cur_left + env_wet * rl;
+            right[i] = speaker.lpf_r_state * speaker.cur_right + env_wet * rr;
+            speaker.ring_wp = wp + 1;
+        }
+        speaker.cur_left = target_l; speaker.cur_right = target_r;
+        for (std::uint32_t c = 2; c < channels; ++c)
+            if (float* const other = channel(c)) std::memset(other, 0, std::size_t{frames} * 4);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+
+std::uint64_t process_hook(std::uintptr_t player, std::uintptr_t mixer) {
+    // What it is playing, read before it moves on to its next file.
+    std::uint32_t length{};
+    float voice_rate{};
+    std::uintptr_t buffer{};
+    std::uint64_t reader{};
+    __try {
+        const auto voice = player + at<std::uint16_t>(player + ac::player_voices) + std::size_t{at<std::uint8_t>(player + ac::player_voice)} * ac::voice_size;
+        if (const auto state = at<std::uint8_t>(voice + ac::voice_state); state != 0 && state != 5) {
+            length = at<std::uint32_t>(voice + ac::voice_frames);
+            voice_rate = at<float>(voice + ac::voice_rate);
+        }
+        buffer = at<std::uintptr_t>(mixer + ac::mixer_write);
+        // The game may run one player for more than one mix, and a player has more than one
+        // file going while it fades from one to the next: each of those reads for itself.
+        reader = (player * 0x9e3779b97f4a7c15ull) ^ (mixer * 0xc2b2ae3d27d4eb4full) ^ at<std::uint8_t>(player + ac::player_voice);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        buffer = 0;
+    }
+    const auto result = process_original(player, mixer);
+    if (!result || !buffer) return result;
+    __try {
+        const auto frames = at<std::uint32_t>(mixer + ac::mixer_frames);
+        const auto channels = std::uint32_t{at<std::uint8_t>(mixer + ac::mixer_channels)};
+        const auto rate = at<float>(mixer + ac::mixer_rate);
+        if (!frames || frames > 0x4000 || at<std::uintptr_t>(mixer + ac::mixer_written) != buffer) return result;
+        const std::uint32_t seconds = voice_rate > 1000.0f ? static_cast<std::uint32_t>(static_cast<float>(length) / voice_rate) : 0;
+        auto* const seen = player_of(player);
+        if (seen) {
+            seen->blocks.fetch_add(1, std::memory_order_relaxed);
+            seen->channels.store(channels, std::memory_order_relaxed);
+            seen->rate.store(static_cast<std::uint32_t>(rate), std::memory_order_relaxed);
+            if (seconds) seen->seconds.store(seconds, std::memory_order_relaxed);
+        }
+        const int mode = which.load(std::memory_order_relaxed);
+        const bool sp = spatial_active();
+        if ((!mode || !spotify_station::active()) && !sp) return result;
+        if (channels < 2 || rate < 8000.0f) return result;
+
+        // The station's own carrier was captured on the first process_hook after song_begun
+        // (via station_song_begins -> capture_next). Every other reader is a world emitter or
+        // short loop; mode 1 skips < 60s readers that aren't the station, mode 3 skips all
+        // non-station readers.
+        const bool stations_own = seen && station_file[0] && std::strncmp(seen->name, station_file, sizeof(station_file)) == 0;
+        const std::uint32_t dur = seen ? seen->seconds.load(std::memory_order_relaxed) : seconds;
+        if (mode && spotify_station::active() && !(mode == 1 && !stations_own && dur < 60) && !(mode == 3 && !stations_own)) {
+            if (replace(reader, buffer, frames, channels, rate)) {
+                last_replaced.store(GetTickCount64(), std::memory_order_relaxed);
+                replaced_blocks.fetch_add(1, std::memory_order_relaxed);
+                replaced_frames.fetch_add(frames, std::memory_order_relaxed);
+                if (seen) seen->replaced.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (sp) {
+            // The world's short loops are silenced only while the station's own song is going
+            // through the speaker; without it they are the only sound there is. A few blocks of
+            // grace, so a loop mixed just before the song in the same round is silenced too.
+            const auto now = GetTickCount64();
+            if (stations_own) station_heard.store(now, std::memory_order_relaxed);
+            const bool short_loop = !stations_own && dur > 0 && dur < 45;
+            if (short_loop) {
+                if (sp_mute_loops.load(std::memory_order_relaxed) && now < station_heard.load(std::memory_order_relaxed) + 300) silence_block(buffer, frames, channels);
+            } else if (stations_own || dur >= 45) {
+                if (auto* const speaker = speaker_of(reader, now)) {
+                    spatialize_block(*speaker, buffer, frames, channels);
+                    speaker->busy.store(false, std::memory_order_release);
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return result;
+}
+
+void command_hook(std::uintptr_t player, int command, std::uintptr_t arguments) {
+    if (command == ac::command_play && arguments) {
+        __try {
+            if (auto* const seen = player_of(player)) {
+                const auto name = at<const char*>(arguments + ac::command_play_name);
+                std::size_t length{};
+                if (name)
+                    while (length + 1 < sizeof(seen->name) && name[length]) {
+                        seen->name[length] = name[length];
+                        ++length;
+                    }
+                seen->name[length] = 0;
+                if (const auto until = expect_until.load(std::memory_order_relaxed); until && GetTickCount64() < until && length) {
+                    expect_until.store(0, std::memory_order_relaxed);
+                    std::memcpy(station_file, seen->name, sizeof(station_file));
+                }
+                seen->seconds.store(0, std::memory_order_relaxed);
+                seen->requests.fetch_add(1, std::memory_order_relaxed);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    command_original(player, command, arguments);
+}
+
+// The game is ending: Spotify's own output is put back first.
+//
+// Not when it is the Spotify library built into this DLL that asks for the end (librespot ends
+// the whole program in a dozen places: on an account that is not Premium, on a sound it cannot
+// play): that took the game down with it at every start for a player whose account was not
+// Premium, 2026-10-12. Only the thread that asked is ended, and the device is left stopped.
+// The library is known by the call coming from this DLL, which itself never ends the program.
+void WINAPI exit_hook(UINT code) {
+    HMODULE caller{}, own{};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(_ReturnAddress()), &caller) &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&exit_hook), &own) && caller == own) {
+        spotify_device::library_gave_up();
+        ExitThread(code);
+    }
+    app_audio::stop();
+    exit_original(code);
+}
+
+bool matches(std::uintptr_t base, const game::build::Fingerprint& contract) noexcept {
+    std::array<unsigned char, 32> bytes{};
+    return memory::peek(base + contract.rva, bytes) && bytes == contract.bytes;
+}
+} // namespace
+
+bool install(std::uintptr_t base) noexcept {
+    if (installed.exchange(true)) return hooked.load();
+    if (!base || !matches(base, ac::stream_player_process) || !matches(base, ac::stream_player_command)) {
+        try {
+            logging::log(logging::Level::warning, logging::Channel::music, "Spotify through the game: the game's sound file player is not the one this was written for.");
+        } catch (...) {}
+        return false;
+    }
+    const auto process = reinterpret_cast<void*>(base + ac::stream_player_process.rva), command = reinterpret_cast<void*>(base + ac::stream_player_command.rva);
+    if (hook_prepare(command, reinterpret_cast<void*>(&command_hook), reinterpret_cast<void**>(&command_original)) != HookOk || hook_enable(command) != HookOk) {
+        command_original = nullptr;
+        return false;
+    }
+    if (hook_prepare(process, reinterpret_cast<void*>(&process_hook), reinterpret_cast<void**>(&process_original)) != HookOk || hook_enable(process) != HookOk) {
+        process_original = nullptr;
+        return false;
+    }
+    if (const auto exit = reinterpret_cast<void*>(&ExitProcess);
+        hook_prepare(exit, reinterpret_cast<void*>(&exit_hook), reinterpret_cast<void**>(&exit_original)) != HookOk || hook_enable(exit) != HookOk)
+        exit_original = nullptr;
+    hooked.store(true);
+    // (Spotify left turned down by a game that ended without putting it back.)
+    app_audio::restore_source(L"Spotify.exe");
+    return true;
+}
+
+void station_song_begins() noexcept { expect_until.store(GetTickCount64() + 1500, std::memory_order_relaxed); }
+int mode() noexcept { return which.load(std::memory_order_relaxed); }
+void set_mode(int mode) noexcept { which.store(std::clamp(mode, 0, 3), std::memory_order_relaxed); }
+float gain() noexcept { return loudness.load(std::memory_order_relaxed); }
+void set_gain(float gain) noexcept { loudness.store(std::clamp(gain, 0.0f, 16.0f), std::memory_order_relaxed); }
+
+void set_spatial(bool active, float left, float right, float lpf_l, float lpf_r, int itd, float env, bool mute_loops) noexcept {
+    // Only the audio thread touches the filters: off is only said here, and on again after
+    // being off (or lapsed) moves the generation on, for the audio thread to start them afresh.
+    if (!active) {
+        sp_active.store(false, std::memory_order_relaxed);
+        sp_expires_at.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (!spatial_active()) sp_generation.fetch_add(1, std::memory_order_relaxed);
+    sp_left.store(std::clamp(left, 0.0f, 4.0f), std::memory_order_relaxed);
+    sp_right.store(std::clamp(right, 0.0f, 4.0f), std::memory_order_relaxed);
+    sp_lpf_l.store(std::clamp(lpf_l, 0.04f, 1.0f), std::memory_order_relaxed);
+    sp_lpf_r.store(std::clamp(lpf_r, 0.04f, 1.0f), std::memory_order_relaxed);
+    sp_itd.store(std::clamp(itd, -32, 32), std::memory_order_relaxed);
+    sp_env.store(std::clamp(env, 0.0f, 0.65f), std::memory_order_relaxed);
+    sp_mute_loops.store(mute_loops, std::memory_order_relaxed);
+    sp_expires_at.store(GetTickCount64() + 2000, std::memory_order_relaxed);
+    // (Release, so the audio thread that sees it on also sees the generation moved on.)
+    sp_active.store(true, std::memory_order_release);
+}
+bool spatial_active() noexcept {
+    return sp_active.load(std::memory_order_acquire) && GetTickCount64() <= sp_expires_at.load(std::memory_order_relaxed);
+}
+
+
+void tick() noexcept {
+    if (!hooked.load(std::memory_order_relaxed)) return;
+    static bool started{};
+    static std::uint64_t looked{};
+    static unsigned said{};
+    const auto now = GetTickCount64();
+    const bool on = spotify_station::active() && which.load(std::memory_order_relaxed) != 0;
+    // The sound is the game's own Spotify device's when an account is on it (spotify_device.h),
+    // and what the Spotify app on this computer plays otherwise.
+    // (And the picked application's, external_audio.h, when its station is the one that is on.)
+    // (And YouTube Music's, youtube_music.h, which fills the buffer itself as the device does.)
+    const bool others = external_audio::on(), tube = youtube_music::on();
+    const bool device = !others && !tube && spotify_device::connected();
+    app_audio::set_external(device || tube, tube ? youtube_music::rate() : 44100);
+    if (on && !device && !tube) {
+        const auto name = others ? external_audio::app() : std::string("Spotify.exe");
+        if (!name.empty()) {
+            started = true;
+            app_audio::target(std::wstring(name.begin(), name.end()).c_str());
+        }
+    }
+    // Spotify's own output is down only while its sound is in fact going through the game. When
+    // the game stops asking for the song's sound (the player paused the game's music), Spotify
+    // is paused, and kept down for the moment that takes; it plays again when the game does.
+    if (started || device || tube) {
+        static bool flowing{}, paused{};
+        const auto since = now - last_replaced.load(std::memory_order_relaxed);
+        const bool flows = on && since < 700;
+        if (flows != flowing) {
+            flowing = flows;
+            if (!flows && on) {
+                external_player::send(external_player::Command::pause);
+                paused = true;
+            } else if (flows && paused) {
+                external_player::send(external_player::Command::play);
+                paused = false;
+            }
+            if (!on) paused = false;
+        }
+        if (started) app_audio::mute_source(on && !device && !tube && since < 2500);
+    }
+    if (now - looked < 1000) return;
+    // How fast the game is taking the sound, against the clock: more than it can play (it is
+    // catching up after standing still, as when the player comes back to its window, and the
+    // music is heard fast for a moment: reported 2026-10-12) or less. Said when it is not as it
+    // should be, with whether the game's window is the one in front.
+    {
+        static std::uint64_t counted{}, counted_starved{};
+        static unsigned told{};
+        const auto frames = replaced_frames.load(std::memory_order_relaxed);
+        const auto capture = app_audio::state();
+        const double seconds = static_cast<double>(now - looked) / 1000.0;
+        if (on && looked && seconds < 3.0 && capture.readers && told < 80) {
+            const double pace = static_cast<double>(frames - counted) / (48000.0 * seconds * capture.readers);
+            DWORD front{};
+            GetWindowThreadProcessId(GetForegroundWindow(), &front);
+            const bool focused = front == GetCurrentProcessId();
+            static bool was_focused{true};
+            if (pace > 1.12 || (pace < 0.88 && pace > 0.01) || focused != was_focused) {
+                ++told;
+                try {
+                    logging::log(logging::Level::info, logging::Channel::music, "Pace: the game took the sound at {:.2f} of the clock's speed over {:.1f} s ({} reader(s), {} frame(s) it wanted were not there); its window is {}.", pace,
+                        seconds, capture.readers, capture.starved - counted_starved, focused ? "in front" : "not in front");
+                } catch (...) {}
+            }
+            was_focused = focused;
+        }
+        counted = frames;
+        counted_starved = capture.starved;
+    }
+    looked = now;
+    // How the capture of an application's sound is going, into the log as it changes (a player
+    // who hears nothing has this to send): whether it runs, why not, and whether any sound has
+    // come of it.
+    if (on && started && !device && !tube) {
+        static std::string said_capture;
+        const auto capture = app_audio::state();
+        const auto name = others ? external_audio::app() : std::string("Spotify.exe");
+        auto text = std::format("{}: {}{}; {}; its own output {}", name, capture.capturing ? "being captured" : "not being captured",
+            capture.problem.empty() ? std::string() : " (" + capture.problem + ")", capture.level > 0.0005f ? "sound is coming of it" : "no sound has come of it yet",
+            capture.muted ? "turned down" : "as it is");
+        if (text != said_capture) {
+            said_capture = text;
+            try {
+                logging::log(capture.capturing ? logging::Level::debug : logging::Level::warning, logging::Channel::music, "Sound through the game: {}.", text);
+            } catch (...) {}
+        }
+    }
+    // (What the game's sound files are, into the log while this is being worked out.)
+    for (std::size_t i = 0; i < players.size() && said < 400; ++i) {
+        auto& player = players[i];
+        const auto requests = player.requests.load(std::memory_order_relaxed);
+        if (!player.address.load(std::memory_order_relaxed) || requests == player.said.load(std::memory_order_relaxed) || !player.seconds.load(std::memory_order_relaxed)) continue;
+        player.said.store(requests, std::memory_order_relaxed);
+        ++said;
+        try {
+            char name[sizeof(player.name)];
+            std::memcpy(name, player.name, sizeof(name));
+            name[sizeof(name) - 1] = 0;
+            logging::log(logging::Level::debug, logging::Channel::music, "Sound file player {}: \"{}\", {} channel(s) at {} Hz, {} s long{}.", i, name,
+                player.channels.load(std::memory_order_relaxed), player.rate.load(std::memory_order_relaxed), player.seconds.load(std::memory_order_relaxed),
+                spotify_station::active() ? " (the Spotify station is on)" : "");
+        } catch (...) {}
+    }
+}
+
+std::string status() {
+    if (!hooked.load()) return "Spotify through the game: not available (the game's sound file player was not recognised).";
+    const auto capture = app_audio::state();
+    auto text = std::format("Spotify through the game: mode {}, gain {:.2f}; {} block(s) replaced ({} s); capture {}{}, {} reader(s), level {:.3f}, {} frame(s) short; Spotify's own output {}.",
+        which.load(), loudness.load(), replaced_blocks.load(), replaced_frames.load() / 48000,
+        capture.capturing ? "running" : "not running", capture.problem.empty() ? std::string() : " (" + capture.problem + ")", capture.readers, capture.level, capture.starved,
+        capture.muted ? "turned down" : "as it is");
+    for (std::size_t i = 0; i < players.size(); ++i) {
+        const auto& player = players[i];
+        if (!player.address.load() || !player.replaced.load()) continue;
+        char name[sizeof(player.name)];
+        std::memcpy(name, player.name, sizeof(name));
+        name[sizeof(name) - 1] = 0;
+        text += std::format("\n  replaced: player {} \"{}\", {} channel(s), {} s, {} block(s)", i, name, player.channels.load(), player.seconds.load(), player.replaced.load());
+    }
+    return text;
+}
+} // namespace dingosdk::music_inject
