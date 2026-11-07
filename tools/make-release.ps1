@@ -12,7 +12,8 @@ if (-not (Test-Path $Dll)) { throw "No ReSkate.dll at $Dll. Build it first, or p
 $name = "ReTake-v$Version"
 $dist = Join-Path $Root "dist"
 $out = Join-Path $dist $name
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+# Empty it rather than delete it: an open installer window keeps the folder itself in use.
+if (Test-Path $out) { Get-ChildItem $out -Force | Remove-Item -Recurse -Force }
 $files = Join-Path $out "files"
 New-Item -ItemType Directory -Force (Join-Path $files "Mods") | Out-Null
 
