@@ -1,0 +1,28 @@
+name: Discord release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # refresh the download card without posting
+
+permissions:
+  contents: read
+
+jobs:
+  discord:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Update Discord
+        run: node .github/discord/sync-release.mjs
+        env:
+          DOWNLOAD_WEBHOOK: ${{ secrets.DISCORD_DOWNLOAD_WEBHOOK }}
+          DOWNLOAD_MESSAGE_ID: ${{ vars.DISCORD_DOWNLOAD_MESSAGE_ID }}
+          UPDATES_WEBHOOK: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
+          POST_UPDATE: ${{ github.event_name == 'release' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
