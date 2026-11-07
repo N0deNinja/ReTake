@@ -52,6 +52,17 @@ end
 
 function R.toast(message, level)
     reskate.ui.toast(message, level)
+    -- What the player was told, in the file too (not the game's log: that has the toast already).
+    text ..= os.date("%H:%M:%S ") .. "[shown] " .. tostring(message) .. "\n"
+    dirty = true
+end
+
+-- The last `count` lines written, oldest first.
+function R.tail(count)
+    local lines = string.split(text, "\n")
+    if lines[#lines] == "" then table.remove(lines) end
+    local first = math.max(1, #lines - count + 1)
+    return table.move(lines, first, #lines, 1, table.create(#lines - first + 1))
 end
 
 return R

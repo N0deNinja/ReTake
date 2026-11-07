@@ -3,6 +3,14 @@
 local U = require("util")
 local R = require("report")
 local L = require("line")
+local P = require("problem")
+
+-- Report a problem, in the timeline: its window sits over the timeline, which freezes the recorder as it opens.
+L.on_report = function() return P.open(true) end
+L.report_open = P.is_open
+L.on_timeline = function(open)
+    if open then P.freeze("you opened the timeline") elseif P.is_open() then P.drop() end
+end
 
 local function say(text)
     reskate.console.print(text)
@@ -28,6 +36,7 @@ local function help()
     say("retake bails              the game's bails off and on")
     say("retake stop               stop everything ReTake is doing")
     say("retake off                stop recording and forget the line")
+    say("retake report             report a problem: say what went wrong, ReTake saves it with the game's state")
     say("retake files              open ReTake's log folder")
 end
 
@@ -49,6 +58,8 @@ reskate.console.command("retake", "ReTake: rewind and retake your lines", functi
         L.stop_all()
     elseif sub == "off" then
         L.stop()
+    elseif sub == "report" then
+        answer(P.open(false))
     elseif sub == "files" then
         R.flush()
         reskate.files.reveal("results")
@@ -64,6 +75,7 @@ end, {
     {name = "bails", help = "The game's bails off and on"},
     {name = "stop", help = "Stop everything ReTake is doing"},
     {name = "off", help = "Stop recording and forget the line"},
+    {name = "report", help = "Report a problem: what went wrong, saved with the game's state"},
     {name = "files", help = "Open ReTake's log folder"},
 })
 
@@ -83,6 +95,7 @@ end)
 
 reskate.on("screen_closed", function(title)
     L.on_screen_closed(title)
+    P.on_screen_closed(title)
 end)
 
 reskate.on("bail", function(e)
@@ -91,11 +104,13 @@ end)
 
 reskate.on("tick", function()
     L.tick(false)
+    P.tick(U.now())
     R.tick(U.now())
 end)
 
 reskate.on("draw", function(d)
     L.draw(d)
+    P.draw(d)
 end)
 
 reskate.on("unload", function()

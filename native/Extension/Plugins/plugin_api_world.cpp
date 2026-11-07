@@ -3163,6 +3163,17 @@ struct WorldApi {
         lua_setfield(L, -2, "skeleton");
         return 1;
     }
+    // tas.line_save(path, text): text, then the line's every step (the controller, the board), to a file in the
+    // plugin's data folder, up to 8 MB: a bug report.
+    static int tas_line_save(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.line_save");
+        need(L, plugin, "files", "reskate.tas.line_save");
+        const auto path = data_path(L, 1, false);
+        std::size_t length = 0;
+        const char* text = luaL_optlstring(L, 2, "", &length);
+        return result(L, game(plugin).tas_line_save(plugin.id(), path, std::string_view(text, length)));
+    }
     static int tas_stop(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "tas", "reskate.tas.stop");
@@ -3549,7 +3560,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
     add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
         {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
         {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}});
+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}});
     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
     add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                   {"ready", entities_ready}, {"blueprints", entities_blueprints},

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.2 (2026-11-07)
+
+- **Report a problem**, in the timeline (top right) or `retake report` in the console. Write what went wrong and press Save: ReTake saves one file, `Mods\.reskate_plugin_data\ReTake\reports\retake-report-<date>.txt`, with what you wrote and what the game and ReTake were doing in the 30 seconds before you opened the timeline (physics steps, frames, controller input, ReTake's state and log). Nothing is sent anywhere; you choose who gets the file.
+- With a line recorded, the report also has the whole line, every step: the controller exactly as recorded and where the board was. So a replay that drifted can be replayed and compared.
+- ReTake keeps a short recording of the game all the time for this, and logs how far each replay drifted from the recording.
+- Installing over an installed ReTake updates it: it finds that folder by itself, asks nothing it doesn't need to, and never backs up an older ReTake `ReSkate.dll` as the one to go back to.
+- ReSkate.dll: `reskate.tas.line_save(path, text)` for the report.
+
 ## 0.0.1 (2026-11-07)
 
 The first public release.

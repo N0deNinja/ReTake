@@ -138,13 +138,22 @@ local function note_player()
     end
 end
 
+L.on_report = nil      -- the timeline's Report a problem: problem.lua opens its window
+L.report_open = nil    -- function: is that window open (the timeline then waits under it)
+L.on_timeline = nil    -- function(open): the timeline opening (true) or going (false)
+
 local function close_player()
     if not player then return end
     note_player()
     end_preview()
     player = nil
     closed_at = U.now()
+    if L.on_timeline then L.on_timeline(false) end
     reskate.ui.close()
+end
+
+local function reporting()
+    return L.report_open ~= nil and L.report_open()
 end
 
 -- Back to a moment: where the line started, then up to it. The teleport first: refused (at most two a
@@ -350,6 +359,7 @@ end
 function L.back(seconds)
     if U.in_session() then return false, "ReTake is offline only" end
     if player then return false, "the timeline is open" end
+    if reporting() then return true end -- Ctrl+R while typing a report: nothing
     if line.phase == "off" or line.length == 0 then return false, "no line is recording: F11, New line here" end
     local base = line.length
     if pending and pending.hand_over and going_back() then base = pending.to end
@@ -374,6 +384,7 @@ local function carry_on()
 end
 
 function L.toggle_player()
+    if reporting() then return true end -- F11 while writing a report: the report keeps the keys
     if player then return carry_on() end
     if U.now() - closed_at < 300 then return true end -- the press that closed it
     if U.in_session() then return false, "ReTake is offline only" end
@@ -389,6 +400,15 @@ function L.toggle_player()
     count = nil
     reskate.ui.open(SCREEN)
     player = {was_air = board_in_air(), opened = U.now(), ticks = 0, cursor = line.length, following = true, dragging = false, left = true, confirm = false, f11 = true, enter = true, repeat_at = 0}
+    if L.on_timeline then L.on_timeline(true) end
+    return true
+end
+
+-- Back to the timeline from the report window, as it was. False when it has gone in the meantime.
+function L.resume_player()
+    if not player then return false end
+    reskate.ui.open(SCREEN)
+    player.left, player.f11, player.enter, player.dragging = true, true, true, false
     return true
 end
 
@@ -398,6 +418,7 @@ function L.on_screen_closed(title)
     end_preview()
     player = nil
     closed_at = U.now()
+    if L.on_timeline then L.on_timeline(false) end
     local ok, why = carry_on()
     if not ok then R.toast(tostring(why), "warn") end
 end
@@ -424,6 +445,8 @@ local function layout()
     b.speed = at(x, chip)
     b.slowmo = at(b.speed.x1 + gap, chip)
     b.bails = at(b.slowmo.x1 + gap, chip)
+    -- In the header, on the right: the header row's middle is panel.y0 + 52k.
+    b.report = {x0 = right - 196 * k, x1 = right, y0 = panel.y0 + 36 * k, y1 = panel.y0 + 68 * k}
     return k, panel, bar, b
 end
 
@@ -488,6 +511,9 @@ local function press(name)
         say_failure(L.toggle_bails())
     elseif name == "stop" then
         L.stop_all()
+    elseif name == "report" then
+        end_preview()
+        if L.on_report then say_failure(L.on_report()) end
     end
 end
 
@@ -672,13 +698,13 @@ function L.tick(busy)
         seek(p.to, p.hand_over, p.retries + 1)
     end
     if player then
-        player_tick(now)
+        if not reporting() then player_tick(now) end
         return
     end
 end
 
 -- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
-local VERSION = "0.0.1"
+local VERSION = "0.0.2"
 local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
 local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
 local PANEL = {colour = "#0c0d11eb", fill = true, rounding = 16}
@@ -806,10 +832,24 @@ local function draw_player(d)
         centred(d, "No line yet", txt(28, TEXT), width / 2, top - 2 * k)
         centred(d, "Stand where your line should start, then press New line.", txt(16, MUTED, "body"), width / 2, top + 34 * k)
     end
+    -- Report a problem, top right: quiet, an outline with a "!" in a circle.
+    local rb = buttons.report
+    local report_hover = mouse and inside(mouse.position, rb)
+    if report_hover then d:rect(v(rb.x0, rb.y0), v(rb.x1, rb.y1), SURFACE_HOVER) end
+    d:rect(v(rb.x0, rb.y0), v(rb.x1, rb.y1), {colour = report_hover and "#ffffff60" or "#ffffff30", thickness = 1, rounding = 10})
+    local report_style = txt(15, report_hover and TEXT or MUTED, "bold")
+    local rs = d:measure("Report a problem", report_style)
+    local rcy = (rb.y0 + rb.y1) / 2
+    local rx = (rb.x0 + rb.x1) / 2 - (rs.x + 24 * k) / 2
+    d:circle(v(rx + 8 * k, rcy), 8 * k, {colour = report_hover and TEXT or MUTED, thickness = 1.5})
+    d:rect(v(rx + 7 * k, rcy - 4.5 * k), v(rx + 9 * k, rcy + 1 * k), {colour = report_hover and TEXT or MUTED, fill = true})
+    d:rect(v(rx + 7 * k, rcy + 2.5 * k), v(rx + 9 * k, rcy + 4.5 * k), {colour = report_hover and TEXT or MUTED, fill = true})
+    d:text(v(rx + 24 * k, rcy - rs.y / 2), "Report a problem", report_style)
+
     local keys = "Scrub: drag · wheel · ←/→      Enter: retake      Esc: close"
     local keys_style = txt(15, MUTED, "body")
     local ks = d:measure(keys, keys_style)
-    d:text(v(bar.x1 - ks.x, top + 12 * k), keys, keys_style)
+    d:text(v(rb.x0 - 22 * k - ks.x, top + 12 * k), keys, keys_style)
 
     -- The timeline: what has played in teal, retakes above, bails below, the playhead on top.
     d:rect(v(bar.x0, bar.y0), v(bar.x1, bar.y1), TRACK)
@@ -915,7 +955,7 @@ function L.draw(d)
     local size = d:size()
     width, height = size.x, size.y
     if player then
-        draw_player(d)
+        if not reporting() then draw_player(d) end -- the report window is drawn over the game instead
         return
     end
     local k = height / 1080
@@ -943,6 +983,36 @@ end
 
 function L.phase()
     return line.phase, line.length
+end
+
+-- What the report's recorder takes every frame: cheap, no copies.
+local pad_seen, pad_at = nil, -math.huge
+function L.live()
+    local now = U.now()
+    if now - pad_at > 1000 then pad_seen, pad_at = find_pad(), now end
+    return {line = line, slowed = slowed, clock = clock_now, speed = applied_speed, timeline = player ~= nil, counting = count ~= nil,
+        going_to = pending and pending.to, pad = pad_seen}
+end
+
+-- Everything ReTake knows, for a report.
+function L.snapshot()
+    local state = {
+        phase = line.phase, length = line.length, step = line.step, since_spawn = line.since_spawn, previous_phase = previous_phase,
+        slowed = slowed, clock = clock_now, game_speed = applied_speed, slowmo_on = slowmo_on, slowmo_speed = slowmo_speed,
+        catch_up = catch_up, bails_off = no_bail, hint = hint_text, screen = string.format("%dx%d", width, height),
+        marks = #marks, retakes = #joins, bails = #bails, pad = find_pad(), filming_rows = filming and #filming.rows,
+        probe_rows = probe and #probe.rows,
+    }
+    if pending then
+        state.pending = {to = pending.to, hand_over = pending.hand_over, retries = pending.retries, armed = pending.armed,
+            air_soon = pending.air_soon, ms_since_asked = U.now() - pending.asked_at, ms_running = pending.run_at and U.now() - pending.run_at}
+    end
+    if count then state.countdown = {ms_left = count.ends - U.now(), how = count.how} end
+    if player then
+        state.timeline = {cursor = player.cursor, following = player.following, opened_in_flight = player.was_air,
+            ms_open = U.now() - player.opened, preview_shown = player.shown}
+    end
+    return {state = state, start = start, marks = marks, joins = joins, bails = bails}
 end
 
 reskate.ui.screen(SCREEN, function() end, {panel = false})

@@ -181,6 +181,11 @@ public:
         std::lock_guard lock(mutex_);
         return {mode_, step_, frames_.size(), owner_, stopped_, unread_, first_unread_, holding_};
     }
+    // A copy of what is recorded, a value a step, for a bug report.
+    std::vector<PadOutput> recorded() {
+        std::lock_guard lock(mutex_);
+        return frames_;
+    }
 
     // The frame for the reads after `step` steps have run: frame N was latched at step N + 1. Empty
     // before the script's first frame.

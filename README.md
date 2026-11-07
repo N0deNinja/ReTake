@@ -15,7 +15,7 @@
 </p>
 
 > [!WARNING]
-> **This is version 0.0.1, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
+> **This is version 0.0.2, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
 
 ![How ReTake works, step by step](docs/how-it-works.jpg)
 
@@ -29,6 +29,7 @@ You skate a line. ReTake records it. When you mess up, open the timeline, pick a
 - **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate.
 - **Bails off.** One switch so you don't fall off from big drops.
 - **Stop all.** One button that stops everything ReTake is doing.
+- **Report a problem.** Write what went wrong; ReTake saves it in a file with the last 30 seconds of the game, for us to look at.
 
 ## Install
 
@@ -39,7 +40,7 @@ You need:
 
 Then:
 
-1. Download **`ReTake-v0.0.1.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
+1. Download **`ReTake-v0.0.2.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
 2. Close skate. and the ReSkate launcher.
 3. Double-click **`Install ReTake.bat`**.
    It finds your game on its own (or lets you pick the folder), backs up your `ReSkate.dll`, installs ReTake, and asks to turn off the launcher's automatic updates.
@@ -61,6 +62,10 @@ If Windows SmartScreen warns about the `.bat`, choose **More info**, then **Run 
 4. In `ReSkateLauncher.settings.json`, set `"updates": false`.
 
 </details>
+
+### Updating
+
+Download the new zip, close the game, and double-click **`Install ReTake.bat`** again. It finds the folder ReTake is in, updates it without asking anything, and keeps your original `ReSkate.dll` backup. ReSkate then asks you to allow ReTake again, because its files changed.
 
 ### Uninstall
 
@@ -98,6 +103,7 @@ Close the game and double-click **`Uninstall ReTake.bat`**. It puts your old `Re
 | **Bails** | The game's bails on or off |
 | **New line** | Throw this line away and start a new one (press twice) |
 | **Stop all** | Stop everything ReTake is doing |
+| **Report a problem** | Top right: write what went wrong and save it to a file you can send us |
 
 ### Console
 
@@ -112,6 +118,7 @@ retake speed [1-8]        how fast going back catches up (default 4)
 retake bails              the game's bails off and on
 retake stop               stop everything ReTake is doing
 retake off                stop recording and forget the line
+retake report             report a problem: write what went wrong, saved with the game's state
 retake files              open ReTake's log folder
 ```
 
@@ -121,7 +128,7 @@ retake files              open ReTake's log folder
 - **Offline only.** ReTake refuses to run in a multiplayer session, by design.
 - **Only for ReSkate 2.1.4-2** and the skate. build it supports. A new ReSkate version needs a new ReTake build.
 - **Lines can be up to 10 minutes long.**
-- Bugs: open an [issue](https://github.com/N0deNinja/ReTake/issues). `retake files` opens the log folder; attaching `results\report.txt` helps a lot.
+- **Found a bug?** Right after it happens, press F11 and click **Report a problem** (top right), write what went wrong, and press **Save report**. ReTake saves a file in `Mods\.reskate_plugin_data\ReTake\reports` with what you wrote and the last 30 seconds of the game. Attach it to an [issue](https://github.com/N0deNinja/ReTake/issues). ReTake never sends anything by itself.
 
 ## What's in this repository
 
@@ -146,7 +153,7 @@ cd ..
 powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
 ```
 
-That writes `dist\ReTake-v0.0.1.zip`.
+That writes `dist\ReTake-v0.0.2.zip`.
 
 ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that rescales the board's flight so it works mid-air, a no-bail switch, sharper plugin fonts, and **no crash reports**: this build never uploads anything.
 

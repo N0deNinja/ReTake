@@ -59,6 +59,278 @@ index b67509e..bb3f717 100644
  inline constexpr std::uintptr_t board_holder_offset = 0x430;  // core
  inline constexpr std::uintptr_t board_physics_offset = 0x18;  // board holder
  inline constexpr std::uintptr_t rig_physics_offset = 0x2f10;  // rig
+diff --git a/Engine/Game/Input/step_script.h b/Engine/Game/Input/step_script.h
+new file mode 100644
+index 0000000..726a69d
+--- /dev/null
++++ b/Engine/Game/Input/step_script.h
+@@ -0,0 +1,266 @@
++#pragma once
++#include "pad_output.h"
++#include <cstddef>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// One controller's values by physics step, latched: while a script runs the game's reads get one value
++// from one step to the next, the controller's when recording and the script's when playing. So the
++// game sees the same values at the same steps either way: a recording and its replays differ in nothing
++// the input can cause. It costs a recording up to one step of input lag. PadOutputs' replacement lasts
++// by the clock and follows the client tick, so its value reaches the game some way into a step that
++// differs from run to run. No plugin code runs on these threads.
++namespace dingosdk::input {
++class StepScript {
++public:
++    enum class Mode : unsigned char { off, recording, playing };
++    struct Status {
++        Mode mode{Mode::off};
++        std::size_t step{}, length{};
++        std::string owner, stopped;
++        // Steps of this run the game read nothing before: an input that reached it a step late or never.
++        std::size_t unread{};
++        std::vector<std::size_t> first_unread;
++        bool holding{}; // a line waiting: no step counts
++    };
++    static constexpr std::size_t unread_kept = 64;
++    static constexpr std::size_t max_steps = 36000; // ten minutes at the game's 60 steps a second
++    static constexpr int max_lead = 8;
++
++    // Client thread: starts recording this controller, replacing the script held.
++    std::string record(std::string_view owner, unsigned controller, std::size_t steps) {
++        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
++        if (steps == 0 || steps > max_steps) return "a script is 1 to 36000 steps";
++        std::lock_guard lock(mutex_);
++        if (const auto why = taken(owner); !why.empty()) return why;
++        frames_.clear();
++        frames_.reserve(steps);
++        limit_ = steps;
++        latest_ = {};
++        latched_ = {};
++        begin(owner, controller, Mode::recording, 0);
++        return {};
++    }
++    // Client thread: gives the script back from its first step. `lead` reads that many steps ahead.
++    std::string play(std::string_view owner, unsigned controller, int lead) {
++        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
++        if (lead < -max_lead || lead > max_lead) return "a lead is -8 to 8 steps";
++        std::lock_guard lock(mutex_);
++        if (const auto why = taken(owner); !why.empty()) return why;
++        if (frames_.empty()) return "no script is recorded";
++        begin(owner, controller, Mode::playing, lead);
++        return {};
++    }
++    // Physics thread: whatever a line is doing ends; what it holds stays to go back to.
++    void halt() {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off) end("stopped");
++    }
++    // Client thread: ends what `owner` runs. What was recorded stays to be played.
++    void stop(std::string_view owner) {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off && owner_ == owner) end("stopped");
++        if (owner_ == owner) line_ = false;
++    }
++    // Client thread: records as a line, which can be gone back in. Losing the input (the game's own menu)
++    // ends the recording as it ends any, and what was skated stays to go back to.
++    std::string record_line(std::string_view owner, unsigned controller, std::size_t steps) {
++        auto why = record(owner, controller, steps);
++        if (why.empty()) {
++            std::lock_guard lock(mutex_);
++            line_ = true;
++        }
++        return why;
++    }
++    // Physics thread: a line holds: no step counts and the game reads a neutral controller, until it runs
++    // up. What was recorded stays. False with nothing recorded and nothing running.
++    bool hold() {
++        std::lock_guard lock(mutex_);
++        if (mode_ == Mode::off && frames_.empty()) return false;
++        mode_ = Mode::recording;
++        holding_ = true;
++        run_to_ = 0;
++        step_ = frames_.size();
++        return true;
++    }
++    // Physics thread: plays from step `from` up to step `to`. Then, with `hand_over`, what came after `to` is
++    // forgotten and it records on from there with the last value it played, until go(); without, it ends as a
++    // playing does.
++    void run_up(std::size_t from, std::size_t to, bool hand_over) {
++        std::lock_guard lock(mutex_);
++        to = to < frames_.size() ? to : frames_.size();
++        holding_ = false;
++        lead_ = 0;
++        reads_ = 1;
++        unread_ = 0;
++        first_unread_.clear();
++        hand_over_ = hand_over;
++        if (from >= to) {
++            finish_run_up(to);
++            return;
++        }
++        mode_ = Mode::playing;
++        step_ = from;
++        run_to_ = to;
++    }
++    // After a run up: the controller's from the next step on.
++    void go() {
++        std::lock_guard lock(mutex_);
++        use_last_ = false;
++    }
++    // The timeline is open: the input being taken costs a line nothing, the game reading a neutral controller.
++    void set_paused(bool paused) {
++        std::lock_guard lock(mutex_);
++        paused_ = paused;
++    }
++    // Until go(): what the game last read, whatever the controller does, as after a run up.
++    void hold_input() {
++        std::lock_guard lock(mutex_);
++        use_last_ = true;
++        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++    }
++    // Physics thread, once a step of the local skater.
++    void step() {
++        std::lock_guard lock(mutex_);
++        if (holding_) return;
++        if (mode_ != Mode::off && reads_ == 0) {
++            ++unread_;
++            if (first_unread_.size() < unread_kept) first_unread_.push_back(step_);
++        }
++        reads_ = 0;
++        if (mode_ == Mode::recording) {
++            if (use_last_) latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++            else latched_ = latest_;
++            frames_.push_back(latched_);
++            step_ = frames_.size();
++            if (frames_.size() >= limit_) end("recorded");
++        } else if (mode_ == Mode::playing) {
++            ++step_;
++            if (run_to_) {
++                if (step_ >= run_to_) finish_run_up(run_to_);
++            } else if (step_ > frames_.size()) {
++                end("played");
++            }
++        }
++    }
++    // Input threads, at each read the game makes: what the game should see instead, if anything.
++    // `real` is what the controller reads. Not allowed (a menu, another window, a session) ends the run,
++    // so an old input is never played after it.
++    std::optional<PadOutput> on_read(unsigned controller, const PadOutput& real, bool allowed) {
++        std::lock_guard lock(mutex_);
++        if (mode_ == Mode::off) return std::nullopt;
++        if (!allowed) {
++            lose();
++            return std::nullopt;
++        }
++        if (controller != controller_) return std::nullopt;
++        ++reads_;
++        latest_ = real; // a run up hands over to the controller as it is by then
++        if (mode_ == Mode::recording) {
++            if (holding_) return PadOutput{};
++            return use_last_ ? without_menus(latched_) : latched_;
++        }
++        // Neutral until the first step, as a recording's reads are.
++        const auto frame = frame_at(step_, lead_, frames_.size());
++        return frame ? without_menus(frames_[*frame]) : PadOutput{};
++    }
++    // Input threads: a read the game was kept from, by a menu or the overlay.
++    void interrupt() {
++        std::lock_guard lock(mutex_);
++        if (mode_ != Mode::off) lose();
++    }
++    // A running script answers this controller's reads.
++    bool replacing(unsigned controller) {
++        std::lock_guard lock(mutex_);
++        return mode_ != Mode::off && controller_ == controller;
++    }
++    Status status() {
++        std::lock_guard lock(mutex_);
++        return {mode_, step_, frames_.size(), owner_, stopped_, unread_, first_unread_, holding_};
++    }
++    // A copy of what is recorded, a value a step, for a bug report.
++    std::vector<PadOutput> recorded() {
++        std::lock_guard lock(mutex_);
++        return frames_;
++    }
++
++    // The frame for the reads after `step` steps have run: frame N was latched at step N + 1. Empty
++    // before the script's first frame.
++    static std::optional<std::size_t> frame_at(std::size_t step, int lead, std::size_t size) noexcept {
++        const auto at = static_cast<std::ptrdiff_t>(step) - 1 + lead;
++        if (at < 0 || size == 0) return std::nullopt;
++        return static_cast<std::size_t>(at) < size ? static_cast<std::size_t>(at) : size - 1;
++    }
++
++private:
++    // What is replayed never opens anything: the D-pad, Start and Back open the game's menus and its replay, and
++    // a press kept in a recording would open them again at every replay of it.
++    static constexpr std::uint16_t menu_buttons = 0x003f;
++    static PadOutput without_menus(PadOutput pad) noexcept {
++        pad.buttons = static_cast<std::uint16_t>(pad.buttons & ~menu_buttons);
++        return pad;
++    }
++    std::string taken(std::string_view owner) const {
++        return mode_ != Mode::off && owner_ != owner ? owner_ + " runs a script" : std::string{};
++    }
++    void begin(std::string_view owner, unsigned controller, Mode mode, int lead) {
++        owner_ = std::string(owner);
++        controller_ = controller;
++        mode_ = mode;
++        lead_ = lead;
++        step_ = 0;
++        holding_ = false;
++        line_ = false;
++        use_last_ = false;
++        run_to_ = 0;
++        reads_ = 0;
++        unread_ = 0;
++        first_unread_.clear();
++        stopped_.clear();
++    }
++    void end(const char* why) {
++        mode_ = Mode::off;
++        holding_ = false;
++        run_to_ = 0;
++        stopped_ = why;
++    }
++    // Over, so an old input is never played after it; what was recorded stays. A line waiting to go back, or with
++    // the timeline open, has nothing to lose.
++    void lose() {
++        if (line_ && paused_) {
++            latest_ = {}; // what the game reads meanwhile
++            return;
++        }
++        if (line_ && holding_) return;
++        end("the game lost the input");
++    }
++    void finish_run_up(std::size_t to) {
++        run_to_ = 0;
++        if (!hand_over_) {
++            step_ = to;
++            end("played");
++            return;
++        }
++        if (to < frames_.size()) frames_.resize(to);
++        step_ = to;
++        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
++        use_last_ = true;
++        mode_ = Mode::recording;
++    }
++
++    std::mutex mutex_;
++    std::vector<PadOutput> frames_;
++    PadOutput latest_{}, latched_{};
++    std::string owner_, stopped_;
++    std::vector<std::size_t> first_unread_;
++    std::size_t step_{}, limit_{}, reads_{}, unread_{}, run_to_{};
++    unsigned controller_{};
++    int lead_{};
++    Mode mode_{Mode::off};
++    bool holding_{}, line_{}, hand_over_{}, use_last_{}, paused_{};
++};
++inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
++}
 diff --git a/Extension/Plugins/Test/plugin_tests.cpp b/Extension/Plugins/Test/plugin_tests.cpp
 index 6c43ca0..782d97f 100644
 --- a/Extension/Plugins/Test/plugin_tests.cpp
@@ -348,10 +620,10 @@ index 6c43ca0..782d97f 100644
          run(plugins_read_frames_and_hold_gameplay_options);
  #ifdef _WIN32
 diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
-index 8abd30b..65b8aed 100644
+index 8abd30b..03b204c 100644
 --- a/Extension/Plugins/plugin_api_world.cpp
 +++ b/Extension/Plugins/plugin_api_world.cpp
-@@ -2930,6 +2930,278 @@ struct WorldApi {
+@@ -2930,6 +2930,289 @@ struct WorldApi {
          lua_setfield(L, -2, "playstation");
          return 1;
      }
@@ -588,6 +860,17 @@ index 8abd30b..65b8aed 100644
 +        lua_setfield(L, -2, "skeleton");
 +        return 1;
 +    }
++    // tas.line_save(path, text): text, then the line's every step (the controller, the board), to a file in the
++    // plugin's data folder, up to 8 MB: a bug report.
++    static int tas_line_save(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_save");
++        need(L, plugin, "files", "reskate.tas.line_save");
++        const auto path = data_path(L, 1, false);
++        std::size_t length = 0;
++        const char* text = luaL_optlstring(L, 2, "", &length);
++        return result(L, game(plugin).tas_line_save(plugin.id(), path, std::string_view(text, length)));
++    }
 +    static int tas_stop(lua_State* L) {
 +        auto& plugin = plugin_of(L);
 +        need(L, plugin, "tas", "reskate.tas.stop");
@@ -630,14 +913,14 @@ index 8abd30b..65b8aed 100644
      // A whole replacement for a real controller, in the same units as input.gamepad().
      static int input_write(lua_State* L) {
          auto& plugin = plugin_of(L);
-@@ -3274,6 +3546,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+@@ -3274,6 +3557,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
      add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
      add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
      add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
 +    add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
 +        {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
 +        {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}});
++        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}});
      add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
      add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                    {"ready", entities_ready}, {"blueprints", entities_blueprints},
@@ -662,7 +945,7 @@ index 173bdd7..6decf4f 100644
              if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
              if (has("capture")) actions.push_back("record your screen");
 diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
-index 61689ee..cd67ef8 100644
+index 61689ee..8803f2c 100644
 --- a/Extension/Plugins/plugin_game.h
 +++ b/Extension/Plugins/plugin_game.h
 @@ -143,7 +143,37 @@ struct PhysicsStep {
@@ -703,7 +986,7 @@ index 61689ee..cd67ef8 100644
  // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
  // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
  struct LaunchShape {
-@@ -1076,6 +1106,34 @@ public:
+@@ -1076,6 +1106,37 @@ public:
      virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
      virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
      virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
@@ -735,11 +1018,14 @@ index 61689ee..cd67ef8 100644
 +    virtual TasLine tas_line() { return {"off", 0, 0, 0}; }
 +    virtual std::optional<TasBodies> tas_line_bodies(std::size_t /*step*/) { return std::nullopt; }
 +    virtual std::optional<std::array<float, 3>> tas_line_position(std::size_t /*step*/) { return std::nullopt; }
++    // `text`, then the line's every step (the controller as recorded, where the board was), to `path` in the
++    // plugin's data folder: a bug report, larger than a plugin's own files may be.
++    virtual std::string tas_line_save(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*text*/) { return unavailable; }
      // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
      // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
      virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
 diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
-index 5c0acee..2a82d2e 100644
+index 5c0acee..46a89f2 100644
 --- a/Extension/Plugins/plugin_game_runtime.cpp
 +++ b/Extension/Plugins/plugin_game_runtime.cpp
 @@ -30,6 +30,10 @@
@@ -790,7 +1076,7 @@ index 5c0acee..2a82d2e 100644
                  if (!c.touching) continue;
                  const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
                  step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
-@@ -1085,6 +1098,520 @@ public:
+@@ -1085,6 +1098,559 @@ public:
              axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
          return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
      }
@@ -1242,6 +1528,45 @@ index 5c0acee..2a82d2e 100644
 +        const auto& t = m.frames[step].board[0].transform;
 +        return std::array<float, 3>{t[12], t[13], t[14]};
 +    }
++    // A bug report: its text, then every step of the line. The controller is as recorded, in XInput's raw units
++    // (buttons as bits, triggers 0 to 255, sticks -32768 to 32767), and the board is where the line had it.
++    static constexpr std::size_t line_save_most_bytes = 8u << 20;
++    std::string tas_line_save(std::string_view plugin, std::string_view path, std::string_view text) override {
++        const auto inputs = input::step_script().recorded();
++        std::vector<std::array<float, 3>> boards;
++        std::vector<char> valid;
++        {
++            auto& m = tas_motion();
++            std::lock_guard lock(m.frames_mutex);
++            const auto length = std::min(m.frames.size(), m.line_length.load(std::memory_order_acquire) + 1);
++            boards.reserve(length);
++            valid.reserve(length);
++            for (std::size_t i = 0; i < length; ++i) {
++                const auto& t = m.frames[i].board[0].transform;
++                boards.push_back({t[12], t[13], t[14]});
++                valid.push_back(m.frames[i].valid ? 1 : 0);
++            }
++        }
++        const auto rows = std::max(inputs.size(), boards.size());
++        std::string out;
++        out.reserve(text.size() + 200 + rows * 72);
++        out.append(text);
++        out += std::format("\n== The line, every step: the controller as recorded and where the board was ({} inputs, {} board steps) ==\n",
++                           inputs.size(), boards.size());
++        out += "step\tbuttons\tlt\trt\tlx\tly\trx\try\tboard_x\tboard_y\tboard_z\n";
++        for (std::size_t i = 0; i < rows; ++i) {
++            if (i < inputs.size()) {
++                const auto& p = inputs[i];
++                out += std::format("{}\t{:04x}\t{}\t{}\t{}\t{}\t{}\t{}", i, p.buttons, p.left_trigger, p.right_trigger, p.left_x, p.left_y, p.right_x, p.right_y);
++            } else {
++                out += std::format("{}\t\t\t\t\t\t\t", i);
++            }
++            if (i < boards.size() && valid[i]) out += std::format("\t{:.3f}\t{:.3f}\t{:.3f}\n", boards[i][0], boards[i][1], boards[i][2]);
++            else out += "\t\t\t\n";
++        }
++        out += "== end of the line ==\n";
++        return files_write_bytes(plugin, path, out, line_save_most_bytes);
++    }
 +    std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
 +        auto& m = tas_motion();
 +        std::lock_guard lock(m.frames_mutex);
@@ -1311,7 +1636,7 @@ index 5c0acee..2a82d2e 100644
      std::optional<StickInput> joystick(int device) override {
          if (!joystick::game_in_foreground()) return std::nullopt;
          const auto sample = joystick::poll(device);
-@@ -1876,6 +2403,8 @@ public:
+@@ -1876,6 +2442,8 @@ public:
      }
      void release(std::string_view plugin) override {
          input::pad_outputs().release(plugin);
@@ -1362,489 +1687,6 @@ index a9fc444..ea3b92e 100644
  }
  
  bool known_permission(std::string_view name) noexcept {
-diff --git a/Extension/Skater/skater_physics.cpp b/Extension/Skater/skater_physics.cpp
-index d358e81..2cd648a 100644
---- a/Extension/Skater/skater_physics.cpp
-+++ b/Extension/Skater/skater_physics.cpp
-@@ -110,6 +110,55 @@ bool read_motion(const NoBailSkater& skater, Vec3& board, Vec3& pelvis, Vec3& sp
-             skater_body::index(skater_body::Bone::hips), pelvis, &spin);
- }
- 
-+// FNV-1a over the raw bytes of the bodies' motion: floats compared to the last bit, as a run repeated
-+// exactly would have them. `physics` holds `count` bodies, or the hash is given up.
-+void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
-+    const auto* bytes = static_cast<const unsigned char*>(data);
-+    for (std::size_t i = 0; i < size; ++i) {
-+        hash ^= bytes[i];
-+        hash *= 1099511628211ull;
-+    }
-+}
-+bool hash_bodies(std::uint64_t& hash, std::uintptr_t physics, std::uintptr_t vtable, std::uint32_t count) noexcept {
-+    std::uintptr_t type{}, bodies{};
-+    std::uint32_t found{};
-+    if (!memory::peek(physics, type) || type != vtable || !memory::peek(physics + state::physics_bodies_offset, bodies) ||
-+        !memory::peek(bodies, found) || found != count)
-+        return false;
-+    for (std::uint32_t i = 0; i < count; ++i) {
-+        const auto at = bodies + i * state::physics_body_size;
-+        std::array<float, 16> transform{};
-+        Vec3 velocity{}, spin{};
-+        if (!memory::peek(at + body::body_transform_offset, transform) || !memory::peek(at + state::body_velocity_offset, velocity) ||
-+            !memory::peek(at + state::body_spin_offset, spin))
-+            return false;
-+        hash_bytes(hash, transform.data(), sizeof(transform));
-+        hash_bytes(hash, velocity.data(), sizeof(velocity));
-+        hash_bytes(hash, spin.data(), sizeof(spin));
-+    }
-+    return true;
-+}
-+void read_exact_motion(const NoBailSkater& skater, Step& step) noexcept {
-+    std::uintptr_t holder{}, board_physics{}, rig_physics{}, bodies{};
-+    if (!memory::peek(skater.core + state::board_holder_offset, holder) || !memory::peek(holder + state::board_physics_offset, board_physics) ||
-+        !memory::peek(skater.rig + state::rig_physics_offset, rig_physics))
-+        return;
-+    Vec3 velocity{}, spin{};
-+    if (body_motion(board_physics, skater.base + state::board_physics_vtable, state::board_body_count, state::board_root_body, velocity, &spin) &&
-+        memory::peek(board_physics + state::physics_bodies_offset, bodies)) {
-+        Step::Pose pose;
-+        pose.velocity = velocity;
-+        if (memory::peek(bodies + state::board_root_body * state::physics_body_size + body::body_transform_offset, pose.transform)) {
-+            step.board = pose;
-+            step.board_spin = spin;
-+        }
-+    }
-+    std::uint64_t hash = 14695981039346656037ull;
-+    if (!hash_bodies(hash, board_physics, skater.base + state::board_physics_vtable, state::board_body_count)) return;
-+    step.board_hash = hash;
-+    if (hash_bodies(hash, rig_physics, skater.base + state::rig_physics_vtable, state::rig_body_count)) step.motion_hash = hash;
-+}
-+
- // Where the local skater's physics step length is kept now (a float, seconds of game time), 0 while
- // there is no local skater.
- std::uintptr_t step_length_address() noexcept {
-@@ -187,6 +236,7 @@ Step read_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept
-         }
-     }
-     (void)read_contacts(skater, step.body);
-+    read_exact_motion(skater, step);
-     return step;
- }
- 
-diff --git a/Extension/Skater/skater_physics.h b/Extension/Skater/skater_physics.h
-index 48d462b..c806ade 100644
---- a/Extension/Skater/skater_physics.h
-+++ b/Extension/Skater/skater_physics.h
-@@ -26,6 +26,13 @@ struct Step {
-     struct Pose { std::array<float, 16> transform{}; game::Vec3 velocity{}; };
-     std::array<std::optional<Pose>, skater_body::count> poses;
-     skater_body::Contacts body; // what each body touched in the step
-+    // The board's root, which poses leaves out, and how it turns.
-+    std::optional<Pose> board;
-+    std::optional<game::Vec3> board_spin;
-+    // A hash of every body's exact place, velocity and spin, board and skeleton: two steps with the
-+    // same hash have the same motion to the last bit. Empty when the bodies could not all be read.
-+    std::optional<std::uint64_t> motion_hash;
-+    std::optional<std::uint64_t> board_hash; // the same of the board's bodies alone
- };
- 
- // Requires the validated build and No Bail started: verifies the layout once.
-diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
-index b70545c..2a40fff 100644
---- a/Extension/UI/Overlay/input_capture.cpp
-+++ b/Extension/UI/Overlay/input_capture.cpp
-@@ -4,6 +4,8 @@
- #include "held_input.h"
- #include "scripted_pad.h"
- #include "Engine/Game/Input/pad_output.h"
-+#include "Engine/Game/Input/step_script.h"
-+#include "Engine/Game/Multiplayer/session_tools.h"
- #include "Extension/UI/NativeMenu/throwdown_menu.h"
- #include "Extension/Throwdowns/throwdown_kit.h"
- #include "Engine/Game/Input/playstation_report.h"
-@@ -188,7 +190,11 @@ bool output_allowed() noexcept {
- void replace_pad(unsigned controller, dingosdk::overlay::GamepadValues& pad) noexcept {
-     if (overlay_input_access) return;
-     const auto saved_error = GetLastError();
--    const auto output = input::pad_outputs().read(controller, GetTickCount64(), output_allowed());
-+    const bool allowed = output_allowed();
-+    const input::PadOutput real{pad.buttons, pad.left_trigger, pad.right_trigger, pad.left_x, pad.left_y, pad.right_x, pad.right_y};
-+    // A script by physics step goes over a replacement by the clock.
-+    auto output = input::step_script().on_read(controller, real, allowed && !multiplayer_session_active());
-+    if (const auto leased = input::pad_outputs().read(controller, GetTickCount64(), allowed); !output) output = leased;
-     SetLastError(saved_error);
-     if (output) pad = {output->buttons, output->left_trigger, output->right_trigger,
-         output->left_x, output->left_y, output->right_x, output->right_y};
-@@ -211,7 +217,7 @@ void filter_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
- // A finished native PlayStation read of the game's: neutral while a menu holds the input, else
- // through the gamepad filter.
- void handle_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
--    if (block_polled_input()) { (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
-+    if (block_polled_input()) { input::step_script().interrupt(); (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
-     else {
-         filter_hid(read, size);
-         int stick{};
-@@ -394,7 +400,7 @@ void filter_pad(bool outer, DWORD user, XINPUT_STATE* output) noexcept {
-     g.sThumbRY = pad.right_y;
-     // Synthetic changes must be noticed even when the physical packet stays unchanged.
-     // Keep physical packet numbers when no replacement is active.
--    if (input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
-+    if (input::step_script().replacing(static_cast<unsigned>(user)) || input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
-         output->dwPacketNumber = static_cast<DWORD>(GetTickCount64());
- }
- // Another program's hook on XInput that was put in front of the capture's own after it was
-@@ -419,6 +425,7 @@ DWORD WINAPI captured_front(DWORD user, XINPUT_STATE* output) {
-     // Only the game gets a scripted pad (the character room's walk): ReSkate's own reads get the real one.
-     if (outer && output && scripted_pad(user, *output)) return ERROR_SUCCESS;
-     if (result == ERROR_SUCCESS && output && capture) {
-+        input::step_script().interrupt();
-         (void)input::pad_outputs().read(0, GetTickCount64(), false);
-         output->Gamepad = {};
-         output->dwPacketNumber ^= 0x80000000u;
-diff --git a/Extension/UI/Overlay/plugin_overlay.cpp b/Extension/UI/Overlay/plugin_overlay.cpp
-index b3565bf..d547980 100644
---- a/Extension/UI/Overlay/plugin_overlay.cpp
-+++ b/Extension/UI/Overlay/plugin_overlay.cpp
-@@ -29,8 +29,19 @@ ImU32 shadow_of(ImU32 colour) {
-     const auto alpha = static_cast<ImU32>(((colour >> IM_COL32_A_SHIFT) & 0xff) * 0.75f);
-     return IM_COL32(0, 0, 0, alpha);
- }
-+// The plain fonts are baked small: a bigger size takes one baked at least that big, so it is never stretched.
-+ImFont* sharp_font(ImFont* font, float size, const plugin_ui::Shape& shape) {
-+    if (shape.style.font != 0 && shape.style.font != 2) return font; // the brushed titles have their own large one
-+    if (size <= font->FontSize * 1.05f) return font;
-+    const auto& menu = detail::state().menu;
-+    if (menu.heading && size <= menu.heading->FontSize * 1.05f) return menu.heading;
-+    if (menu.heading_large && size <= menu.heading_large->FontSize * 1.05f) return menu.heading_large;
-+    if (menu.hud_digits && size > 80 && shape.text.find_first_not_of("0123456789GO") == std::string::npos) return menu.hud_digits;
-+    return menu.hud ? menu.hud : font;
-+}
- void text(ImDrawList* draw, ImFont* font, float k, ImVec2 where, const plugin_ui::Shape& shape) {
-     const float size = shape.style.size * k;
-+    font = sharp_font(font, size, shape);
-     if (shape.style.wrap > 0) {
-         // Wrapped: from its top left, as d:measure counts it.
-         const float wrap = shape.style.wrap * k;
-diff --git a/Extension/UI/Overlay/skate_menu.cpp b/Extension/UI/Overlay/skate_menu.cpp
-index 99ea53e..27102c7 100644
---- a/Extension/UI/Overlay/skate_menu.cpp
-+++ b/Extension/UI/Overlay/skate_menu.cpp
-@@ -1048,6 +1048,10 @@ void load_skate_fonts(SkateMenu& menu) {
-     menu.bold_large = font(L"FONT_HEADING", "arialbd.ttf", 17 * large_font_ratio);
-     menu.heading_large = font(L"FONT_HEADING", "arialbd.ttf", 22 * large_font_ratio);
-     menu.title_large = font(L"FONT_BRUSH", "arialbi.ttf", 44 * large_font_ratio, latin);
-+    static const ImWchar ascii[]{0x0020, 0x007E, 0};
-+    static const ImWchar big[]{'0', '9', 'G', 'G', 'O', 'O', 0};
-+    menu.hud = font(L"FONT_HEADING", "arialbd.ttf", 72, ascii);
-+    menu.hud_digits = embedded_font(L"FONT_HEADING", 220.f, big);
- }
- 
- namespace menu {
-diff --git a/Extension/UI/Overlay/skate_menu.h b/Extension/UI/Overlay/skate_menu.h
-index 34add7c..280bcb1 100644
---- a/Extension/UI/Overlay/skate_menu.h
-+++ b/Extension/UI/Overlay/skate_menu.h
-@@ -110,6 +110,8 @@ struct SkateMenu {
-     ImFont* title = nullptr;    // brushed page titles
-     ImFont* heading = nullptr;  // tile and section headers
-     ImFont* countdown = nullptr; // full-resolution fallback countdown digits
-+    ImFont* hud = nullptr;        // plugins' larger text, 72 pixels (plugin_overlay.cpp)
-+    ImFont* hud_digits = nullptr; // and their largest: digits and GO, 220 pixels
-     ImFont* mono = nullptr;
-     // The same faces drawn larger (large_font_ratio times), swapped in while the menu is full
-     // screen, where everything is scaled up: text stays sharp instead of stretched.
-diff --git a/cmake/CrashReport.cmake b/cmake/CrashReport.cmake
-index 284fb8e..958d8dd 100644
---- a/cmake/CrashReport.cmake
-+++ b/cmake/CrashReport.cmake
-@@ -1,5 +1,6 @@
- # The sentry_key is the project's public DSN key: it grants report submission only. Never use an auth token.
--set(crash_report_default_url "https://sentry.reskate.dev/api/2/minidump/?sentry_key=8efcb389bdc033445093a7af0c66f9be")
-+# ReTake: a fork never reports to ReSkate's Sentry, whose team did not write this code. Empty disables uploads.
-+set(crash_report_default_url "")
- if(NOT "$ENV{RESKATE_CRASH_REPORT_URL}" STREQUAL "")
-     set(crash_report_default_url "$ENV{RESKATE_CRASH_REPORT_URL}")
- endif()
-diff --git a/cmake/Runtime.cmake b/cmake/Runtime.cmake
-index e908ad3..ffc977a 100644
---- a/cmake/Runtime.cmake
-+++ b/cmake/Runtime.cmake
-@@ -157,6 +157,9 @@ add_library(dingosdk_runtime SHARED
-     Extension/Skater/layer_materials.cpp
-     Extension/Skater/board_pose.cpp
-     Extension/Skater/skater_physics.cpp
-+    Extension/Skater/motion_snapshot.cpp
-+    Extension/Skater/state_dump.cpp
-+    Extension/Skater/virtual_time.cpp
-     Extension/Skater/xray.cpp
-     Extension/Skater/xray_render.cpp
-     Extension/Skater/xray_skeleton.cpp
-diff --git a/Engine/Game/Input/step_script.h b/Engine/Game/Input/step_script.h
-new file mode 100644
-index 0000000..4b4f470
---- /dev/null
-+++ b/Engine/Game/Input/step_script.h
-@@ -0,0 +1,261 @@
-+#pragma once
-+#include "pad_output.h"
-+#include <cstddef>
-+#include <mutex>
-+#include <optional>
-+#include <string>
-+#include <string_view>
-+#include <vector>
-+
-+// One controller's values by physics step, latched: while a script runs the game's reads get one value
-+// from one step to the next, the controller's when recording and the script's when playing. So the
-+// game sees the same values at the same steps either way: a recording and its replays differ in nothing
-+// the input can cause. It costs a recording up to one step of input lag. PadOutputs' replacement lasts
-+// by the clock and follows the client tick, so its value reaches the game some way into a step that
-+// differs from run to run. No plugin code runs on these threads.
-+namespace dingosdk::input {
-+class StepScript {
-+public:
-+    enum class Mode : unsigned char { off, recording, playing };
-+    struct Status {
-+        Mode mode{Mode::off};
-+        std::size_t step{}, length{};
-+        std::string owner, stopped;
-+        // Steps of this run the game read nothing before: an input that reached it a step late or never.
-+        std::size_t unread{};
-+        std::vector<std::size_t> first_unread;
-+        bool holding{}; // a line waiting: no step counts
-+    };
-+    static constexpr std::size_t unread_kept = 64;
-+    static constexpr std::size_t max_steps = 36000; // ten minutes at the game's 60 steps a second
-+    static constexpr int max_lead = 8;
-+
-+    // Client thread: starts recording this controller, replacing the script held.
-+    std::string record(std::string_view owner, unsigned controller, std::size_t steps) {
-+        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
-+        if (steps == 0 || steps > max_steps) return "a script is 1 to 36000 steps";
-+        std::lock_guard lock(mutex_);
-+        if (const auto why = taken(owner); !why.empty()) return why;
-+        frames_.clear();
-+        frames_.reserve(steps);
-+        limit_ = steps;
-+        latest_ = {};
-+        latched_ = {};
-+        begin(owner, controller, Mode::recording, 0);
-+        return {};
-+    }
-+    // Client thread: gives the script back from its first step. `lead` reads that many steps ahead.
-+    std::string play(std::string_view owner, unsigned controller, int lead) {
-+        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
-+        if (lead < -max_lead || lead > max_lead) return "a lead is -8 to 8 steps";
-+        std::lock_guard lock(mutex_);
-+        if (const auto why = taken(owner); !why.empty()) return why;
-+        if (frames_.empty()) return "no script is recorded";
-+        begin(owner, controller, Mode::playing, lead);
-+        return {};
-+    }
-+    // Physics thread: whatever a line is doing ends; what it holds stays to go back to.
-+    void halt() {
-+        std::lock_guard lock(mutex_);
-+        if (mode_ != Mode::off) end("stopped");
-+    }
-+    // Client thread: ends what `owner` runs. What was recorded stays to be played.
-+    void stop(std::string_view owner) {
-+        std::lock_guard lock(mutex_);
-+        if (mode_ != Mode::off && owner_ == owner) end("stopped");
-+        if (owner_ == owner) line_ = false;
-+    }
-+    // Client thread: records as a line, which can be gone back in. Losing the input (the game's own menu)
-+    // ends the recording as it ends any, and what was skated stays to go back to.
-+    std::string record_line(std::string_view owner, unsigned controller, std::size_t steps) {
-+        auto why = record(owner, controller, steps);
-+        if (why.empty()) {
-+            std::lock_guard lock(mutex_);
-+            line_ = true;
-+        }
-+        return why;
-+    }
-+    // Physics thread: a line holds: no step counts and the game reads a neutral controller, until it runs
-+    // up. What was recorded stays. False with nothing recorded and nothing running.
-+    bool hold() {
-+        std::lock_guard lock(mutex_);
-+        if (mode_ == Mode::off && frames_.empty()) return false;
-+        mode_ = Mode::recording;
-+        holding_ = true;
-+        run_to_ = 0;
-+        step_ = frames_.size();
-+        return true;
-+    }
-+    // Physics thread: plays from step `from` up to step `to`. Then, with `hand_over`, what came after `to` is
-+    // forgotten and it records on from there with the last value it played, until go(); without, it ends as a
-+    // playing does.
-+    void run_up(std::size_t from, std::size_t to, bool hand_over) {
-+        std::lock_guard lock(mutex_);
-+        to = to < frames_.size() ? to : frames_.size();
-+        holding_ = false;
-+        lead_ = 0;
-+        reads_ = 1;
-+        unread_ = 0;
-+        first_unread_.clear();
-+        hand_over_ = hand_over;
-+        if (from >= to) {
-+            finish_run_up(to);
-+            return;
-+        }
-+        mode_ = Mode::playing;
-+        step_ = from;
-+        run_to_ = to;
-+    }
-+    // After a run up: the controller's from the next step on.
-+    void go() {
-+        std::lock_guard lock(mutex_);
-+        use_last_ = false;
-+    }
-+    // The timeline is open: the input being taken costs a line nothing, the game reading a neutral controller.
-+    void set_paused(bool paused) {
-+        std::lock_guard lock(mutex_);
-+        paused_ = paused;
-+    }
-+    // Until go(): what the game last read, whatever the controller does, as after a run up.
-+    void hold_input() {
-+        std::lock_guard lock(mutex_);
-+        use_last_ = true;
-+        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
-+    }
-+    // Physics thread, once a step of the local skater.
-+    void step() {
-+        std::lock_guard lock(mutex_);
-+        if (holding_) return;
-+        if (mode_ != Mode::off && reads_ == 0) {
-+            ++unread_;
-+            if (first_unread_.size() < unread_kept) first_unread_.push_back(step_);
-+        }
-+        reads_ = 0;
-+        if (mode_ == Mode::recording) {
-+            if (use_last_) latched_ = frames_.empty() ? PadOutput{} : frames_.back();
-+            else latched_ = latest_;
-+            frames_.push_back(latched_);
-+            step_ = frames_.size();
-+            if (frames_.size() >= limit_) end("recorded");
-+        } else if (mode_ == Mode::playing) {
-+            ++step_;
-+            if (run_to_) {
-+                if (step_ >= run_to_) finish_run_up(run_to_);
-+            } else if (step_ > frames_.size()) {
-+                end("played");
-+            }
-+        }
-+    }
-+    // Input threads, at each read the game makes: what the game should see instead, if anything.
-+    // `real` is what the controller reads. Not allowed (a menu, another window, a session) ends the run,
-+    // so an old input is never played after it.
-+    std::optional<PadOutput> on_read(unsigned controller, const PadOutput& real, bool allowed) {
-+        std::lock_guard lock(mutex_);
-+        if (mode_ == Mode::off) return std::nullopt;
-+        if (!allowed) {
-+            lose();
-+            return std::nullopt;
-+        }
-+        if (controller != controller_) return std::nullopt;
-+        ++reads_;
-+        latest_ = real; // a run up hands over to the controller as it is by then
-+        if (mode_ == Mode::recording) {
-+            if (holding_) return PadOutput{};
-+            return use_last_ ? without_menus(latched_) : latched_;
-+        }
-+        // Neutral until the first step, as a recording's reads are.
-+        const auto frame = frame_at(step_, lead_, frames_.size());
-+        return frame ? without_menus(frames_[*frame]) : PadOutput{};
-+    }
-+    // Input threads: a read the game was kept from, by a menu or the overlay.
-+    void interrupt() {
-+        std::lock_guard lock(mutex_);
-+        if (mode_ != Mode::off) lose();
-+    }
-+    // A running script answers this controller's reads.
-+    bool replacing(unsigned controller) {
-+        std::lock_guard lock(mutex_);
-+        return mode_ != Mode::off && controller_ == controller;
-+    }
-+    Status status() {
-+        std::lock_guard lock(mutex_);
-+        return {mode_, step_, frames_.size(), owner_, stopped_, unread_, first_unread_, holding_};
-+    }
-+
-+    // The frame for the reads after `step` steps have run: frame N was latched at step N + 1. Empty
-+    // before the script's first frame.
-+    static std::optional<std::size_t> frame_at(std::size_t step, int lead, std::size_t size) noexcept {
-+        const auto at = static_cast<std::ptrdiff_t>(step) - 1 + lead;
-+        if (at < 0 || size == 0) return std::nullopt;
-+        return static_cast<std::size_t>(at) < size ? static_cast<std::size_t>(at) : size - 1;
-+    }
-+
-+private:
-+    // What is replayed never opens anything: the D-pad, Start and Back open the game's menus and its replay, and
-+    // a press kept in a recording would open them again at every replay of it.
-+    static constexpr std::uint16_t menu_buttons = 0x003f;
-+    static PadOutput without_menus(PadOutput pad) noexcept {
-+        pad.buttons = static_cast<std::uint16_t>(pad.buttons & ~menu_buttons);
-+        return pad;
-+    }
-+    std::string taken(std::string_view owner) const {
-+        return mode_ != Mode::off && owner_ != owner ? owner_ + " runs a script" : std::string{};
-+    }
-+    void begin(std::string_view owner, unsigned controller, Mode mode, int lead) {
-+        owner_ = std::string(owner);
-+        controller_ = controller;
-+        mode_ = mode;
-+        lead_ = lead;
-+        step_ = 0;
-+        holding_ = false;
-+        line_ = false;
-+        use_last_ = false;
-+        run_to_ = 0;
-+        reads_ = 0;
-+        unread_ = 0;
-+        first_unread_.clear();
-+        stopped_.clear();
-+    }
-+    void end(const char* why) {
-+        mode_ = Mode::off;
-+        holding_ = false;
-+        run_to_ = 0;
-+        stopped_ = why;
-+    }
-+    // Over, so an old input is never played after it; what was recorded stays. A line waiting to go back, or with
-+    // the timeline open, has nothing to lose.
-+    void lose() {
-+        if (line_ && paused_) {
-+            latest_ = {}; // what the game reads meanwhile
-+            return;
-+        }
-+        if (line_ && holding_) return;
-+        end("the game lost the input");
-+    }
-+    void finish_run_up(std::size_t to) {
-+        run_to_ = 0;
-+        if (!hand_over_) {
-+            step_ = to;
-+            end("played");
-+            return;
-+        }
-+        if (to < frames_.size()) frames_.resize(to);
-+        step_ = to;
-+        latched_ = frames_.empty() ? PadOutput{} : frames_.back();
-+        use_last_ = true;
-+        mode_ = Mode::recording;
-+    }
-+
-+    std::mutex mutex_;
-+    std::vector<PadOutput> frames_;
-+    PadOutput latest_{}, latched_{};
-+    std::string owner_, stopped_;
-+    std::vector<std::size_t> first_unread_;
-+    std::size_t step_{}, limit_{}, reads_{}, unread_{}, run_to_{};
-+    unsigned controller_{};
-+    int lead_{};
-+    Mode mode_{Mode::off};
-+    bool holding_{}, line_{}, hand_over_{}, use_last_{}, paused_{};
-+};
-+inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
-+}
 diff --git a/Extension/Skater/motion_snapshot.cpp b/Extension/Skater/motion_snapshot.cpp
 new file mode 100644
 index 0000000..0d7da1c
@@ -2016,6 +1858,92 @@ index 0000000..4ff187f
 +void match_flight_step(const NoBailSkater& skater, float step) noexcept;
 +bool restore(const NoBailSkater& skater, const Snapshot& snapshot, bool skeleton) noexcept;
 +}
+diff --git a/Extension/Skater/skater_physics.cpp b/Extension/Skater/skater_physics.cpp
+index d358e81..2cd648a 100644
+--- a/Extension/Skater/skater_physics.cpp
++++ b/Extension/Skater/skater_physics.cpp
+@@ -110,6 +110,55 @@ bool read_motion(const NoBailSkater& skater, Vec3& board, Vec3& pelvis, Vec3& sp
+             skater_body::index(skater_body::Bone::hips), pelvis, &spin);
+ }
+ 
++// FNV-1a over the raw bytes of the bodies' motion: floats compared to the last bit, as a run repeated
++// exactly would have them. `physics` holds `count` bodies, or the hash is given up.
++void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
++    const auto* bytes = static_cast<const unsigned char*>(data);
++    for (std::size_t i = 0; i < size; ++i) {
++        hash ^= bytes[i];
++        hash *= 1099511628211ull;
++    }
++}
++bool hash_bodies(std::uint64_t& hash, std::uintptr_t physics, std::uintptr_t vtable, std::uint32_t count) noexcept {
++    std::uintptr_t type{}, bodies{};
++    std::uint32_t found{};
++    if (!memory::peek(physics, type) || type != vtable || !memory::peek(physics + state::physics_bodies_offset, bodies) ||
++        !memory::peek(bodies, found) || found != count)
++        return false;
++    for (std::uint32_t i = 0; i < count; ++i) {
++        const auto at = bodies + i * state::physics_body_size;
++        std::array<float, 16> transform{};
++        Vec3 velocity{}, spin{};
++        if (!memory::peek(at + body::body_transform_offset, transform) || !memory::peek(at + state::body_velocity_offset, velocity) ||
++            !memory::peek(at + state::body_spin_offset, spin))
++            return false;
++        hash_bytes(hash, transform.data(), sizeof(transform));
++        hash_bytes(hash, velocity.data(), sizeof(velocity));
++        hash_bytes(hash, spin.data(), sizeof(spin));
++    }
++    return true;
++}
++void read_exact_motion(const NoBailSkater& skater, Step& step) noexcept {
++    std::uintptr_t holder{}, board_physics{}, rig_physics{}, bodies{};
++    if (!memory::peek(skater.core + state::board_holder_offset, holder) || !memory::peek(holder + state::board_physics_offset, board_physics) ||
++        !memory::peek(skater.rig + state::rig_physics_offset, rig_physics))
++        return;
++    Vec3 velocity{}, spin{};
++    if (body_motion(board_physics, skater.base + state::board_physics_vtable, state::board_body_count, state::board_root_body, velocity, &spin) &&
++        memory::peek(board_physics + state::physics_bodies_offset, bodies)) {
++        Step::Pose pose;
++        pose.velocity = velocity;
++        if (memory::peek(bodies + state::board_root_body * state::physics_body_size + body::body_transform_offset, pose.transform)) {
++            step.board = pose;
++            step.board_spin = spin;
++        }
++    }
++    std::uint64_t hash = 14695981039346656037ull;
++    if (!hash_bodies(hash, board_physics, skater.base + state::board_physics_vtable, state::board_body_count)) return;
++    step.board_hash = hash;
++    if (hash_bodies(hash, rig_physics, skater.base + state::rig_physics_vtable, state::rig_body_count)) step.motion_hash = hash;
++}
++
+ // Where the local skater's physics step length is kept now (a float, seconds of game time), 0 while
+ // there is no local skater.
+ std::uintptr_t step_length_address() noexcept {
+@@ -187,6 +236,7 @@ Step read_step(const NoBailSkater& skater, float seconds, bool wipeout) noexcept
+         }
+     }
+     (void)read_contacts(skater, step.body);
++    read_exact_motion(skater, step);
+     return step;
+ }
+ 
+diff --git a/Extension/Skater/skater_physics.h b/Extension/Skater/skater_physics.h
+index 48d462b..c806ade 100644
+--- a/Extension/Skater/skater_physics.h
++++ b/Extension/Skater/skater_physics.h
+@@ -26,6 +26,13 @@ struct Step {
+     struct Pose { std::array<float, 16> transform{}; game::Vec3 velocity{}; };
+     std::array<std::optional<Pose>, skater_body::count> poses;
+     skater_body::Contacts body; // what each body touched in the step
++    // The board's root, which poses leaves out, and how it turns.
++    std::optional<Pose> board;
++    std::optional<game::Vec3> board_spin;
++    // A hash of every body's exact place, velocity and spin, board and skeleton: two steps with the
++    // same hash have the same motion to the last bit. Empty when the bodies could not all be read.
++    std::optional<std::uint64_t> motion_hash;
++    std::optional<std::uint64_t> board_hash; // the same of the board's bodies alone
+ };
+ 
+ // Requires the validated build and No Bail started: verifies the layout once.
 diff --git a/Extension/Skater/state_dump.cpp b/Extension/Skater/state_dump.cpp
 new file mode 100644
 index 0000000..f76bca2
@@ -2314,3 +2242,133 @@ index 0000000..edd549c
 +// Reads of the clock answered since the game started, whether on or off: 0 means the hook sees nothing.
 +std::uint64_t reads() noexcept;
 +}
+diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
+index b70545c..2a40fff 100644
+--- a/Extension/UI/Overlay/input_capture.cpp
++++ b/Extension/UI/Overlay/input_capture.cpp
+@@ -4,6 +4,8 @@
+ #include "held_input.h"
+ #include "scripted_pad.h"
+ #include "Engine/Game/Input/pad_output.h"
++#include "Engine/Game/Input/step_script.h"
++#include "Engine/Game/Multiplayer/session_tools.h"
+ #include "Extension/UI/NativeMenu/throwdown_menu.h"
+ #include "Extension/Throwdowns/throwdown_kit.h"
+ #include "Engine/Game/Input/playstation_report.h"
+@@ -188,7 +190,11 @@ bool output_allowed() noexcept {
+ void replace_pad(unsigned controller, dingosdk::overlay::GamepadValues& pad) noexcept {
+     if (overlay_input_access) return;
+     const auto saved_error = GetLastError();
+-    const auto output = input::pad_outputs().read(controller, GetTickCount64(), output_allowed());
++    const bool allowed = output_allowed();
++    const input::PadOutput real{pad.buttons, pad.left_trigger, pad.right_trigger, pad.left_x, pad.left_y, pad.right_x, pad.right_y};
++    // A script by physics step goes over a replacement by the clock.
++    auto output = input::step_script().on_read(controller, real, allowed && !multiplayer_session_active());
++    if (const auto leased = input::pad_outputs().read(controller, GetTickCount64(), allowed); !output) output = leased;
+     SetLastError(saved_error);
+     if (output) pad = {output->buttons, output->left_trigger, output->right_trigger,
+         output->left_x, output->left_y, output->right_x, output->right_y};
+@@ -211,7 +217,7 @@ void filter_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+ // A finished native PlayStation read of the game's: neutral while a menu holds the input, else
+ // through the gamepad filter.
+ void handle_hid(const InputCaptureHooks::HidRead& read, DWORD size) noexcept {
+-    if (block_polled_input()) { (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
++    if (block_polled_input()) { input::step_script().interrupt(); (void)input::pad_outputs().read(4, GetTickCount64(), false); neutral_hid(read, size); }
+     else {
+         filter_hid(read, size);
+         int stick{};
+@@ -394,7 +400,7 @@ void filter_pad(bool outer, DWORD user, XINPUT_STATE* output) noexcept {
+     g.sThumbRY = pad.right_y;
+     // Synthetic changes must be noticed even when the physical packet stays unchanged.
+     // Keep physical packet numbers when no replacement is active.
+-    if (input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
++    if (input::step_script().replacing(static_cast<unsigned>(user)) || input::pad_outputs().read(static_cast<unsigned>(user), GetTickCount64(), true))
+         output->dwPacketNumber = static_cast<DWORD>(GetTickCount64());
+ }
+ // Another program's hook on XInput that was put in front of the capture's own after it was
+@@ -419,6 +425,7 @@ DWORD WINAPI captured_front(DWORD user, XINPUT_STATE* output) {
+     // Only the game gets a scripted pad (the character room's walk): ReSkate's own reads get the real one.
+     if (outer && output && scripted_pad(user, *output)) return ERROR_SUCCESS;
+     if (result == ERROR_SUCCESS && output && capture) {
++        input::step_script().interrupt();
+         (void)input::pad_outputs().read(0, GetTickCount64(), false);
+         output->Gamepad = {};
+         output->dwPacketNumber ^= 0x80000000u;
+diff --git a/Extension/UI/Overlay/plugin_overlay.cpp b/Extension/UI/Overlay/plugin_overlay.cpp
+index b3565bf..d547980 100644
+--- a/Extension/UI/Overlay/plugin_overlay.cpp
++++ b/Extension/UI/Overlay/plugin_overlay.cpp
+@@ -29,8 +29,19 @@ ImU32 shadow_of(ImU32 colour) {
+     const auto alpha = static_cast<ImU32>(((colour >> IM_COL32_A_SHIFT) & 0xff) * 0.75f);
+     return IM_COL32(0, 0, 0, alpha);
+ }
++// The plain fonts are baked small: a bigger size takes one baked at least that big, so it is never stretched.
++ImFont* sharp_font(ImFont* font, float size, const plugin_ui::Shape& shape) {
++    if (shape.style.font != 0 && shape.style.font != 2) return font; // the brushed titles have their own large one
++    if (size <= font->FontSize * 1.05f) return font;
++    const auto& menu = detail::state().menu;
++    if (menu.heading && size <= menu.heading->FontSize * 1.05f) return menu.heading;
++    if (menu.heading_large && size <= menu.heading_large->FontSize * 1.05f) return menu.heading_large;
++    if (menu.hud_digits && size > 80 && shape.text.find_first_not_of("0123456789GO") == std::string::npos) return menu.hud_digits;
++    return menu.hud ? menu.hud : font;
++}
+ void text(ImDrawList* draw, ImFont* font, float k, ImVec2 where, const plugin_ui::Shape& shape) {
+     const float size = shape.style.size * k;
++    font = sharp_font(font, size, shape);
+     if (shape.style.wrap > 0) {
+         // Wrapped: from its top left, as d:measure counts it.
+         const float wrap = shape.style.wrap * k;
+diff --git a/Extension/UI/Overlay/skate_menu.cpp b/Extension/UI/Overlay/skate_menu.cpp
+index 99ea53e..27102c7 100644
+--- a/Extension/UI/Overlay/skate_menu.cpp
++++ b/Extension/UI/Overlay/skate_menu.cpp
+@@ -1048,6 +1048,10 @@ void load_skate_fonts(SkateMenu& menu) {
+     menu.bold_large = font(L"FONT_HEADING", "arialbd.ttf", 17 * large_font_ratio);
+     menu.heading_large = font(L"FONT_HEADING", "arialbd.ttf", 22 * large_font_ratio);
+     menu.title_large = font(L"FONT_BRUSH", "arialbi.ttf", 44 * large_font_ratio, latin);
++    static const ImWchar ascii[]{0x0020, 0x007E, 0};
++    static const ImWchar big[]{'0', '9', 'G', 'G', 'O', 'O', 0};
++    menu.hud = font(L"FONT_HEADING", "arialbd.ttf", 72, ascii);
++    menu.hud_digits = embedded_font(L"FONT_HEADING", 220.f, big);
+ }
+ 
+ namespace menu {
+diff --git a/Extension/UI/Overlay/skate_menu.h b/Extension/UI/Overlay/skate_menu.h
+index 34add7c..280bcb1 100644
+--- a/Extension/UI/Overlay/skate_menu.h
++++ b/Extension/UI/Overlay/skate_menu.h
+@@ -110,6 +110,8 @@ struct SkateMenu {
+     ImFont* title = nullptr;    // brushed page titles
+     ImFont* heading = nullptr;  // tile and section headers
+     ImFont* countdown = nullptr; // full-resolution fallback countdown digits
++    ImFont* hud = nullptr;        // plugins' larger text, 72 pixels (plugin_overlay.cpp)
++    ImFont* hud_digits = nullptr; // and their largest: digits and GO, 220 pixels
+     ImFont* mono = nullptr;
+     // The same faces drawn larger (large_font_ratio times), swapped in while the menu is full
+     // screen, where everything is scaled up: text stays sharp instead of stretched.
+diff --git a/cmake/CrashReport.cmake b/cmake/CrashReport.cmake
+index 284fb8e..958d8dd 100644
+--- a/cmake/CrashReport.cmake
++++ b/cmake/CrashReport.cmake
+@@ -1,5 +1,6 @@
+ # The sentry_key is the project's public DSN key: it grants report submission only. Never use an auth token.
+-set(crash_report_default_url "https://sentry.reskate.dev/api/2/minidump/?sentry_key=8efcb389bdc033445093a7af0c66f9be")
++# ReTake: a fork never reports to ReSkate's Sentry, whose team did not write this code. Empty disables uploads.
++set(crash_report_default_url "")
+ if(NOT "$ENV{RESKATE_CRASH_REPORT_URL}" STREQUAL "")
+     set(crash_report_default_url "$ENV{RESKATE_CRASH_REPORT_URL}")
+ endif()
+diff --git a/cmake/Runtime.cmake b/cmake/Runtime.cmake
+index e908ad3..ffc977a 100644
+--- a/cmake/Runtime.cmake
++++ b/cmake/Runtime.cmake
+@@ -157,6 +157,9 @@ add_library(dingosdk_runtime SHARED
+     Extension/Skater/layer_materials.cpp
+     Extension/Skater/board_pose.cpp
+     Extension/Skater/skater_physics.cpp
++    Extension/Skater/motion_snapshot.cpp
++    Extension/Skater/state_dump.cpp
++    Extension/Skater/virtual_time.cpp
+     Extension/Skater/xray.cpp
+     Extension/Skater/xray_render.cpp
+     Extension/Skater/xray_skeleton.cpp

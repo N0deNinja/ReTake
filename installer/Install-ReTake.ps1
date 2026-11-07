@@ -1,6 +1,7 @@
 # ReTake installer. Run it through "Install ReTake.bat" (or: powershell -ExecutionPolicy Bypass -File Install-ReTake.ps1).
 # It finds your skate. folder with ReSkate in it, backs up ReSkate.dll, puts ReTake's ReSkate.dll and Mods\ReTake in,
 # and turns off the launcher's automatic updates (they would put the official ReSkate.dll back).
+# Run again over an installed ReTake, it updates it: the same folder, no questions, your backup kept.
 param(
     [string]$GameDir = "",
     [switch]$Yes,
@@ -9,7 +10,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Version = "0.0.1"
+$Version = "0.0.2"
+# ReSkate.dll of every ReTake release (SHA-256): never backed up as "yours" over the one you had.
+$ReTakeDlls = @(
+    "9EE223813453BF9EC4730D0603CF436EB8F06ADDC6553F794FAF1A7CCE32F9AB"  # 0.0.1
+)
 $ReSkateVersion = "2.1.4-2"
 
 function Say($text, $colour = "Gray") { Write-Host $text -ForegroundColor $colour }
@@ -39,6 +44,17 @@ function Find-Payload {
         if ((Test-Path (Join-Path $c "ReSkate.dll")) -and (Test-Path (Join-Path $c "Mods\ReTake\manifest.json"))) { return $c }
     }
     Fail "Can't find ReTake's files (files\ReSkate.dll and files\Mods\ReTake). Unzip the whole release first, then run Install ReTake.bat from inside it."
+}
+
+# The ReTake version installed in a game folder, or $null.
+function Installed-Version($dir) {
+    $manifest = Join-Path $dir "Mods\ReTake\manifest.json"
+    if (-not (Test-Path $manifest)) { return $null }
+    try {
+        $v = (Get-Content $manifest -Raw | ConvertFrom-Json).version_number
+        if ($v) { return [string]$v }
+    } catch { }
+    return "an older version"
 }
 
 function Is-GameDir($dir) {
@@ -111,7 +127,10 @@ $payload = Find-Payload
 # 1. Where the game is.
 if (-not $GameDir) {
     $dirs = @(Find-GameDirs)  # @(): one result must stay a list, or [0] is its first letter
-    if ($dirs.Count -eq 1) {
+    $withReTake = @($dirs | Where-Object { Installed-Version $_ })
+    if ($withReTake.Count -eq 1) {
+        $GameDir = $withReTake[0]  # an update: where ReTake already is
+    } elseif ($dirs.Count -eq 1) {
         $GameDir = $dirs[0]
         Say "Found skate. with ReSkate in: $GameDir"
         if (-not (Ask "Install ReTake there?")) { $GameDir = Pick-Folder }
@@ -129,6 +148,13 @@ $GameDir = $GameDir.Trim('" ')
 if (-not (Test-Path (Join-Path $GameDir "Skate.exe"))) { Fail "There's no Skate.exe in $GameDir. Pick the folder skate. is installed in." }
 if (-not (Test-Path (Join-Path $GameDir "ReSkateLauncher.exe"))) {
     Fail "skate. is in $GameDir, but ReSkate isn't. Install ReSkate first (https://github.com/Dingo-Shenanigans/ReSkate/releases), start the game with it once, then run this again."
+}
+
+$installed = Installed-Version $GameDir
+if ($installed -eq $Version) {
+    Say "ReTake $Version is already installed in $GameDir. Installing it again." "Green"
+} elseif ($installed) {
+    Say "ReTake $installed is installed in $GameDir. Updating it to $Version." "Green"
 }
 
 # Program Files needs admin rights: ask Windows for them and start over.
@@ -169,26 +195,38 @@ $backup = Join-Path $GameDir "ReTake-backup"
 New-Item -ItemType Directory -Force $backup | Out-Null
 $state = @{ installed = (Get-Date).ToString("s"); version = $Version }
 $stateFile = Join-Path $backup "install.json"
+$before = $null
 if (Test-Path $stateFile) {
     # Installing again: keep what the first install found, so Uninstall can put it back.
     try {
         $before = Get-Content $stateFile -Raw | ConvertFrom-Json
         if ($before.previous_updates) { $state["previous_updates"] = $before.previous_updates }
+        if ($before.installed) { $state["installed"] = $before.installed; $state["updated"] = (Get-Date).ToString("s") }
     } catch { }
 }
 
 # 4. ReSkate.dll: keep the one you have, then put ReTake's in.
 $dll = Join-Path $GameDir "ReSkate.dll"
 $ours = Join-Path $payload "ReSkate.dll"
+$oursHash = (Get-FileHash $ours).Hash
+$kept = Join-Path $backup "ReSkate.dll"
 if (Test-Path $dll) {
-    $same = (Get-FileHash $dll).Hash -eq (Get-FileHash $ours).Hash
-    $kept = Join-Path $backup "ReSkate.dll"
-    if (-not $same -and -not (Test-Path $kept)) {
-        Copy-Item $dll $kept
-        Say "Backed up your ReSkate.dll to ReTake-backup\ReSkate.dll"
+    $current = (Get-FileHash $dll).Hash
+    # Ours: this release's, an earlier ReTake's, or the one the last install put in.
+    $isReTake = ($current -eq $oursHash) -or ($ReTakeDlls -contains $current) -or ($before -and $before.dll_hash -eq $current)
+    if (-not $isReTake) {
+        if (-not (Test-Path $kept)) {
+            Copy-Item $dll $kept
+            Say "Backed up your ReSkate.dll to ReTake-backup\ReSkate.dll"
+        } elseif ($before -and $before.dll_hash -and (Get-FileHash $kept).Hash -ne $current) {
+            # The launcher put a newer official one in since ReTake was installed: that is now the one to go back to.
+            Copy-Item $dll $kept -Force
+            Say "Backed up your current ReSkate.dll to ReTake-backup\ReSkate.dll"
+        }
     }
 }
 Copy-Item $ours $dll -Force
+$state["dll_hash"] = $oursHash
 Say "Installed ReTake's ReSkate.dll" "Green"
 
 # 5. The mod itself. An old test version (tas_probe) uses the same keys, so it goes into the backup folder.
@@ -235,10 +273,15 @@ if (Test-Path $settings) {
 $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8
 
 Say ""
-Say "ReTake $Version is installed." "Yellow"
-Say "  1. Start skate. with the ReSkate launcher as usual, and go offline (single player)."
-Say "  2. ReSkate asks you to allow ReTake's permissions the first time: allow them."
-Say "  3. Press F11 and pick New line. Then skate, mess up, go back, and retake."
+if ($installed -and $installed -ne $Version) {
+    Say "ReTake is updated from $installed to $Version." "Yellow"
+    Say "  Start skate. with the ReSkate launcher as usual. ReSkate asks you to allow ReTake again, because its files changed: allow it."
+} else {
+    Say "ReTake $Version is installed." "Yellow"
+    Say "  1. Start skate. with the ReSkate launcher as usual, and go offline (single player)."
+    Say "  2. ReSkate asks you to allow ReTake's permissions the first time: allow them."
+    Say "  3. Press F11 and pick New line. Then skate, mess up, go back, and retake."
+}
 Say ""
 Say "Uninstall ReTake.bat puts everything back." "DarkGray"
 Say ""

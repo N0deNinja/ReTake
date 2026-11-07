@@ -1546,6 +1546,45 @@ public:
         const auto& t = m.frames[step].board[0].transform;
         return std::array<float, 3>{t[12], t[13], t[14]};
     }
+    // A bug report: its text, then every step of the line. The controller is as recorded, in XInput's raw units
+    // (buttons as bits, triggers 0 to 255, sticks -32768 to 32767), and the board is where the line had it.
+    static constexpr std::size_t line_save_most_bytes = 8u << 20;
+    std::string tas_line_save(std::string_view plugin, std::string_view path, std::string_view text) override {
+        const auto inputs = input::step_script().recorded();
+        std::vector<std::array<float, 3>> boards;
+        std::vector<char> valid;
+        {
+            auto& m = tas_motion();
+            std::lock_guard lock(m.frames_mutex);
+            const auto length = std::min(m.frames.size(), m.line_length.load(std::memory_order_acquire) + 1);
+            boards.reserve(length);
+            valid.reserve(length);
+            for (std::size_t i = 0; i < length; ++i) {
+                const auto& t = m.frames[i].board[0].transform;
+                boards.push_back({t[12], t[13], t[14]});
+                valid.push_back(m.frames[i].valid ? 1 : 0);
+            }
+        }
+        const auto rows = std::max(inputs.size(), boards.size());
+        std::string out;
+        out.reserve(text.size() + 200 + rows * 72);
+        out.append(text);
+        out += std::format("\n== The line, every step: the controller as recorded and where the board was ({} inputs, {} board steps) ==\n",
+                           inputs.size(), boards.size());
+        out += "step\tbuttons\tlt\trt\tlx\tly\trx\try\tboard_x\tboard_y\tboard_z\n";
+        for (std::size_t i = 0; i < rows; ++i) {
+            if (i < inputs.size()) {
+                const auto& p = inputs[i];
+                out += std::format("{}\t{:04x}\t{}\t{}\t{}\t{}\t{}\t{}", i, p.buttons, p.left_trigger, p.right_trigger, p.left_x, p.left_y, p.right_x, p.right_y);
+            } else {
+                out += std::format("{}\t\t\t\t\t\t\t", i);
+            }
+            if (i < boards.size() && valid[i]) out += std::format("\t{:.3f}\t{:.3f}\t{:.3f}\n", boards[i][0], boards[i][1], boards[i][2]);
+            else out += "\t\t\t\n";
+        }
+        out += "== end of the line ==\n";
+        return files_write_bytes(plugin, path, out, line_save_most_bytes);
+    }
     std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
         auto& m = tas_motion();
         std::lock_guard lock(m.frames_mutex);

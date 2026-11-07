@@ -1134,6 +1134,9 @@ public:
     virtual TasLine tas_line() { return {"off", 0, 0, 0}; }
     virtual std::optional<TasBodies> tas_line_bodies(std::size_t /*step*/) { return std::nullopt; }
     virtual std::optional<std::array<float, 3>> tas_line_position(std::size_t /*step*/) { return std::nullopt; }
+    // `text`, then the line's every step (the controller as recorded, where the board was), to `path` in the
+    // plugin's data folder: a bug report, larger than a plugin's own files may be.
+    virtual std::string tas_line_save(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*text*/) { return unavailable; }
     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
     // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
     virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }

@@ -1,4 +1,4 @@
-ReTake 0.0.1: rewind and retake your lines in skate. (a ReSkate mod, offline only)
+ReTake 0.0.2: rewind and retake your lines in skate. (a ReSkate mod, offline only)
 https://github.com/N0deNinja/ReTake
 
 INSTALL
@@ -14,11 +14,21 @@ INSTALL
   The installer only touches the skate. folder: ReSkate.dll, Mods\ReTake, ReTake-backup,
   and the "updates" line in ReSkateLauncher.settings.json.
 
+UPDATE
+  Close the game and double-click "Install ReTake.bat" from the new version. It finds the
+  folder ReTake is in and updates it, keeping your original ReSkate.dll backup.
+
 UNINSTALL
   Close the game and double-click "Uninstall ReTake.bat". It puts your old ReSkate.dll back,
   removes Mods\ReTake, and turns launcher updates back on.
 
-THIS IS 0.0.1
+FOUND A BUG?
+  Right after it happens, press F11 and click "Report a problem" (top right), write what went
+  wrong, and press Save report. ReTake saves a file in
+  Mods\.reskate_plugin_data\ReTake\reports with what you wrote and the last 30 seconds of the
+  game. Send us that file. ReTake never sends anything by itself.
+
+THIS IS AN EARLY VERSION
   Sometimes a replay drifts from what you skated, mostly on rails and ledges. We're working on it.
   If it happens, go back a little earlier and try again.
 
