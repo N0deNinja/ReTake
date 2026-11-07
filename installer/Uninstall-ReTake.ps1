@@ -62,7 +62,7 @@ Say "  ReTake uninstaller" "Yellow"
 Say ""
 
 if (-not $GameDir) {
-    $dirs = Find-GameDirs
+    $dirs = @(Find-GameDirs)  # @(): one result must stay a list, or [0] is its first letter
     if ($dirs.Count -eq 1) {
         $GameDir = $dirs[0]
     } elseif ($dirs.Count -gt 1) {

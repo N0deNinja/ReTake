@@ -110,7 +110,7 @@ $payload = Find-Payload
 
 # 1. Where the game is.
 if (-not $GameDir) {
-    $dirs = Find-GameDirs
+    $dirs = @(Find-GameDirs)  # @(): one result must stay a list, or [0] is its first letter
     if ($dirs.Count -eq 1) {
         $GameDir = $dirs[0]
         Say "Found skate. with ReSkate in: $GameDir"
