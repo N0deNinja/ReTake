@@ -3,7 +3,12 @@ name: Discord release
 on:
   release:
     types: [published]
-  workflow_dispatch: # refresh the download card without posting
+  workflow_dispatch: # refresh the download card; with "post", also post the latest release again
+    inputs:
+      post:
+        description: Also post the latest release in the updates channel
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,5 +29,5 @@ jobs:
           DOWNLOAD_WEBHOOK: ${{ secrets.DISCORD_DOWNLOAD_WEBHOOK }}
           DOWNLOAD_MESSAGE_ID: ${{ vars.DISCORD_DOWNLOAD_MESSAGE_ID }}
           UPDATES_WEBHOOK: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
-          POST_UPDATE: ${{ github.event_name == 'release' }}
+          POST_UPDATE: ${{ github.event_name == 'release' || inputs.post == true }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
