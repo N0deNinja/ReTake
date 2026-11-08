@@ -3199,7 +3199,26 @@ struct WorldApi {
         need(L, plugin, "tas", "reskate.tas.line_export");
         need(L, plugin, "files", "reskate.tas.line_export");
         const auto path = data_path(L, 1, false);
-        return result(L, game(plugin).tas_line_export(plugin.id(), path));
+        std::size_t length = 0;
+        const char* note = luaL_optlstring(L, 2, "", &length);
+        return result(L, game(plugin).tas_line_export(plugin.id(), path, std::string_view(note, length)));
+    }
+    // tas.line_note(path): a line file's note, the text saved with it (tas.line_export's second argument), without
+    // loading the line: "" for a file saved before notes; nil and why for one that is not a line this build loads.
+    static int tas_line_note(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.line_note");
+        need(L, plugin, "files", "reskate.tas.line_note");
+        const auto path = data_path(L, 1, false);
+        std::string why;
+        const auto note = game(plugin).tas_line_note(plugin.id(), path, why);
+        if (!note) {
+            lua_pushnil(L);
+            lua_pushlstring(L, why.data(), why.size());
+            return 2;
+        }
+        lua_pushlstring(L, note->data(), note->size());
+        return 1;
     }
     static int tas_line_import(lua_State* L) {
         auto& plugin = plugin_of(L);
@@ -3207,6 +3226,146 @@ struct WorldApi {
         need(L, plugin, "files", "reskate.tas.line_import");
         const auto path = data_path(L, 1, false);
         return result(L, game(plugin).tas_line_import(plugin.id(), path, tas_controller(L, 2)));
+    }
+    // tas.ghost_probe(show, x, y, z): research for a ghost that is the skater itself: a real skater model in the
+    // player's outfit, posed as the skater is now, moved by (x, y, z) metres. Called each tick while shown; false
+    // hides it. true, or false and why not.
+    static int tas_ghost_probe(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_probe");
+        const bool show = lua_toboolean(L, 1) != 0;
+        const std::array<float, 3> offset{static_cast<float>(luaL_optnumber(L, 2, 0)), static_cast<float>(luaL_optnumber(L, 3, 0)),
+                                          static_cast<float>(luaL_optnumber(L, 4, 0))};
+        for (const float value : offset)
+            if (!std::isfinite(value) || std::fabs(value) > 100.0f) luaL_argerror(L, 2, "an offset of at most 100 m");
+        return result(L, game(plugin).tas_ghost_probe(show, offset));
+    }
+    // ---- ghost lines ----------------------------------------------------------------------------------------------
+    // tas.ghost_record(on): recording a ghost of the local skater on (what was recorded is cleared) or off (kept, to
+    // save). tas.ghost_capture(step): the skater as it is now, as that step of the ghost; each tick while recording.
+    static int tas_ghost_record(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_record");
+        return result(L, game(plugin).tas_ghost_record(lua_toboolean(L, 1) != 0));
+    }
+    static int tas_ghost_capture(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_capture");
+        const double step = luaL_checknumber(L, 1);
+        if (!(step >= 0 && step < 4294967295.0)) luaL_argerror(L, 1, "a step is a whole number from 0");
+        return result(L, game(plugin).tas_ghost_capture(static_cast<std::uint32_t>(step)));
+    }
+    // tas.ghost_status(): {recording, recorded, recorded_first, recorded_last, recorded_outfit, loaded, loaded_first,
+    // loaded_last, loaded_outfit, shown, file}.
+    static int tas_ghost_status(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_status");
+        const auto s = game(plugin).tas_ghost_status();
+        lua_createtable(L, 0, 11);
+        lua_pushboolean(L, s.recording);
+        lua_setfield(L, -2, "recording");
+        lua_pushnumber(L, static_cast<double>(s.recorded));
+        lua_setfield(L, -2, "recorded");
+        lua_pushnumber(L, s.recorded_first);
+        lua_setfield(L, -2, "recorded_first");
+        lua_pushnumber(L, s.recorded_last);
+        lua_setfield(L, -2, "recorded_last");
+        lua_pushboolean(L, s.recorded_outfit);
+        lua_setfield(L, -2, "recorded_outfit");
+        lua_pushnumber(L, static_cast<double>(s.loaded));
+        lua_setfield(L, -2, "loaded");
+        lua_pushnumber(L, s.loaded_first);
+        lua_setfield(L, -2, "loaded_first");
+        lua_pushnumber(L, s.loaded_last);
+        lua_setfield(L, -2, "loaded_last");
+        lua_pushboolean(L, s.loaded_outfit);
+        lua_setfield(L, -2, "loaded_outfit");
+        lua_pushboolean(L, s.shown);
+        lua_setfield(L, -2, "shown");
+        lua_pushlstring(L, s.file.data(), s.file.size());
+        lua_setfield(L, -2, "file");
+        return 1;
+    }
+    // tas.ghost_export(path, note) and tas.ghost_load(path): in the background, tas.ghost_status().file says how it went.
+    static int tas_ghost_export(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_export");
+        need(L, plugin, "files", "reskate.tas.ghost_export");
+        const auto path = data_path(L, 1, false);
+        std::size_t length = 0;
+        const char* note = luaL_optlstring(L, 2, "", &length);
+        return result(L, game(plugin).tas_ghost_export(plugin.id(), path, std::string_view(note, length)));
+    }
+    static int tas_ghost_note(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_note");
+        need(L, plugin, "files", "reskate.tas.ghost_note");
+        const auto path = data_path(L, 1, false);
+        std::string why;
+        const auto note = game(plugin).tas_ghost_note(plugin.id(), path, why);
+        if (!note) {
+            lua_pushnil(L);
+            lua_pushlstring(L, why.data(), why.size());
+            return 2;
+        }
+        lua_pushlstring(L, note->data(), note->size());
+        return 1;
+    }
+    static int tas_ghost_load(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_load");
+        need(L, plugin, "files", "reskate.tas.ghost_load");
+        const auto path = data_path(L, 1, false);
+        return result(L, game(plugin).tas_ghost_load(plugin.id(), path));
+    }
+    // tas.ghost_frame(step) and tas.ghost_show(step): the loaded ghost at that step (fractional between two):
+    // {root, head, camera = {position, forward, up, fov}, ended, shown}, or nil and why. ghost_show also shows its
+    // skater, so: each tick while shown. tas.ghost_hide() takes it away.
+    static int ghost_frame_of(lua_State* L, bool show) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", show ? "reskate.tas.ghost_show" : "reskate.tas.ghost_frame");
+        const double step = luaL_checknumber(L, 1);
+        if (!std::isfinite(step)) luaL_argerror(L, 1, "a step is a number");
+        std::string why;
+        const auto frame = game(plugin).tas_ghost_frame(step, show, why);
+        if (!frame) {
+            lua_pushnil(L);
+            lua_pushlstring(L, why.data(), why.size());
+            return 2;
+        }
+        lua_createtable(L, 0, 5);
+        lua_pushvector(L, frame->root[0], frame->root[1], frame->root[2]);
+        lua_setfield(L, -2, "root");
+        lua_pushvector(L, frame->head[0], frame->head[1], frame->head[2]);
+        lua_setfield(L, -2, "head");
+        lua_createtable(L, 0, 4);
+        lua_pushvector(L, frame->camera_position[0], frame->camera_position[1], frame->camera_position[2]);
+        lua_setfield(L, -2, "position");
+        lua_pushvector(L, frame->camera_forward[0], frame->camera_forward[1], frame->camera_forward[2]);
+        lua_setfield(L, -2, "forward");
+        lua_pushvector(L, frame->camera_up[0], frame->camera_up[1], frame->camera_up[2]);
+        lua_setfield(L, -2, "up");
+        lua_pushnumber(L, frame->fov);
+        lua_setfield(L, -2, "fov");
+        lua_setfield(L, -2, "camera");
+        lua_pushboolean(L, frame->ended);
+        lua_setfield(L, -2, "ended");
+        lua_pushboolean(L, frame->shown);
+        lua_setfield(L, -2, "shown");
+        return 1;
+    }
+    static int tas_ghost_frame(lua_State* L) { return ghost_frame_of(L, false); }
+    static int tas_ghost_show(lua_State* L) { return ghost_frame_of(L, true); }
+    static int tas_ghost_hide(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.ghost_hide");
+        game(plugin).tas_ghost_hide();
+        return 0;
+    }
+    static int tas_sensor_start(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.sensor_start");
+        return result(L, game(plugin).tas_sensor_start());
     }
     static int tas_line_file_status(lua_State* L) {
         auto& plugin = plugin_of(L);
@@ -3234,6 +3393,12 @@ struct WorldApi {
         lua_setfield(L, -2, "replay_off");
         lua_pushnumber(L, static_cast<double>(s.replay_off_at));
         lua_setfield(L, -2, "replay_off_at");
+        if (s.sensor >= 0) {
+            lua_pushboolean(L, s.sensor == 1);
+            lua_setfield(L, -2, "sensor_started");
+        }
+        lua_pushnumber(L, static_cast<double>(s.sensor_writes));
+        lua_setfield(L, -2, "sensor_writes");
         lua_pushnumber(L, static_cast<double>(s.since_spawn));
         lua_setfield(L, -2, "since_spawn");
         lua_pushnumber(L, static_cast<double>(s.unread));
@@ -3606,7 +3771,11 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
         {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
         {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
         {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
-        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status}});
+        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status},
+        {"line_note", tas_line_note}, {"ghost_probe", tas_ghost_probe}, {"sensor_start", tas_sensor_start},
+        {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
+        {"ghost_export", tas_ghost_export}, {"ghost_note", tas_ghost_note}, {"ghost_load", tas_ghost_load},
+        {"ghost_frame", tas_ghost_frame}, {"ghost_show", tas_ghost_show}, {"ghost_hide", tas_ghost_hide}});
     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
     add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                   {"ready", entities_ready}, {"blueprints", entities_blueprints},

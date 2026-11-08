@@ -11,6 +11,7 @@
 #include <format>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -164,14 +165,20 @@ std::string graph(const NoBailSkater& skater, std::size_t most) {
 std::string save(const std::filesystem::path& file) {
     auto& d = dump();
     d.armed.store(false, std::memory_order_release);
-    std::lock_guard lock(d.mutex);
-    if (d.bytes.size() <= 4) return "nothing was taken";
-    std::error_code error;
-    std::filesystem::create_directories(file.parent_path(), error);
-    if (error) return "the folder could not be made: " + error.message();
-    std::ofstream stream(file, std::ios::binary | std::ios::trunc);
-    stream.write(reinterpret_cast<const char*>(d.bytes.data()), static_cast<std::streamsize>(d.bytes.size()));
-    d.bytes.clear();
-    return stream.good() ? std::string{} : std::string("the file could not be written");
+    // What was taken, out of the way at once (the next arm may come straight after); written on a thread of its own:
+    // up to 64 MB is far past a plugin call's 50 ms.
+    std::vector<unsigned char> bytes;
+    {
+        std::lock_guard lock(d.mutex);
+        if (d.bytes.size() <= 4) return "nothing was taken";
+        bytes.swap(d.bytes);
+    }
+    std::thread([bytes = std::move(bytes), file] {
+        std::error_code error;
+        std::filesystem::create_directories(file.parent_path(), error);
+        std::ofstream stream(file, std::ios::binary | std::ios::trunc);
+        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }).detach();
+    return {};
 }
 }

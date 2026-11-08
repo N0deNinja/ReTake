@@ -5,6 +5,7 @@
 local U = require("util")
 local C = require("clock")
 local R = require("report")
+local S = require("ui")
 local L = require("line")
 local P = {}
 
@@ -384,14 +385,14 @@ end
 local width, height = 1920, 1080
 local function layout()
     local k = height / 1080
-    local w, h = math.min(920 * k, width - 32 * k), (form and form.saved and 390 or 600) * k
+    local w, h = math.min(920 * k, width - 32 * k), (form and form.saved and 420 or 640) * k
     local box = {x0 = (width - w) / 2, y0 = (height - h) / 2}
     box.x1, box.y1 = box.x0 + w, box.y0 + h
     local pad = 34 * k
-    local field = {x0 = box.x0 + pad, x1 = box.x1 - pad, y0 = box.y0 + 150 * k, y1 = box.y0 + 470 * k}
+    local field = {x0 = box.x0 + pad, x1 = box.x1 - pad, y0 = box.y0 + 176 * k, y1 = box.y0 + 496 * k}
     local by0, by1 = box.y1 - 78 * k, box.y1 - 30 * k
     local buttons = {
-        save = {x0 = box.x1 - pad - 210 * k, x1 = box.x1 - pad, y0 = by0, y1 = by1},
+        save = {x0 = box.x1 - pad - 236 * k, x1 = box.x1 - pad, y0 = by0, y1 = by1},
     }
     buttons.cancel = {x0 = buttons.save.x0 - 12 * k - 150 * k, x1 = buttons.save.x0 - 12 * k, y0 = by0, y1 = by1}
     buttons.folder = {x0 = box.x0 + pad, x1 = box.x0 + pad + 200 * k, y0 = by0, y1 = by1}
@@ -456,15 +457,7 @@ function P.tick(now)
 end
 
 -- ---- drawing ----------------------------------------------------------------------------------------
-local ACCENT, INK, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
-
-local function v(x, y)
-    return vector.create(x, y, 0)
-end
-
-local function txt(size, colour, font)
-    return {colour = colour, size = size, font = font or "heading"}
-end
+local v = S.v
 
 -- Words to lines that fit `w`; a word too long for a line is broken up.
 local function wrap(d, text, style, w)
@@ -496,75 +489,65 @@ local function wrap(d, text, style, w)
     return lines
 end
 
-local function button(d, r, label, kind, mouse, k)
-    local hover = mouse and inside(mouse.position, r)
-    local fill, ink = {colour = hover and "#ffffff26" or "#ffffff14", fill = true, rounding = 10}, TEXT
-    if kind == "primary" then fill, ink = {colour = hover and "#5ffbe8" or ACCENT, fill = true, rounding = 10}, INK end
-    d:rect(v(r.x0, r.y0), v(r.x1, r.y1), fill)
-    local style = txt(18, ink)
-    local size = d:measure(label, style)
-    d:text(v((r.x0 + r.x1) / 2 - size.x / 2, (r.y0 + r.y1) / 2 - size.y / 2), label, style)
-end
-
 function P.draw(d)
     if not form then return end
     local size = d:size()
     width, height = size.x, size.y
     local k, box, field, buttons, pad = layout()
     local mouse = reskate.input.cursor()
-    d:rect(v(0, 0), v(width, height), {colour = "#000000a0", fill = true})
-    d:rect(v(box.x0, box.y0), v(box.x1, box.y1), {colour = "#0c0d11f4", fill = true, rounding = 16})
-    d:rect(v(box.x0, box.y0), v(box.x1, box.y1), {colour = "#ffffff1c", thickness = 1, rounding = 16})
+    S.scrim(d, width, height)
+    S.panel(d, box, k, 41)
     local x = box.x0 + pad
-    d:text(v(x, box.y0 + 30 * k), form.saved and "Report saved" or "Report a problem", txt(30, TEXT))
+    local th = S.title(d, x, box.y0 + 22 * k, form.saved and "Report saved" or "Report a problem", k)
 
     if form.saved then
-        local body = txt(17, MUTED, "body")
-        local y = box.y0 + 90 * k
+        local body = S.font(16, S.SOFT, "body", true)
+        local y = box.y0 + 34 * k + th
         local when = frozen and frozen.why == "you opened the timeline" and "before you opened the timeline" or "before this window opened"
         for _, line in wrap(d, "Send us this file. It has what you wrote, and what the game and ReTake were doing just " .. when .. ".", body, box.x1 - pad - x) do
             d:text(v(x, y), line, body)
-            y += 26 * k
+            y += 25 * k
         end
-        y += 18 * k
+        y += 16 * k
         local path = "Mods\\.reskate_plugin_data\\ReTake\\" .. string.gsub(form.saved, "/", "\\")
-        local path_style = txt(17, ACCENT, "bold")
-        d:rect(v(x, y), v(box.x1 - pad, y + 48 * k), {colour = "#02f7da1a", fill = true, rounding = 8})
+        local path_style = S.font(15, S.INK, "bold")
+        S.tile(d, {x0 = x, x1 = box.x1 - pad, y0 = y, y1 = y + 48 * k}, S.PAPER, 43, k)
         for _, line in wrap(d, path, path_style, box.x1 - pad - x - 32 * k) do
             d:text(v(x + 16 * k, y + 24 * k - d:measure(line, path_style).y / 2), line, path_style)
             break
         end
-        y += 74 * k
-        d:text(v(x, y), "Nothing is sent anywhere by ReTake. You choose who gets the file.", txt(15, MUTED, "body"))
-        if form.error then d:text(v(x, y + 30 * k), form.error, txt(15, RED, "body")) end
-        button(d, buttons.folder, "Open folder", "normal", mouse, k)
-        button(d, buttons.save, form.from_timeline and "Back to timeline" or "Done", "primary", mouse, k)
+        y += 72 * k
+        d:text(v(x, y), "Nothing is sent anywhere by ReTake. You choose who gets the file.", S.font(14, S.MUTED, "body", true))
+        if form.error then S.note(d, x, y + 30 * k, form.error, k, true) end
+        S.button(d, buttons.folder, "Open folder", {kind = "quiet", mouse = mouse, k = k})
+        S.button(d, buttons.save, form.from_timeline and "Back to timeline" or "Done", {kind = "primary", mouse = mouse, k = k})
         return
     end
 
-    local intro = txt(16, MUTED, "body")
-    local y = box.y0 + 78 * k
+    local intro = S.font(15, S.SOFT, "body", true)
+    local y = box.y0 + 30 * k + th
     for _, line in wrap(d, "What went wrong, and what were you doing just before? ReTake saves it with the last 30 seconds of the game, so we can see what happened.", intro, box.x1 - pad - x) do
         d:text(v(x, y), line, intro)
-        y += 24 * k
+        y += 23 * k
     end
 
-    -- The field, its border teal: it always has the keyboard.
-    d:rect(v(field.x0, field.y0), v(field.x1, field.y1), {colour = "#ffffff0d", fill = true, rounding = 10})
-    d:rect(v(field.x0, field.y0), v(field.x1, field.y1), {colour = ACCENT, thickness = 1.5, rounding = 10})
-    local style = txt(19, TEXT, "body")
+    -- The field: the game's white text box, ringed in teal: it always has the keyboard.
+    S.tile(d, {x0 = field.x0 - 4 * k, x1 = field.x1 + 4 * k, y0 = field.y0 - 4 * k, y1 = field.y1 + 4 * k}, S.ACCENT, 44, k)
+    S.tile(d, field, S.PAPER, 45, k)
+    local style = S.font(18, S.INK, "body")
     local inner = 18 * k
     local line_h = 28 * k
     local room = math.floor((field.y1 - field.y0 - 2 * inner) / line_h)
     local caret_on = math.floor((U.now() - form.opened) / 500) % 2 == 0
+    local caret = {colour = S.INK, fill = true}
     if form.text == "" then
-        local hint = txt(19, "#ffffff55", "body")
+        local hint = S.font(18, "#6e6e6e", "body")
         local hy = field.y0 + inner
         for _, line in wrap(d, "For example: I went back to 0:12, just before the rail, and in the replay the skater fell off the rail before the countdown.", hint, field.x1 - field.x0 - 2 * inner) do
             d:text(v(field.x0 + inner, hy), line, hint)
             hy += line_h
         end
-        if caret_on then d:rect(v(field.x0 + inner, field.y0 + inner), v(field.x0 + inner + 2 * k, field.y0 + inner + 24 * k), {colour = ACCENT, fill = true}) end
+        if caret_on then d:rect(v(field.x0 + inner, field.y0 + inner), v(field.x0 + inner + 2.5 * k, field.y0 + inner + 24 * k), caret) end
     else
         if form.wrapped_for ~= form.text or form.wrapped_w ~= field.x1 - field.x0 then
             form.wrapped = wrap(d, form.text, style, field.x1 - field.x0 - 2 * inner - 6 * k)
@@ -581,17 +564,19 @@ function P.draw(d)
             local last = lines[#lines] or ""
             local cx = field.x0 + inner + (last ~= "" and d:measure(last, style).x + 2 * k or 0)
             local cy = field.y0 + inner + (#lines - first) * line_h
-            d:rect(v(cx, cy), v(cx + 2 * k, cy + 24 * k), {colour = ACCENT, fill = true})
+            d:rect(v(cx, cy), v(cx + 2.5 * k, cy + 24 * k), caret)
         end
     end
     local count = string.format("%d / %d", utf8.len(form.text) or #form.text, MOST_CHARS)
-    local count_style = txt(14, MUTED, "body")
+    local count_style = S.font(13, S.MUTED, "bold", true)
     local cs = d:measure(count, count_style)
-    d:text(v(field.x1 - cs.x, field.y1 + 10 * k), count, count_style)
-    d:text(v(field.x0, field.y1 + 10 * k), "Enter: new line      Ctrl+Enter: save      Esc: cancel", count_style)
-    if form.error then d:text(v(field.x0, field.y1 + 36 * k), form.error, txt(15, RED, "body")) end
-    button(d, buttons.cancel, "Cancel", "normal", mouse, k)
-    button(d, buttons.save, "Save report", "primary", mouse, k)
+    d:text(v(field.x1 - cs.x, field.y1 + 14 * k), count, count_style)
+    local kx, ky = field.x0, field.y1 + 12 * k
+    kx += S.keycap(d, kx, ky, "Enter", "New line", k) + 22 * k
+    S.keycap(d, kx, ky, "Ctrl+Enter", "Save", k)
+    if form.error then S.note(d, field.x0, field.y1 + 44 * k, form.error, k, true) end
+    S.button(d, buttons.cancel, "Cancel", {mouse = mouse, k = k, key = "Esc"})
+    S.button(d, buttons.save, "Save report", {kind = "primary", mouse = mouse, k = k})
 end
 
 reskate.ui.screen(SCREEN, function() end, {panel = false})

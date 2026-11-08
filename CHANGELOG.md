@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.0.5 (2026-11-08)
+
+Ghost lines: share a line with friends, who watch it through your eyes and then try it with your skater beside them. Also: every try kept as a take, sharing your lines, slow motion on any button, and a new look in the game's own style.
+
+### Ghost lines: watch someone's line, then try it with them
+
+- **F10 opens Ghost lines**: other skaters' lines to watch and try. A line can't be retaken or changed here: it's theirs to match.
+- **Making one:** skate a line (retakes and all), then **F10, Make a ghost of my line** (or `retake ghost make [name]`). The line plays once, hands off, while ReTake keeps your skater's pose at every step, your outfit and your camera. It's saved as a `.ghost` file in `Mods\.reskate_plugin_data\ReTake\ghosts` (**Open folder**): send that file to share it. `retake name <name>` sets the name shown over your skater.
+- **Finding them:** a pin floats over the start of each ghost line on the map you're on, with its name and distance. Near one, ReTake tells you it's there. The window lists them nearest first, with a map of the ones around you. One on another map travels there first.
+- **Watch:** you see the line as its skater saw it, through their camera, with their skater in their outfit and their name above them.
+- **Try it:** you start where they started, at their speed, after 3, 2, 1. Their skater rides beside you as a ghost with their name over them. It keeps to the game's own steps, so pausing or slow motion holds it too. When it ends, F10 tries again.
+- The ghost is a real skater model, shown the way ReSkate's multiplayer shows another player. It doesn't collide with you. Offline only.
+- Watching or trying a ghost line keeps your own line: a line being recorded ends where it was, and nothing is forgotten.
+
+### A new look, in the game's own style
+
+- **ReTake now looks like the rest of skate.'s menus**: the timeline, My lines, Ghost lines and Report a problem use the game's hand-cut tiles, its fonts and its big capitals, with ReTake's teal where the game uses blue. What is chosen turns white, keys show as keycaps (Enter, Esc, F10), settings show their name on the left and their value in teal on the right, as in the game's own settings, and the paused state sits on a sticky note.
+- The 3, 2, 1 countdown is in the game's marker font, like its trick callouts.
+- The tags over ghost lines and over a ghost's skater are paper tiles with a point down to where it is, and the distance beside them.
+- The report box is white with dark text, like the game's own text boxes.
+- Nothing about how anything works has changed: every button is where it was.
+
+### Slow motion on any button, or none
+
+- **Pick your own slow-motion button.** In the timeline, click **Slow-mo key**, then press the button or buttons you want together and let go: any controller buttons (triggers and the D-pad too) or a key. L3 + R3 is still the default, for anyone who doesn't use them for the camera.
+- **Turn it off:** click **Slow-mo key** twice. Slow motion then has no button (`retake slowmo` still turns it on).
+- Pressing nothing for 10 seconds, or Esc, keeps the button you had. F10, F11 and Ctrl+R are ReTake's own and can't be used.
+- Console: `retake slowmo key` says which it is; `retake slowmo key Pad.LB+Pad.RB`, `Ctrl+K`, `off` or `default` sets it.
+- Your choice is kept between games (`slowmo_key.txt`). A button set for ReTake's slow motion in ReSkate's own Binds page still wins over it.
+
+### Takes: every try is kept
+
+- **A retake no longer throws away what it cuts.** Just before a retake records over a line, the line as it was is kept as a take. The timeline header then shows **< Take 2 of 3 >**: click the arrows to switch to an earlier try and carry on from it. The one you are skating is kept first, so switching never loses anything.
+- **Combining the best parts:** a take branches where it was retaken. Go to the try whose ending you like, pick a moment, and retake from there.
+- A line keeps up to 60 takes (the oldest go first). A line's takes are deleted when you start a new line, unless the line is saved in My lines, in which case they stay with it.
+
+### Share a line
+
+- **My lines → Share** shows the line's file in its folder (`Mods\.reskate_plugin_data\ReTake\lines`). Send that `.retake` file to anyone with ReTake.
+- **Receiving one:** drop the `.retake` file into that folder (**Open folder** in My lines). It shows up in My lines with who made it, and loads like your own lines: it travels to its map, and you can play it, retake it and save your own version. Your version says which line it was **built on**.
+- Lines are now saved as `.retake` files that carry their own name, map and author, so a single file is all you need to send. Lines saved by 0.0.4 still load.
+- A shared line replays from its recording, so it plays back for anyone. Retaking it means skating it yourself, and tricks from mods the other player has and you don't won't come out the same.
+
+### Fixed
+
+- **A loaded line no longer goes off at its first rail.** Played straight after starting the game, before you had skated, a loaded line took rails the other way, every time: a part of the game that only starts once the skater is ridden had not started, and a replay alone never starts it. Now ReTake asks you to ride for a moment first when it hasn't started. Played after riding, the same line replays as it was skated.
+
+### Research (console)
+
+- `retake statetest`: the first time, starts a line. The second time, it ends the line, saves it to My lines as "State test <time>", and plays it back twice, writing a snapshot of the game's skater state for the run and each replay to `logs\tas_state`. `retake statetest replay`, after restarting the game and loading that line, plays it once more and writes its snapshot too. A line replays exactly in the session it was skated in, but can drift once loaded after a restart, so the difference between those snapshots shows what a replay still has to put back.
+- `retake ghosttest`: tries showing a real skater model in your outfit 3 m to your side, copying you live (it uses the same code multiplayer uses to show other players). If it works, the timeline's ghost can be your skater rather than a skeleton. Run it again to turn it off.
+- `retake warmtest`: tries starting that part of the game without riding, so a loaded line could play straight away. It says whether the game kept it started.
+
+### ReSkate.dll
+
+- Saved lines carry a note (version 2 of the line file; version 1 still loads): `reskate.tas.line_export(path, note)`, `reskate.tas.line_note(path)`.
+- `reskate.tas.ghost_probe(show, x, y, z)`.
+- `reskate.tas.status()` has `sensor_started` (whether the skater has been ridden since the game started) and `sensor_writes`; `reskate.tas.sensor_start()` (research).
+- State snapshots are written in the background.
+- Ghost lines (`Extension/Plugins/ghost_file.h`): `reskate.tas.ghost_record(on)`, `ghost_capture(step)`, `ghost_status()`, `ghost_export(path, note)`, `ghost_note(path)`, `ghost_load(path)` (saving and loading in the background), `ghost_frame(step)`, `ghost_show(step)` and `ghost_hide()`. A ghost keeps a pose a step as multiplayer encodes it (each the difference from the one before, every 60th whole), the camera, and the outfit; it is shown in the last multiplayer player slot, offline only.
+- Still sends no crash reports.
+
+### Installer
+
+- Knows 0.0.4's `ReSkate.dll` and the 0.0.5 test builds, so updating never backs one of them up as your original.
+
 ## 0.0.4 (2026-11-08)
 
 ### My lines: save your lines and come back to them

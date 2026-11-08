@@ -38,6 +38,15 @@ inline constexpr std::uintptr_t in_the_air_offset = 0x180;    // offboard state
 // or a teleport: one a step in every run compared on 2026-11-06. The core keeps its address across a
 // teleport, so the address does not show one.
 inline constexpr std::uintptr_t core_steps_since_built = 0x190;
+// A sensor block in the skater's context (+0x1a00 to +0x1c40), found by ReTake's state dumps on 2026-11-08: in a
+// skater ridden since the game started, +0x1a04 and +0x1a18 are exactly 1.0 at every step (bails and all), +0x1b14
+// 0.7, +0x1a10 0 and +0x1a20 (float[3]) 0, and +0x1a30 on holds a direction that follows the skater. In a skater only
+// placed by a replay since the game started they stay 0, 0, 0, FLT_MAX and an up normal, the direction never comes,
+// and the replay takes a rail the other way (context+0x490 -1 where the ride had 1). What they mean is not read yet.
+inline constexpr std::uintptr_t context_sensor_on_a = 0x1a04, context_sensor_on_b = 0x1a18; // float, 1 started
+inline constexpr std::uintptr_t context_sensor_far = 0x1a10;    // float: 0 started, FLT_MAX not
+inline constexpr std::uintptr_t context_sensor_normal = 0x1a20; // float[3]: 0 started, an up normal not
+inline constexpr std::uintptr_t context_sensor_gain = 0x1b14;   // float: 0.7 started, 0 not
 inline constexpr std::uintptr_t body_flags_offset = 0x60;
 inline constexpr std::uint32_t body_flag_rotation = 1, body_flag_position = 4, body_flag_velocity = 8, body_flag_spin = 0x20;
 // A flight on the board (no_bail.cpp, 2.7): the air state (core+0x308, its launch block at +0x30, the core's at core+0x3e8)

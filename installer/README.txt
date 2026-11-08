@@ -1,4 +1,4 @@
-ReTake 0.0.4: rewind and retake your lines in skate. (a ReSkate mod, offline only)
+ReTake 0.0.5: rewind and retake your lines in skate. (a ReSkate mod, offline only)
 https://github.com/N0deNinja/ReTake
 
 INSTALL
@@ -8,7 +8,7 @@ INSTALL
      installs ReTake, and asks to turn off the launcher's automatic updates
      (an update would put the official ReSkate.dll back and remove ReTake).
   3. Start skate. with the ReSkate launcher, play offline, and allow ReTake's permissions when asked.
-  4. Press F11 and pick New line.
+  4. Press F11 and pick New line. F10 opens Ghost lines: lines other skaters sent you, to watch and try.
 
   If Windows SmartScreen warns about the .bat, choose "More info", then "Run anyway".
   The installer only touches the skate. folder: ReSkate.dll, Mods\ReTake, ReTake-backup,

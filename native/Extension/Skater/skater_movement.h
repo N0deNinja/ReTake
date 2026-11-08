@@ -8,6 +8,8 @@
 namespace dingosdk::skater_movement {
 // The client the camera is read through for `stick` (Runtime/client_tick.cpp, every tick).
 void set_client(std::uintptr_t client) noexcept;
+// The client set last (0 before the first): for what needs it outside the client tick's own calls.
+std::uintptr_t client() noexcept;
 // Nothing without a local skater or when its velocity does not read as a velocity.
 std::optional<plugins::SkaterMovement> read(std::uintptr_t base);
 }

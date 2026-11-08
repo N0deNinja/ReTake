@@ -4,6 +4,7 @@
 -- recorded: stopped at its end, the timeline open to any moment of it.
 local U = require("util")
 local R = require("report")
+local S = require("ui")
 local L = require("line")
 local LIB = {}
 
@@ -16,6 +17,7 @@ local VK_ESCAPE, VK_RETURN = 27, 13
 local op = nil      -- {kind="save"|"load", id=, meta=, stage=, at=}: one at a time
 local window = nil  -- {from_timeline=, left=, escape=, scroll=, confirm=, message=, error=}
 local cache = nil   -- the saved lines, newest first, until something changes
+local source = nil  -- what the line there was loaded from (its info), for a line built on one someone sent
 
 local function path(id, ext)
     return FOLDER .. "/" .. id .. ext
@@ -70,6 +72,37 @@ local function map_label(meta)
     return meta.map_name or (meta.map and string.match(meta.map, "([^/\\|]+)$")) or "another map"
 end
 
+-- For ghost lines (ghosts.lua): the map, whether a line's map is this one, and what to call it.
+function LIB.current_map()
+    return current_map()
+end
+
+function LIB.same_map(map)
+    local here = current_map()
+    return not map or not here or norm(map) == norm(here)
+end
+
+function LIB.map_label(meta)
+    return map_label(meta)
+end
+
+-- The game's name for `map`, nil for one it does not travel to.
+function LIB.map_name(map)
+    local _, name = destination_of(map)
+    return name
+end
+
+-- Travels to `map`, as loading a line from another map does, then calls done(). False and why when it can't.
+function LIB.travel(map, done)
+    if op then return false, "a line is being saved or loaded" end
+    if U.in_session() then return false, "ReTake is offline only" end
+    local destination, name = destination_of(map)
+    if not destination then return false, "ReTake can't travel to that map: go there, then try again" end
+    op = {kind = "go", meta = {map = map}, stage = "travel", destination = destination, at = U.now(), tries = 0, done = done}
+    R.toast("Travelling to " .. tostring(name) .. "…")
+    return true
+end
+
 local function say(text, kind)
     if window then
         if kind == "warn" then window.error, window.message = text, nil else window.message, window.error = text, nil end
@@ -78,17 +111,54 @@ local function say(text, kind)
 end
 
 -- The saved lines, newest first: {id=, meta=}.
+-- The file a line's steps are in: lines saved since sharing came are one .retake file each, with what ReTake keeps of
+-- them inside (its note); older ones are a .line beside their .json.
+local function line_file(entry_id, meta)
+    return FOLDER .. "/" .. (meta.file or (entry_id .. ".line"))
+end
+
+-- A line someone sent: a .retake put in the lines folder, with no .json beside it yet. Its note says what it is; the
+-- .json is made from it, so it is listed as any other from then on.
+local function adopt_received(stem, file)
+    if not reskate.tas.line_note then return nil end
+    local note, why = reskate.tas.line_note(FOLDER .. "/" .. file)
+    if not note or note == "" then
+        if why then R.line("[lines] " .. file .. " is not a line this ReTake loads: " .. tostring(why)) end
+        return nil
+    end
+    local decoded, meta = pcall(reskate.json.decode, note)
+    if not decoded or type(meta) ~= "table" then return nil end
+    meta.file = file
+    meta.received = os.date("%Y-%m-%d %H:%M")
+    local ok = reskate.files.write(path(stem, ".json"), reskate.json.encode(meta))
+    if not ok then return nil end
+    R.line(string.format("[lines] received %q (%s), made by %s with ReTake %s", tostring(meta.name), file, tostring(meta.author or "someone"), tostring(meta.retake)))
+    return meta
+end
+
 function LIB.list()
     if cache then return cache end
     local out = {}
     local ok, names = pcall(reskate.files.list, FOLDER)
     if ok and names then
+        local listed = {}
         for _, name in names do
             local id = string.match(name, "([^/\\]+)%.json$")
             if id then
                 local text = reskate.files.read(path(id, ".json"))
                 local decoded, meta = pcall(reskate.json.decode, text or "")
-                if decoded and type(meta) == "table" then table.insert(out, {id = id, meta = meta}) end
+                if decoded and type(meta) == "table" then
+                    table.insert(out, {id = id, meta = meta})
+                    listed[id] = true
+                end
+            end
+        end
+        for _, name in names do
+            local file = string.match(name, "([^/\\]+%.retake)$")
+            local stem = file and string.sub(file, 1, -8)
+            if stem and not listed[stem] then
+                local meta = adopt_received(stem, file)
+                if meta then table.insert(out, {id = stem, meta = meta}) end
             end
         end
     end
@@ -101,8 +171,42 @@ function LIB.busy()
     return op ~= nil
 end
 
--- Saves the line as it is now, under `name` (else its date). In the background: a toast says when it is done.
-function LIB.save(name)
+-- The player's name for a line they share, when the game has one (offline it may not).
+function LIB.player_name()
+    if not reskate.session or not reskate.session.me then return nil end
+    local ok, me = pcall(reskate.session.me)
+    if ok and type(me) == "table" and type(me.name) == "string" and me.name ~= "" then return me.name end
+    return nil
+end
+
+-- What the line there was loaded from (its info), nil for a line skated here.
+function LIB.source()
+    return source
+end
+
+-- A new line is the player's own, built on nothing.
+function LIB.on_new_line()
+    source = nil
+end
+
+-- Sharing a saved line: its file is the whole of it. The folder opens, and the window says which file to send.
+function LIB.share(id)
+    local entry
+    for _, e in LIB.list() do
+        if e.id == id then entry = e end
+    end
+    if not entry then return false, "there is no such line" end
+    if not entry.meta.file then return false, "this line was saved before sharing came: load it and save it again to share it" end
+    pcall(reskate.files.reveal, FOLDER)
+    local text = "Send " .. entry.meta.file .. " to anyone with ReTake: they put it in their lines folder (My lines, Open folder)."
+    if window then window.message, window.error = text, nil end
+    R.line("[lines] sharing " .. entry.meta.file)
+    return true
+end
+
+-- Saves the line as it is now, under `name` (else its date), `extra` (fields of its own) kept with it. In the
+-- background: a toast says when it is done.
+function LIB.save(name, extra)
     if not reskate.tas.line_export then return false, "this ReSkate.dll cannot save lines: install ReTake's DLL from this version" end
     if op then return false, "a line is being saved or loaded" end
     local info = L.info()
@@ -123,7 +227,13 @@ function LIB.save(name)
         bails = info.bails,
         retake = L.version,
         map = current_map(),
+        file = id .. ".retake",
+        line_id = L.line_id(),
+        author = LIB.player_name(),
+        -- A line built on one someone sent: whose it was.
+        based_on = source and source.received and {name = source.name, author = source.author} or (source and source.based_on) or nil,
     }
+    for k, v in extra or {} do meta[k] = v end
     if meta.map then
         local _, name = destination_of(meta.map)
         meta.map_name = name
@@ -138,7 +248,8 @@ function LIB.save(name)
             R.line(string.format("[lines] the map %s is not one the game travels to: %s", tostring(meta.map), table.concat(known, ", ")))
         end
     end
-    local ok, why = reskate.tas.line_export(path(id, ".line"))
+    -- One file is the whole line, its note what ReTake keeps of it: that file is what is sent to someone.
+    local ok, why = reskate.tas.line_export(FOLDER .. "/" .. meta.file, reskate.json.encode(meta))
     if not ok then return false, why end
     op = {kind = "save", id = id, meta = meta, at = U.now()}
     if window then window.message, window.error = "Saving…", nil end
@@ -177,8 +288,12 @@ end
 
 function LIB.delete(id)
     if op and op.id == id then return false, "it is being saved or loaded" end
+    local entry
+    for _, e in LIB.list() do
+        if e.id == id then entry = e end
+    end
     local ok1 = reskate.files.remove(path(id, ".json"))
-    pcall(reskate.files.remove, path(id, ".line"))
+    pcall(reskate.files.remove, entry and line_file(id, entry.meta) or path(id, ".line"))
     cache = nil
     if not ok1 then return false, "it could not be deleted" end
     R.line("[lines] deleted " .. id)
@@ -200,7 +315,7 @@ local function op_tick(now)
         end
         local ok, why = reskate.files.write(path(o.id, ".json"), reskate.json.encode(o.meta))
         if not ok then
-            pcall(reskate.files.remove, path(o.id, ".line"))
+            pcall(reskate.files.remove, line_file(o.id, o.meta))
             say("The line could not be saved: " .. tostring(why), "warn")
             return
         end
@@ -225,7 +340,15 @@ local function op_tick(now)
         -- There once the map is the line's and a skater stands in it a moment: then as any load.
         if norm(current_map()) == norm(op.meta.map) and reskate.skater.get() then
             op.seen = op.seen or now
-            if now - op.seen >= SETTLE_MS then op.stage, op.at = "stopping", now end
+            if now - op.seen >= SETTLE_MS then
+                if op.kind == "go" then
+                    local done = op.done
+                    op = nil
+                    if done then done() end
+                    return
+                end
+                op.stage, op.at = "stopping", now
+            end
         else
             op.seen = nil
             if now - op.at > TRAVEL_MS then
@@ -236,7 +359,7 @@ local function op_tick(now)
     elseif op.stage == "stopping" then
         local phase = L.phase()
         if phase == "off" or phase == "played" then
-            local ok, why = reskate.tas.line_import(path(op.id, ".line"), L.find_pad())
+            local ok, why = reskate.tas.line_import(line_file(op.id, op.meta), L.find_pad())
             if not ok then
                 op = nil
                 say("The line could not be loaded: " .. tostring(why), "warn")
@@ -257,6 +380,9 @@ local function op_tick(now)
             return
         end
         L.adopt(o.meta)
+        source = o.meta
+        if LIB.on_loaded then LIB.on_loaded(o.meta) end
+        if o.meta.retake and o.meta.retake ~= L.version then R.line(string.format("[lines] %q was made with ReTake %s; this is %s", tostring(o.meta.name), tostring(o.meta.retake), L.version)) end
         say("Loaded: " .. tostring(o.meta.name) .. ". Pick a moment and retake it")
     end
 end
@@ -302,8 +428,9 @@ local function layout()
     local list = {x0 = box.x0 + pad, x1 = box.x1 - pad, y0 = box.y0 + 160 * k, y1 = box.y1 - 100 * k}
     local row_h = (list.y1 - list.y0) / ROWS_SHOWN
     local buttons = {
-        save = {x0 = box.x1 - pad - 270 * k, x1 = box.x1 - pad, y0 = box.y0 + 32 * k, y1 = box.y0 + 80 * k},
+        save = {x0 = box.x1 - pad - 300 * k, x1 = box.x1 - pad, y0 = box.y0 + 34 * k, y1 = box.y0 + 82 * k},
         close = {x0 = box.x1 - pad - 160 * k, x1 = box.x1 - pad, y0 = box.y1 - 78 * k, y1 = box.y1 - 30 * k},
+        folder = {x0 = box.x0 + pad, x1 = box.x0 + pad + 170 * k, y0 = box.y1 - 78 * k, y1 = box.y1 - 30 * k},
     }
     local rows = {}
     local entries = LIB.list()
@@ -315,6 +442,7 @@ local function layout()
         local by0, by1 = (r.box.y0 + r.box.y1) / 2 - 22 * k, (r.box.y0 + r.box.y1) / 2 + 22 * k
         r.load = {x0 = list.x1 - 16 * k - 120 * k, x1 = list.x1 - 16 * k, y0 = by0, y1 = by1}
         r.delete = {x0 = r.load.x0 - 10 * k - 120 * k, x1 = r.load.x0 - 10 * k, y0 = by0, y1 = by1}
+        r.share = {x0 = r.delete.x0 - 10 * k - 110 * k, x1 = r.delete.x0 - 10 * k, y0 = by0, y1 = by1}
         table.insert(rows, r)
     end
     return k, box, list, buttons, rows, pad
@@ -335,6 +463,12 @@ local function click(mouse)
         close_window()
         return
     end
+    if inside(p, buttons.folder) then
+        pcall(reskate.files.reveal, FOLDER)
+        window.message, window.error = "A line someone sent you goes in this folder; it shows up here.", nil
+        cache = nil
+        return
+    end
     if inside(p, buttons.save) then
         answer(LIB.save())
         return
@@ -349,6 +483,9 @@ local function click(mouse)
                 window = nil
                 reskate.ui.close()
             end
+            return
+        elseif inside(p, r.share) then
+            answer(LIB.share(r.entry.id))
             return
         elseif inside(p, r.delete) then
             if window.confirm == r.entry.id then
@@ -387,27 +524,7 @@ function LIB.tick(now)
 end
 
 -- ---- drawing ----------------------------------------------------------------------------------------------
-local ACCENT, INK, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
-
-local function v(x, y)
-    return vector.create(x, y, 0)
-end
-
-local function txt(size, colour, font)
-    return {colour = colour, size = size, font = font or "heading"}
-end
-
-local function button(d, r, label, kind, mouse, k, off)
-    local hover = not off and mouse and inside(mouse.position, r)
-    local fill, ink = {colour = hover and "#ffffff26" or "#ffffff14", fill = true, rounding = 10}, TEXT
-    if kind == "primary" then fill, ink = {colour = hover and "#5ffbe8" or ACCENT, fill = true, rounding = 10}, INK end
-    if kind == "danger" then fill, ink = {colour = hover and "#ff5a5a40" or "#ff5a5a26", fill = true, rounding = 10}, RED end
-    if off then fill, ink = {colour = "#ffffff08", fill = true, rounding = 10}, "#ffffff40" end
-    d:rect(v(r.x0, r.y0), v(r.x1, r.y1), fill)
-    local style = txt(17, ink)
-    local size = d:measure(label, style)
-    d:text(v((r.x0 + r.x1) / 2 - size.x / 2, (r.y0 + r.y1) / 2 - size.y / 2), label, style)
-end
+local v = S.v
 
 function LIB.draw(d)
     if not window then return end
@@ -415,46 +532,49 @@ function LIB.draw(d)
     width, height = size.x, size.y
     local k, box, list, buttons, rows, pad = layout()
     local mouse = reskate.input.cursor()
-    d:rect(v(0, 0), v(width, height), {colour = "#000000a0", fill = true})
-    d:rect(v(box.x0, box.y0), v(box.x1, box.y1), {colour = "#0c0d11f4", fill = true, rounding = 16})
-    d:rect(v(box.x0, box.y0), v(box.x1, box.y1), {colour = "#ffffff1c", thickness = 1, rounding = 16})
+    S.scrim(d, width, height)
+    S.panel(d, box, k, 21)
     local x = box.x0 + pad
-    d:text(v(x, box.y0 + 30 * k), "My lines", txt(30, TEXT))
-    d:text(v(x, box.y0 + 80 * k), "Save a line to come back to it, even after closing the game. Loading one replaces the line you have now.",
-        txt(15, MUTED, "body"))
+    local th = S.title(d, x, box.y0 + 26 * k, "My lines", k)
+    d:text(v(x, box.y0 + 36 * k + th), "Save a line to come back to it, even after closing the game. Loading one replaces the line you have now.",
+        S.font(14, S.MUTED, "body", true))
     local info = L.info()
     local can_save = info.phase ~= "off" and info.length > 0 and info.start ~= nil and not op
-    button(d, buttons.save, can_save and ("Save this line  " .. clock_text(info.length)) or "Save this line", "primary", mouse, k, not can_save)
+    S.button(d, buttons.save, can_save and ("Save this line  " .. clock_text(info.length)) or "Save this line", {kind = "primary", mouse = mouse, k = k, off = not can_save})
 
     local here = current_map()
     local entries = LIB.list()
     if #entries == 0 then
-        local empty = txt(18, MUTED, "body")
-        local m = d:measure("No lines saved yet.", empty)
-        d:text(v((list.x0 + list.x1) / 2 - m.x / 2, (list.y0 + list.y1) / 2 - m.y), "No lines saved yet.", empty)
+        local cy = (list.y0 + list.y1) / 2
+        S.centred(d, "NO LINES SAVED YET", S.font(20, S.SOFT, "heading", true), (list.x0 + list.x1) / 2, cy - 14 * k)
+        S.centred(d, "Skate a line, then Save this line.", S.font(14, S.MUTED, "body", true), (list.x0 + list.x1) / 2, cy + 16 * k)
     end
     for _, r in rows do
         local b = r.box
-        local hover = mouse and inside(mouse.position, b)
-        d:rect(v(b.x0, b.y0), v(b.x1, b.y1), {colour = hover and "#ffffff12" or "#ffffff08", fill = true, rounding = 10})
+        S.row(d, b, S.hovered(mouse, b), S.seed(r.entry.id), k)
         local meta = r.entry.meta
         local cy = (b.y0 + b.y1) / 2
-        d:text(v(b.x0 + 18 * k, cy - 24 * k), tostring(meta.name or r.entry.id), txt(20, TEXT))
+        d:text(v(b.x0 + 20 * k, cy - 25 * k), tostring(meta.name or r.entry.id), S.font(19, S.TEXT, "heading", true))
         local retakes = meta.joins and #meta.joins or 0
         local sub = string.format("%s  ·  saved %s  ·  %d %s", clock_text(meta.length), tostring(meta.saved or "?"), retakes, retakes == 1 and "retake" or "retakes")
         if meta.map and here and norm(meta.map) ~= norm(here) then sub ..= "  ·  on " .. map_label(meta) end
-        d:text(v(b.x0 + 18 * k, cy + 4 * k), sub, txt(14, MUTED, "body"))
+        if meta.received then sub ..= "  ·  from " .. tostring(meta.author or "someone") end
+        if meta.based_on then sub ..= "  ·  built on " .. tostring(meta.based_on.name) end
+        d:text(v(b.x0 + 20 * k, cy + 4 * k), sub, S.font(13, S.MUTED, "body", true))
         local busy = op ~= nil
-        button(d, r.load, op and op.id == r.entry.id and "Loading…" or "Load", "primary", mouse, k, busy)
-        button(d, r.delete, window.confirm == r.entry.id and "Sure?" or "Delete", window.confirm == r.entry.id and "danger" or "normal", mouse, k, busy)
+        local sure = window.confirm == r.entry.id
+        S.button(d, r.load, op and op.id == r.entry.id and "Loading…" or "Load", {kind = "primary", mouse = mouse, k = k, off = busy, size = 15})
+        S.button(d, r.delete, sure and "Sure?" or "Delete", {kind = sure and "armed" or "danger", mouse = mouse, k = k, off = busy, size = 15})
+        S.button(d, r.share, "Share", {mouse = mouse, k = k, off = busy or not r.entry.meta.file, size = 15})
     end
     if #entries > ROWS_SHOWN then
         local more = string.format("%d–%d of %d  (wheel to scroll)", window.scroll + 1, math.min(#entries, window.scroll + ROWS_SHOWN), #entries)
-        d:text(v(x, box.y1 - 64 * k), more, txt(14, MUTED, "body"))
+        d:text(v(x, box.y1 - 66 * k), more, S.font(13, S.MUTED, "body", true))
     end
     local note = window.error or window.message
-    if note then d:text(v(x, box.y1 - 90 * k), note, txt(15, window.error and RED or ACCENT, "body")) end
-    button(d, buttons.close, window.from_timeline and "Back" or "Close", "normal", mouse, k)
+    if note then S.note(d, x, box.y1 - 96 * k, note, k, window.error ~= nil) end
+    S.button(d, buttons.close, window.from_timeline and "Back" or "Close", {mouse = mouse, k = k, key = "Esc"})
+    S.button(d, buttons.folder, "Open folder", {kind = "quiet", mouse = mouse, k = k})
 end
 
 reskate.ui.screen(SCREEN, function() end, {panel = false})

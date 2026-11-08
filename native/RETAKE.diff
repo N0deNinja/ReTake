@@ -24,10 +24,10 @@ index a97216b..18bac1a 100644
      if (url.empty()) url = crash_report::configured_url;
      url = envelope_url(url);
 diff --git a/Engine/Game/Build/20260929/skater_state.h b/Engine/Game/Build/20260929/skater_state.h
-index b67509e..bb3f717 100644
+index b67509e..e3d9c0f 100644
 --- a/Engine/Game/Build/20260929/skater_state.h
 +++ b/Engine/Game/Build/20260929/skater_state.h
-@@ -30,8 +30,30 @@ inline constexpr std::uintptr_t in_the_air_offset = 0x180;    // offboard state
+@@ -30,8 +30,39 @@ inline constexpr std::uintptr_t in_the_air_offset = 0x180;    // offboard state
  // n * 0x130, each pointing back to its owner at +0x10 with its velocity (float[3], m/s) at +0x70 and
  // its spin (angular velocity, float[3], radians per second) at +0x90. 0x140fc06b0 syncs a body with
  // the physics world: by its pending flags (+0x60) it sets the velocity (8, 0x1425da600) from +0x70
@@ -40,6 +40,15 @@ index b67509e..bb3f717 100644
 +// or a teleport: one a step in every run compared on 2026-11-06. The core keeps its address across a
 +// teleport, so the address does not show one.
 +inline constexpr std::uintptr_t core_steps_since_built = 0x190;
++// A sensor block in the skater's context (+0x1a00 to +0x1c40), found by ReTake's state dumps on 2026-11-08: in a
++// skater ridden since the game started, +0x1a04 and +0x1a18 are exactly 1.0 at every step (bails and all), +0x1b14
++// 0.7, +0x1a10 0 and +0x1a20 (float[3]) 0, and +0x1a30 on holds a direction that follows the skater. In a skater only
++// placed by a replay since the game started they stay 0, 0, 0, FLT_MAX and an up normal, the direction never comes,
++// and the replay takes a rail the other way (context+0x490 -1 where the ride had 1). What they mean is not read yet.
++inline constexpr std::uintptr_t context_sensor_on_a = 0x1a04, context_sensor_on_b = 0x1a18; // float, 1 started
++inline constexpr std::uintptr_t context_sensor_far = 0x1a10;    // float: 0 started, FLT_MAX not
++inline constexpr std::uintptr_t context_sensor_normal = 0x1a20; // float[3]: 0 started, an up normal not
++inline constexpr std::uintptr_t context_sensor_gain = 0x1b14;   // float: 0.7 started, 0 not
 +inline constexpr std::uintptr_t body_flags_offset = 0x60;
 +inline constexpr std::uint32_t body_flag_rotation = 1, body_flag_position = 4, body_flag_velocity = 8, body_flag_spin = 0x20;
 +// A flight on the board (no_bail.cpp, 2.7): the air state (core+0x308, its launch block at +0x30, the core's at core+0x3e8)
@@ -350,19 +359,20 @@ index 0000000..e52e626
 +inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
 +}
 diff --git a/Extension/Plugins/Test/plugin_tests.cpp b/Extension/Plugins/Test/plugin_tests.cpp
-index 6c43ca0..e699685 100644
+index 6c43ca0..a29a15a 100644
 --- a/Extension/Plugins/Test/plugin_tests.cpp
 +++ b/Extension/Plugins/Test/plugin_tests.cpp
-@@ -14,6 +14,8 @@
+@@ -14,6 +14,9 @@
  #include "Extension/Throwdowns/throwdown_kit.h"
  #include "Engine/Vfs/mod_list.h"
  #include "Engine/Game/Input/pad_output.h"
 +#include "Engine/Game/Input/step_script.h"
 +#include "Extension/Plugins/line_file.h"
++#include "Extension/Plugins/ghost_file.h"
  #include "Engine/Game/Input/playstation_report.h"
  #include "Engine/Game/Input/gameplay_options.h"
  #ifdef _WIN32 // reads memory as the game does (Engine/Core/Platform/memory.h)
-@@ -926,6 +928,29 @@ struct FakeGame final : Game {
+@@ -926,6 +929,29 @@ struct FakeGame final : Game {
      std::string set_animation_value(std::string_view name, double) override { return name == "Animation/Dingo/Float.Physics.Example" ? "" : "not a live numeric physics output"; }
      int read_controller = -1;
      std::optional<PadInput> written_pad; unsigned written_controller{};
@@ -392,7 +402,7 @@ index 6c43ca0..e699685 100644
      std::string write_pad(std::string_view, unsigned controller, std::optional<PadInput> value) override { written_controller = controller; written_pad = value; return {}; }
      std::optional<StickInput> joystick(int device) override {
          if (device > 1) return std::nullopt;
-@@ -3980,6 +4005,275 @@ void plugins_write_normalized_controllers() {
+@@ -3980,6 +4006,340 @@ void plugins_write_normalized_controllers() {
      check(!outputs.read(4, 1201, true), "stop releases native pads too");
  }
  
@@ -649,26 +659,91 @@ index 6c43ca0..e699685 100644
 +    const std::vector<PadOutput> steps{pad(5), pad(6), pad(7)};
 +    const std::vector<Motion> motion{{{1, 2, 3, 4}, true}, {{5, 6, 7, 8}, false}};
 +    const auto raw = dingosdk::line_file::pack(steps, motion);
++    // Version 2: the header, the note's size and the note (20 bytes here), then the 100 bytes of payload.
 +    auto header = dingosdk::line_file::header_for<Motion>(steps.size(), motion.size(), raw.size(), 100);
-+    check(dingosdk::line_file::check<Motion>(header, sizeof(header) + 100, 36000).empty(), "a line's header passes");
++    const std::size_t with_note = sizeof(header) + 4 + 20 + 100;
++    check(header.version == 2 && dingosdk::line_file::payload_at(header, 20) == sizeof(header) + 24, "a line's file has its note before the payload");
++    check(dingosdk::line_file::check<Motion>(header, with_note, 36000, 20).empty(), "a line's header passes");
 +    std::vector<PadOutput> steps_back;
 +    std::vector<Motion> motion_back;
 +    check(dingosdk::line_file::unpack(raw, header, steps_back, motion_back) && steps_back.size() == 3 && steps_back[2].left_x == 7 &&
 +              motion_back.size() == 2 && motion_back[1].place[3] == 8 && !motion_back[1].valid,
 +          "and its steps and motion come back as they were");
-+    check(!dingosdk::line_file::check<Motion>(header, sizeof(header) + 99, 36000).empty(), "a file cut short is refused");
++    check(!dingosdk::line_file::check<Motion>(header, with_note - 1, 36000, 20).empty(), "a file cut short is refused");
++    check(!dingosdk::line_file::check<Motion>(header, with_note, 36000, dingosdk::line_file::most_note + 1).empty(), "a note too long is refused");
++    auto old = header;
++    old.version = 1;
++    check(dingosdk::line_file::check<Motion>(old, sizeof(old) + 100, 36000).empty() && dingosdk::line_file::payload_at(old, 0) == sizeof(old),
++          "a line saved before notes still loads");
 +    auto other = header;
 +    other.snapshot_size += 4;
-+    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "one from another build is refused");
++    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "one from another build is refused");
++    other = header;
++    other.version = 3;
++    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "one from a later ReTake is refused");
 +    other = header;
 +    other.magic[0] = 'X';
-+    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "and anything else");
++    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "and anything else");
++
++    // A ghost line: a pose a step, each the difference from the one before (every 60th whole), with the camera.
++    namespace gf = dingosdk::ghost_file;
++    namespace mp = dingosdk::multiplayer;
++    const auto pose_at = [](float x) {
++        mp::Pose pose;
++        pose.root.position = {x, 1, 2};
++        for (int bone = 0; bone < 30; ++bone) {
++            mp::Transform t;
++            t.position = {x + bone * 0.01f, 0.5f, 0};
++            const float angle = x * 0.1f + bone * 0.02f;
++            t.rotation = {0, std::sin(angle / 2), 0, std::cos(angle / 2)};
++            pose.skater.push_back(t);
++        }
++        pose.board.push_back(pose.root);
++        return pose;
++    };
++    gf::Recorder recorder;
++    for (std::uint32_t step = 10; step < 140; ++step) {
++        gf::Camera camera{{static_cast<float>(step), 3, 0}, {0, 0, 1}, {0, 1, 0}, 60};
++        check(recorder.add(step, pose_at(static_cast<float>(step) * 0.1f), camera), "a ghost keeps each step");
++    }
++    check(recorder.add(139, pose_at(13.95f), {{139, 3, 0}, {0, 0, 1}, {0, 1, 0}, 60}) && recorder.track.samples.size() == 130,
++          "a step seen again replaces the one there");
++    check(!recorder.add(100, pose_at(1), {}), "and one before the last is refused");
++    std::size_t wholes = 0;
++    for (const auto& sample : recorder.track.samples) wholes += mp::pose_codec::whole(sample.pose) ? 1 : 0;
++    check(wholes == 3 && mp::pose_codec::whole(recorder.track.samples.front().pose), "every 60th pose is whole, the first among them");
++    recorder.track.appearance = {1, 2, 3};
++    const auto ghost_raw = gf::pack(recorder.track);
++    gf::Track back;
++    check(gf::unpack(ghost_raw, back) && back == recorder.track, "a ghost's payload comes back as it was");
++    check(!gf::unpack(std::string_view(ghost_raw).substr(0, ghost_raw.size() - 1), back), "a payload cut short is refused");
++    gf::Player ghost(recorder.track);
++    check(ghost.first_step() == 10 && ghost.last_step() == 139, "a ghost knows its steps");
++    const auto close_to = [](float a, float b) { return std::fabs(a - b) < 0.003f; };
++    auto at = ghost.at(75);
++    check(at && close_to(at->pose.root.position[0], 7.5f) && close_to(at->pose.skater[29].position[0], 7.79f) && !at->ended && at->camera.position[0] == 75,
++          "a ghost at a step shows that step's pose and camera");
++    at = ghost.at(75.5);
++    check(at && close_to(at->pose.root.position[0], 7.55f) && close_to(at->camera.position[0], 75.5f), "and between two steps, between them");
++    at = ghost.at(12); // decoded again from the first whole pose
++    check(at && close_to(at->pose.root.position[0], 1.2f), "from anywhere, back to the start");
++    at = ghost.at(131); // from the whole pose at the 120th sample
++    check(at && close_to(at->pose.skater[3].position[0], 13.13f), "and on past a whole pose");
++    at = ghost.at(500);
++    check(at && at->ended && close_to(at->pose.root.position[0], 13.95f), "after its end it holds its last pose");
++    at = ghost.at(0);
++    check(at && !at->ended && close_to(at->pose.root.position[0], 1.0f), "and before its start, its first");
++    auto ghost_header = gf::header_for(20, ghost_raw.size(), 100);
++    check(gf::check(ghost_header, sizeof(ghost_header) + 120).empty(), "a ghost's header passes");
++    check(!gf::check(ghost_header, sizeof(ghost_header) + 119).empty(), "a ghost file cut short is refused");
++    ghost_header.magic[3] = 'L';
++    check(!gf::check(ghost_header, sizeof(ghost_header) + 120).empty(), "and a line is not a ghost");
 +}
 +
  void controller_reports_preserve_non_controls() {
      using namespace dingosdk;
      for (int variant = 0; variant < 5; ++variant) {
-@@ -7822,6 +8116,7 @@ int main() {
+@@ -7822,6 +8182,7 @@ int main() {
          run(plugins_place_world_entities);
          run(plugins_have_what_a_prop_hunt_needs);
          run(plugins_write_normalized_controllers);
@@ -676,12 +751,288 @@ index 6c43ca0..e699685 100644
          run(controller_reports_preserve_non_controls);
          run(plugins_read_frames_and_hold_gameplay_options);
  #ifdef _WIN32
+diff --git a/Extension/Plugins/ghost_file.h b/Extension/Plugins/ghost_file.h
+new file mode 100644
+index 0000000..b05781d
+--- /dev/null
++++ b/Extension/Plugins/ghost_file.h
+@@ -0,0 +1,270 @@
++#pragma once
++#include "Extension/Multiplayer/Net/pose_codec.h"
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// A ghost line (reskate.tas.ghost_*): a line as other players see it, to ride beside. Each step of it keeps the skater's
++// pose as multiplayer sends it (Extension/Multiplayer/Net/pose_codec.h: every bone, rounded, as the difference from the
++// pose before, every 60th whole) and the camera the line was seen through; once, the outfit, as a cosmetics packet. A
++// ghost is shown as multiplayer shows another player: a real skater in that outfit, posed step by step. A minute of
++// it is about a megabyte.
++//
++// The file: the header, the note (what ReTake keeps of it: its name, who made it, its map and start, as text), then
++// the payload, compressed (the runtime's zstd). Unlike a line file, nothing in it is this build's memory: a ghost
++// loads into any build whose poses have the same bones.
++namespace dingosdk::ghost_file {
++inline constexpr char magic[4] = {'R', 'T', 'K', 'G'};
++inline constexpr std::uint32_t version = 1;
++inline constexpr std::uint32_t most_note = 1u << 20;
++inline constexpr std::size_t whole_every = 60;            // a whole pose this often, to start showing from anywhere
++inline constexpr std::size_t most_samples = 60 * 60 * 30; // half an hour of steps
++inline constexpr std::uint64_t most_raw = 512ull << 20;
++
++#pragma pack(push, 1)
++struct Header {
++    char magic[4];
++    std::uint32_t version;
++    std::uint32_t note_size;
++    std::uint64_t raw_size;    // the payload, uncompressed
++    std::uint64_t packed_size; // the payload as it follows the note
++};
++#pragma pack(pop)
++
++struct Camera {
++    std::array<float, 3> position{}, forward{0, 0, 1}, up{0, 1, 0};
++    float fov{};
++    bool operator==(const Camera&) const = default;
++};
++struct Sample {
++    std::uint32_t step{};
++    Camera camera;
++    std::vector<std::uint8_t> pose; // pose_codec: whole, or the difference from the sample before
++    bool operator==(const Sample&) const = default;
++};
++struct Track {
++    std::vector<std::uint8_t> appearance; // a cosmetics packet (multiplayer::encode), empty for none
++    std::vector<Sample> samples;          // steps only ever rise
++    bool operator==(const Track&) const = default;
++};
++
++inline Header header_for(std::size_t note_size, std::size_t raw_size, std::size_t packed_size) {
++    Header h{};
++    std::memcpy(h.magic, magic, sizeof(magic));
++    h.version = version;
++    h.note_size = static_cast<std::uint32_t>(note_size);
++    h.raw_size = raw_size;
++    h.packed_size = packed_size;
++    return h;
++}
++// Empty when the header is one this build reads, else why not.
++inline std::string check(const Header& h, std::uint64_t file_size) {
++    if (std::memcmp(h.magic, magic, sizeof(magic)) != 0) return "it is not a ghost line";
++    if (h.version != version) return "it was made by another version of ReTake";
++    if (h.note_size > most_note) return "its note is too long";
++    if (h.raw_size == 0 || h.raw_size > most_raw) return "its size is not a ghost line's";
++    if (file_size < sizeof(Header) + h.note_size || h.packed_size != file_size - sizeof(Header) - h.note_size) return "the file is cut short";
++    return {};
++}
++
++// ---- the payload ----------------------------------------------------------------------------------------------
++// u32 outfit size, the outfit; u32 samples; each: u32 step, 10 floats of camera, u32 pose size, the pose.
++namespace detail {
++inline void put(std::string& out, const void* data, std::size_t size) { out.append(static_cast<const char*>(data), size); }
++template <class T> void put(std::string& out, T value) { put(out, &value, sizeof(value)); }
++struct Reader {
++    std::string_view in;
++    bool ok = true;
++    bool get(void* data, std::size_t size) {
++        if (!ok || in.size() < size) return ok = false;
++        std::memcpy(data, in.data(), size);
++        in.remove_prefix(size);
++        return true;
++    }
++    template <class T> T get() {
++        T value{};
++        get(&value, sizeof(value));
++        return value;
++    }
++};
++} // namespace detail
++
++inline std::string pack(const Track& track) {
++    std::string out;
++    detail::put(out, static_cast<std::uint32_t>(track.appearance.size()));
++    detail::put(out, track.appearance.data(), track.appearance.size());
++    detail::put(out, static_cast<std::uint32_t>(track.samples.size()));
++    for (const auto& s : track.samples) {
++        detail::put(out, s.step);
++        detail::put(out, s.camera.position.data(), sizeof(float) * 3);
++        detail::put(out, s.camera.forward.data(), sizeof(float) * 3);
++        detail::put(out, s.camera.up.data(), sizeof(float) * 3);
++        detail::put(out, s.camera.fov);
++        detail::put(out, static_cast<std::uint32_t>(s.pose.size()));
++        detail::put(out, s.pose.data(), s.pose.size());
++    }
++    return out;
++}
++// The payload back: false when it is not one (cut short, steps not rising, a sample with no pose).
++inline bool unpack(std::string_view raw, Track& track) {
++    detail::Reader r{raw};
++    track = {};
++    const auto outfit = r.get<std::uint32_t>();
++    if (!r.ok || outfit > r.in.size()) return false;
++    track.appearance.resize(outfit);
++    r.get(track.appearance.data(), outfit);
++    const auto count = r.get<std::uint32_t>();
++    if (!r.ok || count == 0 || count > most_samples) return false;
++    track.samples.reserve(count);
++    for (std::uint32_t i = 0; i < count && r.ok; ++i) {
++        Sample s;
++        s.step = r.get<std::uint32_t>();
++        r.get(s.camera.position.data(), sizeof(float) * 3);
++        r.get(s.camera.forward.data(), sizeof(float) * 3);
++        r.get(s.camera.up.data(), sizeof(float) * 3);
++        s.camera.fov = r.get<float>();
++        const auto size = r.get<std::uint32_t>();
++        if (!r.ok || size == 0 || size > r.in.size()) return false;
++        s.pose.resize(size);
++        r.get(s.pose.data(), size);
++        if (!track.samples.empty() && s.step <= track.samples.back().step) return false;
++        track.samples.push_back(std::move(s));
++    }
++    return r.ok && r.in.empty() && multiplayer::pose_codec::whole(track.samples.front().pose);
++}
++
++// ---- recording ------------------------------------------------------------------------------------------------
++// One sample a step: the pose at a step seen again (a frame drawn twice in a step, slow motion) replaces the one
++// there, so each step keeps its last.
++class Recorder {
++public:
++    void clear() {
++        track = {};
++        last_.reset();
++        before_last_.reset();
++    }
++    // False when `step` comes before the last one, or the ghost is full.
++    bool add(std::uint32_t step, const multiplayer::Pose& pose, const Camera& camera) {
++        namespace pc = multiplayer::pose_codec;
++        auto quant = pc::quantize(pose);
++        if (!track.samples.empty() && step < track.samples.back().step) return false;
++        const bool again = !track.samples.empty() && step == track.samples.back().step;
++        if (again) {
++            track.samples.pop_back();
++            last_ = before_last_;
++        } else if (track.samples.size() >= most_samples) {
++            return false;
++        }
++        const bool whole = !last_ || track.samples.size() % whole_every == 0 || last_->skater != quant.skater || last_->board != quant.board;
++        Sample s{step, camera, whole ? pc::encode_whole(quant) : pc::encode_delta(quant, *last_)};
++        track.samples.push_back(std::move(s));
++        before_last_ = std::move(last_);
++        last_ = std::move(quant);
++        return true;
++    }
++    Track track;
++
++private:
++    std::optional<multiplayer::pose_codec::QuantPose> last_, before_last_;
++};
++
++// ---- showing --------------------------------------------------------------------------------------------------
++// The pose and camera at any step, between two samples in proportion. Samples decode in order from the nearest
++// whole one before; the last two decoded are kept, so showing step after step decodes each sample once.
++class Player {
++public:
++    explicit Player(Track track) : track_(std::move(track)) {}
++    struct Frame {
++        multiplayer::Pose pose;
++        Camera camera;
++        bool ended{}; // `step` is at or after the last sample
++    };
++    const Track& track() const { return track_; }
++    std::uint32_t first_step() const { return track_.samples.empty() ? 0 : track_.samples.front().step; }
++    std::uint32_t last_step() const { return track_.samples.empty() ? 0 : track_.samples.back().step; }
++    // Nothing when the ghost has no samples or a pose would not decode.
++    std::optional<Frame> at(double step) {
++        namespace mp = multiplayer;
++        const auto& samples = track_.samples;
++        if (samples.empty() || !std::isfinite(step)) return std::nullopt;
++        Frame frame;
++        const auto after = std::upper_bound(samples.begin(), samples.end(), step,
++            [](double value, const Sample& s) { return value < static_cast<double>(s.step); });
++        if (after == samples.begin() || after == samples.end()) {
++            const std::size_t i = after == samples.begin() ? 0 : samples.size() - 1;
++            const auto* q = decoded(i);
++            if (!q) return std::nullopt;
++            frame.pose = mp::pose_codec::restore(*q);
++            frame.camera = samples[i].camera;
++            frame.ended = after == samples.end();
++            return frame;
++        }
++        const std::size_t b = static_cast<std::size_t>(after - samples.begin()), a = b - 1;
++        const auto* qa = decoded(a);
++        if (!qa) return std::nullopt;
++        const auto pa = mp::pose_codec::restore(*qa);
++        const auto* qb = decoded(b);
++        if (!qb) return std::nullopt;
++        const auto pb = mp::pose_codec::restore(*qb);
++        const float t = static_cast<float>((step - samples[a].step) / static_cast<double>(samples[b].step - samples[a].step));
++        if (pa.skater.size() != pb.skater.size() || pa.board.size() != pb.board.size()) {
++            frame.pose = t < 0.5f ? pa : pb;
++        } else {
++            frame.pose.root = mp::interpolate(pa.root, pb.root, t);
++            frame.pose.skater.resize(pa.skater.size());
++            frame.pose.board.resize(pa.board.size());
++            for (std::size_t j = 0; j < pa.skater.size(); ++j) frame.pose.skater[j] = mp::interpolate(pa.skater[j], pb.skater[j], t);
++            for (std::size_t j = 0; j < pa.board.size(); ++j) frame.pose.board[j] = mp::interpolate(pa.board[j], pb.board[j], t);
++        }
++        const auto& ca = samples[a].camera;
++        const auto& cb = samples[b].camera;
++        const auto mix = [t](const std::array<float, 3>& x, const std::array<float, 3>& y) {
++            return std::array<float, 3>{x[0] + (y[0] - x[0]) * t, x[1] + (y[1] - x[1]) * t, x[2] + (y[2] - x[2]) * t};
++        };
++        frame.camera = {mix(ca.position, cb.position), mix(ca.forward, cb.forward), mix(ca.up, cb.up), ca.fov + (cb.fov - ca.fov) * t};
++        return frame;
++    }
++
++private:
++    struct Decoded {
++        std::size_t index = static_cast<std::size_t>(-1);
++        multiplayer::pose_codec::QuantPose pose;
++    };
++    const multiplayer::pose_codec::QuantPose* decoded(std::size_t i) {
++        namespace pc = multiplayer::pose_codec;
++        for (auto& d : cache_)
++            if (d.index == i) return &d.pose;
++        // From the sample before when it is kept, else from the nearest whole one before.
++        std::size_t from = i;
++        std::optional<pc::QuantPose> pose;
++        for (auto& d : cache_)
++            if (i > 0 && d.index == i - 1) {
++                pose = d.pose;
++                from = i;
++            }
++        if (!pose) {
++            from = i;
++            while (from > 0 && !pc::whole(track_.samples[from].pose)) --from;
++            if (!pc::whole(track_.samples[from].pose)) return nullptr;
++        }
++        for (std::size_t k = from; k <= i; ++k) {
++            auto next = pc::decode(track_.samples[k].pose, pose ? &*pose : nullptr);
++            if (!next) return nullptr;
++            pose = std::move(next);
++        }
++        // Into the slot not holding the one before, so the pair stays.
++        auto& slot = cache_[0].index == i - 1 ? cache_[1] : cache_[0];
++        slot.index = i;
++        slot.pose = std::move(*pose);
++        return &slot.pose;
++    }
++    Track track_;
++    std::array<Decoded, 2> cache_{};
++};
++} // namespace dingosdk::ghost_file
 diff --git a/Extension/Plugins/line_file.h b/Extension/Plugins/line_file.h
 new file mode 100644
-index 0000000..2d0b637
+index 0000000..312c1a4
 --- /dev/null
 +++ b/Extension/Plugins/line_file.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,85 @@
 +#pragma once
 +#include "Engine/Game/Input/pad_output.h"
 +#include <cstdint>
@@ -697,7 +1048,10 @@ index 0000000..2d0b637
 +// the sizes in the header saying so. The file is the header, then the payload, compressed (the runtime's).
 +namespace dingosdk::line_file {
 +inline constexpr char magic[4] = {'R', 'T', 'K', 'L'};
-+inline constexpr std::uint32_t version = 1;
++// 1: the header, then the payload. 2: the header, a u32 note size and the note (what ReTake keeps of the line, its
++// name and where it starts, as text), then the payload: one file is a whole line, to send to someone.
++inline constexpr std::uint32_t version = 2;
++inline constexpr std::uint32_t most_note = 1u << 20;
 +
 +#pragma pack(push, 1)
 +struct Header {
@@ -734,15 +1088,22 @@ index 0000000..2d0b637
 +    return h;
 +}
 +
-+// Empty when the header is one this build can load, else why not.
-+template <class Snapshot> std::string check(const Header& h, std::size_t file_size, std::size_t most_steps) {
++// Where the payload starts: after the header, and in version 2 the note.
++inline std::size_t payload_at(const Header& h, std::uint32_t note_size) {
++    return sizeof(Header) + (h.version >= 2 ? sizeof(std::uint32_t) + note_size : 0);
++}
++
++// Empty when the header is one this build can load, else why not. `note_size` is the note's, read after the header
++// (version 2), else 0.
++template <class Snapshot> std::string check(const Header& h, std::size_t file_size, std::size_t most_steps, std::uint32_t note_size = 0) {
 +    if (std::memcmp(h.magic, magic, sizeof(magic)) != 0) return "it is not a ReTake line";
-+    if (h.version != version) return "it was saved by another version of ReTake";
++    if (h.version != 1 && h.version != 2) return "it was saved by another version of ReTake";
++    if (note_size > most_note) return "its note is too long";
 +    if (h.pad_size != sizeof(input::PadOutput) || h.snapshot_size != sizeof(Snapshot)) return "it was saved by another build of ReTake's ReSkate.dll";
 +    if (h.inputs == 0 || h.inputs > most_steps || h.frames > most_steps) return "its length is not a line's";
 +    const auto raw = static_cast<std::uint64_t>(h.inputs) * sizeof(input::PadOutput) + static_cast<std::uint64_t>(h.frames) * sizeof(Snapshot);
 +    if (h.raw_size != raw) return "its sizes do not add up";
-+    if (h.packed_size != file_size - sizeof(Header)) return "the file is cut short";
++    if (file_size < payload_at(h, note_size) || h.packed_size != file_size - payload_at(h, note_size)) return "the file is cut short";
 +    return {};
 +}
 +
@@ -758,10 +1119,10 @@ index 0000000..2d0b637
 +}
 +}
 diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
-index 8abd30b..32439db 100644
+index 8abd30b..79441c9 100644
 --- a/Extension/Plugins/plugin_api_world.cpp
 +++ b/Extension/Plugins/plugin_api_world.cpp
-@@ -2930,6 +2930,334 @@ struct WorldApi {
+@@ -2930,6 +2930,499 @@ struct WorldApi {
          lua_setfield(L, -2, "playstation");
          return 1;
      }
@@ -1034,7 +1395,26 @@ index 8abd30b..32439db 100644
 +        need(L, plugin, "tas", "reskate.tas.line_export");
 +        need(L, plugin, "files", "reskate.tas.line_export");
 +        const auto path = data_path(L, 1, false);
-+        return result(L, game(plugin).tas_line_export(plugin.id(), path));
++        std::size_t length = 0;
++        const char* note = luaL_optlstring(L, 2, "", &length);
++        return result(L, game(plugin).tas_line_export(plugin.id(), path, std::string_view(note, length)));
++    }
++    // tas.line_note(path): a line file's note, the text saved with it (tas.line_export's second argument), without
++    // loading the line: "" for a file saved before notes; nil and why for one that is not a line this build loads.
++    static int tas_line_note(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_note");
++        need(L, plugin, "files", "reskate.tas.line_note");
++        const auto path = data_path(L, 1, false);
++        std::string why;
++        const auto note = game(plugin).tas_line_note(plugin.id(), path, why);
++        if (!note) {
++            lua_pushnil(L);
++            lua_pushlstring(L, why.data(), why.size());
++            return 2;
++        }
++        lua_pushlstring(L, note->data(), note->size());
++        return 1;
 +    }
 +    static int tas_line_import(lua_State* L) {
 +        auto& plugin = plugin_of(L);
@@ -1042,6 +1422,146 @@ index 8abd30b..32439db 100644
 +        need(L, plugin, "files", "reskate.tas.line_import");
 +        const auto path = data_path(L, 1, false);
 +        return result(L, game(plugin).tas_line_import(plugin.id(), path, tas_controller(L, 2)));
++    }
++    // tas.ghost_probe(show, x, y, z): research for a ghost that is the skater itself: a real skater model in the
++    // player's outfit, posed as the skater is now, moved by (x, y, z) metres. Called each tick while shown; false
++    // hides it. true, or false and why not.
++    static int tas_ghost_probe(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_probe");
++        const bool show = lua_toboolean(L, 1) != 0;
++        const std::array<float, 3> offset{static_cast<float>(luaL_optnumber(L, 2, 0)), static_cast<float>(luaL_optnumber(L, 3, 0)),
++                                          static_cast<float>(luaL_optnumber(L, 4, 0))};
++        for (const float value : offset)
++            if (!std::isfinite(value) || std::fabs(value) > 100.0f) luaL_argerror(L, 2, "an offset of at most 100 m");
++        return result(L, game(plugin).tas_ghost_probe(show, offset));
++    }
++    // ---- ghost lines ----------------------------------------------------------------------------------------------
++    // tas.ghost_record(on): recording a ghost of the local skater on (what was recorded is cleared) or off (kept, to
++    // save). tas.ghost_capture(step): the skater as it is now, as that step of the ghost; each tick while recording.
++    static int tas_ghost_record(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_record");
++        return result(L, game(plugin).tas_ghost_record(lua_toboolean(L, 1) != 0));
++    }
++    static int tas_ghost_capture(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_capture");
++        const double step = luaL_checknumber(L, 1);
++        if (!(step >= 0 && step < 4294967295.0)) luaL_argerror(L, 1, "a step is a whole number from 0");
++        return result(L, game(plugin).tas_ghost_capture(static_cast<std::uint32_t>(step)));
++    }
++    // tas.ghost_status(): {recording, recorded, recorded_first, recorded_last, recorded_outfit, loaded, loaded_first,
++    // loaded_last, loaded_outfit, shown, file}.
++    static int tas_ghost_status(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_status");
++        const auto s = game(plugin).tas_ghost_status();
++        lua_createtable(L, 0, 11);
++        lua_pushboolean(L, s.recording);
++        lua_setfield(L, -2, "recording");
++        lua_pushnumber(L, static_cast<double>(s.recorded));
++        lua_setfield(L, -2, "recorded");
++        lua_pushnumber(L, s.recorded_first);
++        lua_setfield(L, -2, "recorded_first");
++        lua_pushnumber(L, s.recorded_last);
++        lua_setfield(L, -2, "recorded_last");
++        lua_pushboolean(L, s.recorded_outfit);
++        lua_setfield(L, -2, "recorded_outfit");
++        lua_pushnumber(L, static_cast<double>(s.loaded));
++        lua_setfield(L, -2, "loaded");
++        lua_pushnumber(L, s.loaded_first);
++        lua_setfield(L, -2, "loaded_first");
++        lua_pushnumber(L, s.loaded_last);
++        lua_setfield(L, -2, "loaded_last");
++        lua_pushboolean(L, s.loaded_outfit);
++        lua_setfield(L, -2, "loaded_outfit");
++        lua_pushboolean(L, s.shown);
++        lua_setfield(L, -2, "shown");
++        lua_pushlstring(L, s.file.data(), s.file.size());
++        lua_setfield(L, -2, "file");
++        return 1;
++    }
++    // tas.ghost_export(path, note) and tas.ghost_load(path): in the background, tas.ghost_status().file says how it went.
++    static int tas_ghost_export(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_export");
++        need(L, plugin, "files", "reskate.tas.ghost_export");
++        const auto path = data_path(L, 1, false);
++        std::size_t length = 0;
++        const char* note = luaL_optlstring(L, 2, "", &length);
++        return result(L, game(plugin).tas_ghost_export(plugin.id(), path, std::string_view(note, length)));
++    }
++    static int tas_ghost_note(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_note");
++        need(L, plugin, "files", "reskate.tas.ghost_note");
++        const auto path = data_path(L, 1, false);
++        std::string why;
++        const auto note = game(plugin).tas_ghost_note(plugin.id(), path, why);
++        if (!note) {
++            lua_pushnil(L);
++            lua_pushlstring(L, why.data(), why.size());
++            return 2;
++        }
++        lua_pushlstring(L, note->data(), note->size());
++        return 1;
++    }
++    static int tas_ghost_load(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_load");
++        need(L, plugin, "files", "reskate.tas.ghost_load");
++        const auto path = data_path(L, 1, false);
++        return result(L, game(plugin).tas_ghost_load(plugin.id(), path));
++    }
++    // tas.ghost_frame(step) and tas.ghost_show(step): the loaded ghost at that step (fractional between two):
++    // {root, head, camera = {position, forward, up, fov}, ended, shown}, or nil and why. ghost_show also shows its
++    // skater, so: each tick while shown. tas.ghost_hide() takes it away.
++    static int ghost_frame_of(lua_State* L, bool show) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", show ? "reskate.tas.ghost_show" : "reskate.tas.ghost_frame");
++        const double step = luaL_checknumber(L, 1);
++        if (!std::isfinite(step)) luaL_argerror(L, 1, "a step is a number");
++        std::string why;
++        const auto frame = game(plugin).tas_ghost_frame(step, show, why);
++        if (!frame) {
++            lua_pushnil(L);
++            lua_pushlstring(L, why.data(), why.size());
++            return 2;
++        }
++        lua_createtable(L, 0, 5);
++        lua_pushvector(L, frame->root[0], frame->root[1], frame->root[2]);
++        lua_setfield(L, -2, "root");
++        lua_pushvector(L, frame->head[0], frame->head[1], frame->head[2]);
++        lua_setfield(L, -2, "head");
++        lua_createtable(L, 0, 4);
++        lua_pushvector(L, frame->camera_position[0], frame->camera_position[1], frame->camera_position[2]);
++        lua_setfield(L, -2, "position");
++        lua_pushvector(L, frame->camera_forward[0], frame->camera_forward[1], frame->camera_forward[2]);
++        lua_setfield(L, -2, "forward");
++        lua_pushvector(L, frame->camera_up[0], frame->camera_up[1], frame->camera_up[2]);
++        lua_setfield(L, -2, "up");
++        lua_pushnumber(L, frame->fov);
++        lua_setfield(L, -2, "fov");
++        lua_setfield(L, -2, "camera");
++        lua_pushboolean(L, frame->ended);
++        lua_setfield(L, -2, "ended");
++        lua_pushboolean(L, frame->shown);
++        lua_setfield(L, -2, "shown");
++        return 1;
++    }
++    static int tas_ghost_frame(lua_State* L) { return ghost_frame_of(L, false); }
++    static int tas_ghost_show(lua_State* L) { return ghost_frame_of(L, true); }
++    static int tas_ghost_hide(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.ghost_hide");
++        game(plugin).tas_ghost_hide();
++        return 0;
++    }
++    static int tas_sensor_start(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.sensor_start");
++        return result(L, game(plugin).tas_sensor_start());
 +    }
 +    static int tas_line_file_status(lua_State* L) {
 +        auto& plugin = plugin_of(L);
@@ -1069,6 +1589,12 @@ index 8abd30b..32439db 100644
 +        lua_setfield(L, -2, "replay_off");
 +        lua_pushnumber(L, static_cast<double>(s.replay_off_at));
 +        lua_setfield(L, -2, "replay_off_at");
++        if (s.sensor >= 0) {
++            lua_pushboolean(L, s.sensor == 1);
++            lua_setfield(L, -2, "sensor_started");
++        }
++        lua_pushnumber(L, static_cast<double>(s.sensor_writes));
++        lua_setfield(L, -2, "sensor_writes");
 +        lua_pushnumber(L, static_cast<double>(s.since_spawn));
 +        lua_setfield(L, -2, "since_spawn");
 +        lua_pushnumber(L, static_cast<double>(s.unread));
@@ -1096,7 +1622,7 @@ index 8abd30b..32439db 100644
      // A whole replacement for a real controller, in the same units as input.gamepad().
      static int input_write(lua_State* L) {
          auto& plugin = plugin_of(L);
-@@ -3274,6 +3602,11 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+@@ -3274,6 +3767,15 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
      add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
      add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
      add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
@@ -1104,7 +1630,11 @@ index 8abd30b..32439db 100644
 +        {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
 +        {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
 +        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
-+        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status}});
++        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status},
++        {"line_note", tas_line_note}, {"ghost_probe", tas_ghost_probe}, {"sensor_start", tas_sensor_start},
++        {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
++        {"ghost_export", tas_ghost_export}, {"ghost_note", tas_ghost_note}, {"ghost_load", tas_ghost_load},
++        {"ghost_frame", tas_ghost_frame}, {"ghost_show", tas_ghost_show}, {"ghost_hide", tas_ghost_hide}});
      add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
      add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                    {"ready", entities_ready}, {"blueprints", entities_blueprints},
@@ -1129,10 +1659,10 @@ index 173bdd7..6decf4f 100644
              if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
              if (has("capture")) actions.push_back("record your screen");
 diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
-index 61689ee..a410ecf 100644
+index 61689ee..18daf47 100644
 --- a/Extension/Plugins/plugin_game.h
 +++ b/Extension/Plugins/plugin_game.h
-@@ -143,7 +143,39 @@ struct PhysicsStep {
+@@ -143,7 +143,54 @@ struct PhysicsStep {
      struct Pose { EffectMatrix transform{}; Vec3 velocity{}; };
      std::map<std::string, Pose, std::less<>> poses; // all available local bodies, including airborne ones
      std::optional<std::uint32_t> state;
@@ -1155,6 +1685,8 @@ index 61689ee..a410ecf 100644
 +    std::uint64_t clock_reads{}; // reads of the clock the hook has seen
 +    float replay_off{};          // the last run up: the most the board was from its recording before a step was put back, m
 +    std::size_t replay_off_at{}; // and at which step
++    int sensor{-1};              // the skater's sensor block: 1 started (ridden since the game started), 0 not, -1 unread
++    std::size_t sensor_writes{}; // starts written by tas_sensor_start (research)
 +};
 +// A line: one recording from a standing start that can go back to any step of it (reskate.tas.line).
 +struct TasLine {
@@ -1166,13 +1698,26 @@ index 61689ee..a410ecf 100644
 +    std::array<float, 16> board{};
 +    std::array<std::array<float, 3>, 26> skeleton{};
 +};
++// Ghost lines (Extension/Plugins/ghost_file.h): the one being recorded, the one loaded to show, and the file thread.
++struct TasGhostStatus {
++    bool recording{}, recorded_outfit{}, loaded_outfit{}, shown{};
++    std::size_t recorded{}, loaded{};                  // samples, a step each
++    std::uint32_t recorded_first{}, recorded_last{}, loaded_first{}, loaded_last{};
++    std::string file; // "saving", "loading", "saved", "loaded", why the last failed, or empty before the first
++};
++// The loaded ghost at a step: where its skater is, what its camera saw, whether that is past its end.
++struct TasGhostFrame {
++    std::array<float, 3> root{}, head{}, camera_position{}, camera_forward{}, camera_up{};
++    float fov{};
++    bool ended{}, shown{};
++};
 +// What a script's playing puts back of the motion taken when it was recorded.
 +// `lock`: every step of the playing, the bodies are put back as that step was recorded, so nothing can drift.
 +enum class TasRestore { none, board, all, lock };
  // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
  // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
  struct LaunchShape {
-@@ -1076,6 +1108,48 @@ public:
+@@ -1076,6 +1123,74 @@ public:
      virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
      virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
      virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
@@ -1215,23 +1760,50 @@ index 61689ee..a410ecf 100644
 +    // A line saved to `path` in the plugin's data folder, and loaded back as this plugin's line on `controller`, stopped
 +    // where it ended (Extension/Plugins/line_file.h). Both run in the background: tas_line_file_status says "saving",
 +    // "loading", "saved", "loaded", why one failed, or nothing before the first.
-+    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
++    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
++    // A line file's note (what ReTake keeps of it, as text; empty in a file saved before notes), without loading it.
++    virtual std::optional<std::string> tas_line_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
++        why = unavailable;
++        return std::nullopt;
++    }
 +    virtual std::string tas_line_import(std::string_view /*plugin*/, std::string_view /*path*/, unsigned /*controller*/) { return unavailable; }
 +    virtual std::string tas_line_file_status() { return {}; }
++    // Research: a real skater model posed as the local skater, moved by `offset`; false hides it (a ghost's test).
++    virtual std::string tas_ghost_probe(bool /*show*/, std::array<float, 3> /*offset*/) { return unavailable; }
++    // Ghost lines: recording the local skater a step at a time (`on` clears what was recorded), saving that to a
++    // file in the plugin's data folder and loading one back (both in the background), and showing the loaded one as a
++    // real skater in its outfit, at any step, in the last multiplayer slot. Offline only.
++    virtual std::string tas_ghost_record(bool /*on*/) { return unavailable; }
++    virtual std::string tas_ghost_capture(std::uint32_t /*step*/) { return unavailable; }
++    virtual TasGhostStatus tas_ghost_status() { return {}; }
++    virtual std::string tas_ghost_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
++    virtual std::optional<std::string> tas_ghost_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
++        why = unavailable;
++        return std::nullopt;
++    }
++    virtual std::string tas_ghost_load(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
++    virtual std::optional<TasGhostFrame> tas_ghost_frame(double /*step*/, bool /*show*/, std::string& why) {
++        why = unavailable;
++        return std::nullopt;
++    }
++    virtual void tas_ghost_hide() {}
++    // Research: the skater's sensor block written as it is in a ridden skater, on the next physics step.
++    virtual std::string tas_sensor_start() { return unavailable; }
      // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
      // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
      virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
 diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
-index 5c0acee..cacc622 100644
+index 5c0acee..4858c7a 100644
 --- a/Extension/Plugins/plugin_game_runtime.cpp
 +++ b/Extension/Plugins/plugin_game_runtime.cpp
-@@ -28,8 +28,15 @@
+@@ -28,8 +28,16 @@
  #include "Engine/Vfs/mod_catalog.h"
  #include "Engine/Core/Log/logging.h"
  #include <mutex>
 +#include <thread>
 +#include "zstd.h"
 +#include "line_file.h"
++#include "ghost_file.h"
  #include "Extension/Assets/live_mods.h"
  #include "Extension/Skater/game_speed.h"
 +#include "Extension/Skater/motion_snapshot.h"
@@ -1241,7 +1813,14 @@ index 5c0acee..cacc622 100644
  #include "Extension/Skater/launches.h"
  #include "Extension/Skater/pad_hide.h"
  #include "Engine/Game/Skater/first_person_cycle.h"
-@@ -46,6 +53,7 @@
+@@ -41,11 +49,14 @@
+ #include "plugin_camera.h"
+ #include "Extension/Multiplayer/Session/session.h"
+ #include "Extension/Multiplayer/Remote/stand_ins.h"
++#include "Extension/Multiplayer/Remote/native_cosmetics.h"
++#include "Extension/Multiplayer/Session/peer_slots.h"
+ #include "Extension/Music/external_player.h"
+ #include "Extension/Music/music_inject.h"
  #include "Extension/Music/spotify_station.h"
  #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
  #include "Extension/Profile/local_profile_runtime.h"
@@ -1249,7 +1828,7 @@ index 5c0acee..cacc622 100644
  #include "Extension/Settings/named_settings.h"
  #include "Engine/Game/Settings/multiplayer_settings_lock.h"
  #include "Extension/Skater/ai_skaters.h"
-@@ -75,6 +83,7 @@
+@@ -75,6 +86,7 @@
  #include "Extension/UI/Overlay/viewmodel.h"
  #include "Extension/UI/Overlay/scripted_pad.h"
  #include "Engine/Game/Input/pad_output.h"
@@ -1257,7 +1836,7 @@ index 5c0acee..cacc622 100644
  #include "Engine/Game/Skater/animation_values.h"
  #include "Extension/Skater/grind_target.h"
  #include "Engine/Game/Input/gameplay_options.h"
-@@ -87,6 +96,7 @@
+@@ -87,6 +99,7 @@
  #include <shellapi.h>
  #include <algorithm>
  #include <array>
@@ -1265,7 +1844,7 @@ index 5c0acee..cacc622 100644
  #include <cmath>
  #include <format>
  #include <fstream>
-@@ -697,6 +707,12 @@ public:
+@@ -697,6 +710,12 @@ public:
              for (std::size_t i = 1; i < skater_body::count; ++i) {
                  const auto& c = s.body.bodies[i];
                  if (const auto& pose = s.poses[i]) step.poses.emplace(skater_body::names[i], PhysicsStep::Pose{pose->transform, pose->velocity});
@@ -1278,7 +1857,7 @@ index 5c0acee..cacc622 100644
                  if (!c.touching) continue;
                  const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
                  step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
-@@ -1085,6 +1101,763 @@ public:
+@@ -1085,6 +1104,1178 @@ public:
              axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
          return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
      }
@@ -1294,6 +1873,11 @@ index 5c0acee..cacc622 100644
 +        // the recording had it then (the step's own error, with no lag between the two), the most and its step.
 +        std::atomic<float> replay_off{};
 +        std::atomic<std::size_t> replay_off_at{};
++        // The skater's sensor block (skater_state.h): read each step, 1 started, 0 not, -1 unread. A replay of a loaded
++        // line goes another way on rails while it is not started. Research: started by writing what it holds started.
++        std::atomic<int> sensor{-1};
++        std::atomic<bool> sensor_start_wanted{};
++        std::atomic<std::size_t> sensor_writes{};
 +        std::atomic<std::size_t> since_spawn{};
 +        // Every step of the recording, and whether a playing is held to them. The physics thread's: a run
 +        // always begins from a step of it (tas_wait).
@@ -1488,6 +2072,36 @@ index 5c0acee..cacc622 100644
 +        m.history_count = std::min(m.history_count + 1, size);
 +        m.history_length.store(m.history_count, std::memory_order_release);
 +    }
++    static bool tas_poke(std::uintptr_t address, const void* data, std::size_t size) noexcept {
++        if (address < 0x10000) return false;
++        __try {
++            std::memcpy(reinterpret_cast<void*>(address), data, size);
++            return true;
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            return false;
++        }
++    }
++    // The sensor block (skater_state.h): asked to, written as it is in a ridden skater; then read, for status().
++    static void tas_sensor_step(TasMotion& m, const NoBailSkater& skater) noexcept {
++        namespace state = addr::skater_state;
++        if (!skater.context) {
++            m.sensor.store(-1, std::memory_order_release);
++            return;
++        }
++        if (m.sensor_start_wanted.exchange(false, std::memory_order_acq_rel)) {
++            const float one = 1.0f, gain = 0.7f, zero = 0.0f;
++            const std::array<float, 3> none{};
++            if (tas_poke(skater.context + state::context_sensor_on_a, &one, sizeof(one)) &&
++                tas_poke(skater.context + state::context_sensor_on_b, &one, sizeof(one)) &&
++                tas_poke(skater.context + state::context_sensor_gain, &gain, sizeof(gain)) &&
++                tas_poke(skater.context + state::context_sensor_far, &zero, sizeof(zero)) &&
++                tas_poke(skater.context + state::context_sensor_normal, none.data(), sizeof(none)))
++                m.sensor_writes.fetch_add(1, std::memory_order_relaxed);
++        }
++        float a{}, b{};
++        const bool read = memory::peek(skater.context + state::context_sensor_on_a, a) && memory::peek(skater.context + state::context_sensor_on_b, b);
++        m.sensor.store(!read ? -1 : (a == 1.0f && b == 1.0f) ? 1 : 0, std::memory_order_release);
++    }
 +    static void tas_on_step(const NoBailSkater& skater, float, bool) noexcept {
 +        virtual_time::on_step();
 +        auto& m = tas_motion();
@@ -1499,6 +2113,7 @@ index 5c0acee..cacc622 100644
 +            m.line_rebuilt = true;
 +        }
 +        m.since_spawn.store(since, std::memory_order_release);
++        tas_sensor_step(m, skater);
 +        try {
 +            std::lock_guard lock(m.waiting_mutex);
 +            if (m.waiting && since == m.waiting->at) {
@@ -1862,7 +2477,35 @@ index 5c0acee..cacc622 100644
 +        state.outcome = std::move(outcome);
 +        state.running = false;
 +    }
-+    std::string tas_line_export(std::string_view plugin, std::string_view path) override {
++    // A line file's header and its note (line_file.h); empty when it is one this build can load, else why not.
++    static std::string read_line_head(std::ifstream& in, std::uint64_t size, line_file::Header& header, std::string& note) {
++        if (size > line_file_most_bytes || size < sizeof(header) || !in.read(reinterpret_cast<char*>(&header), sizeof(header)))
++            return "it is not a ReTake line";
++        std::uint32_t note_size = 0;
++        if (header.version >= 2) {
++            if (!in.read(reinterpret_cast<char*>(&note_size), sizeof(note_size)) || note_size > line_file::most_note) return "it is not a ReTake line";
++            note.assign(note_size, '\0');
++            if (note_size && !in.read(note.data(), note_size)) return "the file is cut short";
++        }
++        return line_file::check<motion_snapshot::Snapshot>(header, static_cast<std::size_t>(size), input::StepScript::max_steps, note_size);
++    }
++    std::optional<std::string> tas_line_note(std::string_view plugin, std::string_view path, std::string& why) override {
++        std::filesystem::path root, file;
++        if (why = data_file(plugin, path, root, file); !why.empty()) return std::nullopt;
++        std::error_code error;
++        const auto size = std::filesystem::file_size(file, error);
++        std::ifstream in(file, std::ios::binary);
++        if (error || !in) {
++            why = "there is no such line";
++            return std::nullopt;
++        }
++        line_file::Header header{};
++        std::string note;
++        if (why = read_line_head(in, size, header, note); !why.empty()) return std::nullopt;
++        return note;
++    }
++    std::string tas_line_export(std::string_view plugin, std::string_view path, std::string_view note_text) override {
++        if (note_text.size() > line_file::most_note) return "the note is too long";
 +        auto& m = tas_motion();
 +        auto inputs = input::step_script().recorded();
 +        if (inputs.empty()) return "no line is recorded";
@@ -1874,7 +2517,7 @@ index 5c0acee..cacc622 100644
 +            frames.assign(m.frames.begin(), m.frames.begin() + static_cast<std::ptrdiff_t>(std::min(m.frames.size(), inputs.size())));
 +        }
 +        if (!line_file_begin("saving")) return "a line is being saved or loaded";
-+        std::thread([inputs = std::move(inputs), frames = std::move(frames), file] {
++        std::thread([inputs = std::move(inputs), frames = std::move(frames), file, note = std::string(note_text)] {
 +            std::string outcome = "saved";
 +            try {
 +                const auto raw = line_file::pack(inputs, frames);
@@ -1890,7 +2533,10 @@ index 5c0acee..cacc622 100644
 +                    temporary += ".tmp";
 +                    {
 +                        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++                        const auto note_size = static_cast<std::uint32_t>(note.size());
 +                        if (!out || !out.write(reinterpret_cast<const char*>(&header), sizeof(header)) ||
++                            !out.write(reinterpret_cast<const char*>(&note_size), sizeof(note_size)) ||
++                            (note_size && !out.write(note.data(), note_size)) ||
 +                            !out.write(packed.data(), static_cast<std::streamsize>(packed_size)))
 +                            outcome = "the file cannot be written";
 +                    }
@@ -1922,13 +2568,11 @@ index 5c0acee..cacc622 100644
 +                std::error_code error;
 +                const auto size = std::filesystem::file_size(file, error);
 +                line_file::Header header{};
++                std::string note;
 +                std::ifstream in(file, std::ios::binary);
 +                if (error || !in) {
 +                    outcome = "there is no such line";
-+                } else if (size > line_file_most_bytes || size < sizeof(header) || !in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
-+                    outcome = "it is not a ReTake line";
-+                } else if (auto why = line_file::check<motion_snapshot::Snapshot>(header, static_cast<std::size_t>(size), input::StepScript::max_steps);
-+                           !why.empty()) {
++                } else if (auto why = read_line_head(in, size, header, note); !why.empty()) {
 +                    outcome = std::move(why);
 +                } else {
 +                    std::string packed(static_cast<std::size_t>(header.packed_size), '\0');
@@ -1972,6 +2616,350 @@ index 5c0acee..cacc622 100644
 +        std::lock_guard lock(state.mutex);
 +        return state.running ? state.doing : state.outcome;
 +    }
++    // Research, for a ghost that is the skater itself: a real skater model, in the player's outfit, posed as the local
++    // skater is now and moved by `offset`, as multiplayer shows another player (Extension/Multiplayer/Remote: the same
++    // capture, actor and cosmetics). Called each tick while shown; false hides it. Offline only, in the last player
++    // slot, which no one uses offline.
++    std::uint64_t ghost_generation_{};
++    bool ghost_shown_{};
++    std::string tas_ghost_probe(bool show, std::array<float, 3> offset) override {
++        if (multiplayer_session_active()) return "never in a multiplayer session";
++        const multiplayer::PeerScope scope(multiplayer::max_remote_players - 1);
++        if (!show) {
++            if (ghost_shown_) multiplayer::remove_remote(base_);
++            ghost_shown_ = false;
++            ghost_generation_ = 0;
++            return {};
++        }
++        const auto client = skater_movement::client();
++        if (!client) return "the game has no client yet";
++        auto local = multiplayer::capture_local(base_, client, true);
++        if (!local.ready) return local.detail.empty() ? std::string("the skater could not be read") : local.detail;
++        auto pose = local.pose;
++        multiplayer::offset_pose(pose, offset);
++        std::string detail;
++        ghost_shown_ = true;
++        if (!multiplayer::show_remote(base_, client, local, pose, detail)) return detail.empty() ? std::string("the model is not shown yet") : detail;
++        const auto generation = multiplayer::remote_skater_generation();
++        if (generation != ghost_generation_) {
++            std::string why;
++            if (auto appearance = multiplayer::capture_cosmetics(base_, local, why)) {
++                multiplayer::update_remote_cosmetics(base_, local, *appearance, why);
++                ghost_generation_ = generation;
++            }
++        }
++        return {};
++    }
++    // ---- ghost lines (ghost_file.h) ------------------------------------------------------------------------------
++    // Recorded here, a pose a step from the local skater as multiplayer captures it for others, with the camera; shown
++    // as multiplayer shows another player, in the last player slot (as the probe above), in the outfit the file
++    // keeps. Recording and showing are the client thread's (plugin calls); the file thread only hands a loaded ghost
++    // over, under the mutex.
++    struct Ghosts {
++        std::mutex mutex;
++        bool recording{};
++        ghost_file::Recorder recorder;
++        std::optional<multiplayer::Appearance> recorded_outfit;
++        std::unique_ptr<ghost_file::Player> player; // the ghost loaded to show
++        std::optional<multiplayer::Appearance> outfit;
++        std::uint64_t serial{}; // a new loaded ghost, so its outfit goes on again
++        bool running{};
++        std::string doing, outcome; // the file thread's "saving" or "loading"; "saved", "loaded", or why not
++    };
++    static Ghosts& ghosts() {
++        static auto* value = new Ghosts; // a file thread may still run at exit
++        return *value;
++    }
++    bool ghost_shown_now_{};
++    std::uint64_t ghost_shown_serial_{}, ghost_outfit_generation_{};
++    static std::vector<std::uint8_t> encode_outfit(const multiplayer::Appearance& outfit) {
++        multiplayer::Packet p;
++        p.kind = multiplayer::PacketKind::cosmetics;
++        p.session = p.epoch = p.map = p.world = 1;
++        p.appearance = outfit;
++        try {
++            return multiplayer::encode(p);
++        } catch (...) {
++            return {};
++        }
++    }
++    static std::optional<multiplayer::Appearance> decode_outfit(const std::vector<std::uint8_t>& bytes) {
++        if (bytes.empty()) return std::nullopt;
++        const auto p = multiplayer::decode(bytes);
++        if (!p || p->kind != multiplayer::PacketKind::cosmetics || !multiplayer::valid_appearance(p->appearance)) return std::nullopt;
++        return p->appearance;
++    }
++    std::string tas_ghost_record(bool on) override {
++        if (multiplayer_session_active()) return "never in a multiplayer session";
++        auto& g = ghosts();
++        std::lock_guard lock(g.mutex);
++        if (on) {
++            g.recorder.clear();
++            g.recorded_outfit.reset();
++        }
++        g.recording = on;
++        return {};
++    }
++    // The local skater as it is now, at `step` of the line: its pose, the camera, and (until it has it) its outfit.
++    std::string tas_ghost_capture(std::uint32_t step) override {
++        auto& g = ghosts();
++        {
++            std::lock_guard lock(g.mutex);
++            if (!g.recording) return "no ghost is being recorded";
++        }
++        const auto client = skater_movement::client();
++        if (!client) return "the game has no client yet";
++        const auto local = multiplayer::capture_local(base_, client, true);
++        if (!local.ready) return local.detail.empty() ? std::string("the skater could not be read") : local.detail;
++        if (local.pose.skater.empty()) return "the skater's pose could not be read";
++        ghost_file::Camera camera;
++        if (const auto view = camera_view()) camera = {view->position, view->forward, view->up, view->fov};
++        std::optional<multiplayer::Appearance> outfit;
++        bool need_outfit{};
++        {
++            std::lock_guard lock(g.mutex);
++            need_outfit = !g.recorded_outfit;
++        }
++        if (need_outfit) {
++            std::string why;
++            outfit = multiplayer::capture_cosmetics(base_, local, why);
++        }
++        std::lock_guard lock(g.mutex);
++        if (!g.recording) return "no ghost is being recorded";
++        if (outfit) g.recorded_outfit = std::move(outfit);
++        if (!g.recorder.add(step, local.pose, camera)) return "that step is before the last one, or the ghost is full";
++        return {};
++    }
++    TasGhostStatus tas_ghost_status() override {
++        auto& g = ghosts();
++        std::lock_guard lock(g.mutex);
++        TasGhostStatus s;
++        s.recording = g.recording;
++        s.recorded = g.recorder.track.samples.size();
++        if (s.recorded) {
++            s.recorded_first = g.recorder.track.samples.front().step;
++            s.recorded_last = g.recorder.track.samples.back().step;
++        }
++        s.recorded_outfit = g.recorded_outfit.has_value();
++        if (g.player) {
++            s.loaded = g.player->track().samples.size();
++            s.loaded_first = g.player->first_step();
++            s.loaded_last = g.player->last_step();
++            s.loaded_outfit = g.outfit.has_value();
++        }
++        s.shown = ghost_shown_now_;
++        s.file = g.running ? g.doing : g.outcome;
++        return s;
++    }
++    static bool ghost_file_begin(const char* doing) {
++        auto& g = ghosts();
++        std::lock_guard lock(g.mutex);
++        if (g.running) return false;
++        g.running = true;
++        g.doing = doing;
++        g.outcome.clear();
++        return true;
++    }
++    static void ghost_file_end(std::string outcome) {
++        auto& g = ghosts();
++        std::lock_guard lock(g.mutex);
++        g.outcome = std::move(outcome);
++        g.running = false;
++    }
++    static std::string read_ghost_head(std::ifstream& in, std::uint64_t size, ghost_file::Header& header, std::string& note) {
++        if (size < sizeof(header) || !in.read(reinterpret_cast<char*>(&header), sizeof(header))) return "it is not a ghost line";
++        if (auto why = ghost_file::check(header, size); !why.empty()) return why;
++        note.assign(header.note_size, '\0');
++        if (header.note_size && !in.read(note.data(), header.note_size)) return "the file is cut short";
++        return {};
++    }
++    // The recorded ghost to a file in the plugin's data folder, with `note`; in the background.
++    std::string tas_ghost_export(std::string_view plugin, std::string_view path, std::string_view note_text) override {
++        if (note_text.size() > ghost_file::most_note) return "the note is too long";
++        std::filesystem::path root, file;
++        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
++        ghost_file::Track track;
++        {
++            auto& g = ghosts();
++            std::lock_guard lock(g.mutex);
++            if (g.recording) return "the ghost is still being recorded";
++            if (g.recorder.track.samples.size() < 2) return "no ghost is recorded";
++            track = g.recorder.track;
++            if (g.recorded_outfit) track.appearance = encode_outfit(*g.recorded_outfit);
++        }
++        if (!ghost_file_begin("saving")) return "a ghost is being saved or loaded";
++        std::thread([track = std::move(track), file, note = std::string(note_text)] {
++            std::string outcome = "saved";
++            try {
++                const auto raw = ghost_file::pack(track);
++                std::string packed(ZSTD_compressBound(raw.size()), '\0');
++                const std::size_t packed_size = ZSTD_compress(packed.data(), packed.size(), raw.data(), raw.size(), 9);
++                if (ZSTD_isError(packed_size)) {
++                    outcome = "the ghost could not be compressed";
++                } else {
++                    const auto header = ghost_file::header_for(note.size(), raw.size(), packed_size);
++                    std::error_code error;
++                    std::filesystem::create_directories(file.parent_path(), error);
++                    auto temporary = file;
++                    temporary += ".tmp";
++                    {
++                        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++                        if (!out || !out.write(reinterpret_cast<const char*>(&header), sizeof(header)) ||
++                            (!note.empty() && !out.write(note.data(), static_cast<std::streamsize>(note.size()))) ||
++                            !out.write(packed.data(), static_cast<std::streamsize>(packed_size)))
++                            outcome = "the file cannot be written";
++                    }
++                    if (outcome == "saved") {
++                        std::filesystem::rename(temporary, file, error);
++                        if (error) outcome = "the file cannot be written";
++                    }
++                    if (outcome != "saved") std::filesystem::remove(temporary, error);
++                }
++            } catch (...) {
++                outcome = "the ghost could not be saved";
++            }
++            ghost_file_end(std::move(outcome));
++        }).detach();
++        return {};
++    }
++    std::optional<std::string> tas_ghost_note(std::string_view plugin, std::string_view path, std::string& why) override {
++        std::filesystem::path root, file;
++        if (why = data_file(plugin, path, root, file); !why.empty()) return std::nullopt;
++        std::error_code error;
++        const auto size = std::filesystem::file_size(file, error);
++        std::ifstream in(file, std::ios::binary);
++        if (error || !in) {
++            why = "there is no such ghost line";
++            return std::nullopt;
++        }
++        ghost_file::Header header{};
++        std::string note;
++        if (why = read_ghost_head(in, size, header, note); !why.empty()) return std::nullopt;
++        return note;
++    }
++    // A ghost file read back as the ghost to show, in the background.
++    std::string tas_ghost_load(std::string_view plugin, std::string_view path) override {
++        std::filesystem::path root, file;
++        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
++        if (!ghost_file_begin("loading")) return "a ghost is being saved or loaded";
++        std::thread([file] {
++            std::string outcome = "loaded";
++            try {
++                std::error_code error;
++                const auto size = std::filesystem::file_size(file, error);
++                ghost_file::Header header{};
++                std::string note;
++                std::ifstream in(file, std::ios::binary);
++                if (error || !in) {
++                    outcome = "there is no such ghost line";
++                } else if (auto why = read_ghost_head(in, size, header, note); !why.empty()) {
++                    outcome = std::move(why);
++                } else {
++                    std::string packed(static_cast<std::size_t>(header.packed_size), '\0');
++                    std::string raw(static_cast<std::size_t>(header.raw_size), '\0');
++                    ghost_file::Track track;
++                    if (!in.read(packed.data(), static_cast<std::streamsize>(packed.size())) ||
++                        ZSTD_decompress(raw.data(), raw.size(), packed.data(), packed.size()) != raw.size() || !ghost_file::unpack(raw, track)) {
++                        outcome = "the file is damaged";
++                    } else {
++                        auto outfit = decode_outfit(track.appearance);
++                        auto player = std::make_unique<ghost_file::Player>(std::move(track));
++                        if (!player->at(player->first_step())) {
++                            outcome = "the file is damaged";
++                        } else {
++                            auto& g = ghosts();
++                            std::lock_guard lock(g.mutex);
++                            g.player = std::move(player);
++                            g.outfit = std::move(outfit);
++                            ++g.serial;
++                        }
++                    }
++                }
++            } catch (...) {
++                outcome = "the ghost could not be loaded";
++            }
++            ghost_file_end(std::move(outcome));
++        }).detach();
++        return {};
++    }
++    // The loaded ghost at `step` (fractional: between two of its steps): where it is and its camera, and with `show`
++    // the skater itself, posed so, in its outfit. Called each tick while shown.
++    std::optional<TasGhostFrame> tas_ghost_frame(double step, bool show, std::string& why) override {
++        auto& g = ghosts();
++        std::optional<ghost_file::Player::Frame> frame;
++        std::optional<multiplayer::Appearance> outfit;
++        std::uint64_t serial{};
++        {
++            std::lock_guard lock(g.mutex);
++            if (!g.player) {
++                why = "no ghost line is loaded";
++                return std::nullopt;
++            }
++            frame = g.player->at(step);
++            serial = g.serial;
++            if (show && serial != ghost_shown_serial_) outfit = g.outfit;
++        }
++        if (!frame) {
++            why = "the ghost could not be read at that step";
++            return std::nullopt;
++        }
++        TasGhostFrame out;
++        out.root = frame->pose.root.position;
++        out.camera_position = frame->camera.position;
++        out.camera_forward = frame->camera.forward;
++        out.camera_up = frame->camera.up;
++        out.fov = frame->camera.fov;
++        out.ended = frame->ended;
++        out.head = out.root; // a name goes above it (the plugin raises it to above the head)
++        if (!show) return out;
++        if (multiplayer_session_active()) {
++            why = "never in a multiplayer session";
++            return std::nullopt;
++        }
++        const multiplayer::PeerScope scope(multiplayer::max_remote_players - 1);
++        const auto client = skater_movement::client();
++        if (!client) {
++            why = "the game has no client yet";
++            return std::nullopt;
++        }
++        const auto local = multiplayer::capture_local(base_, client, false);
++        if (!local.ready) {
++            why = local.detail.empty() ? std::string("the skater could not be read") : local.detail;
++            return std::nullopt;
++        }
++        std::string detail;
++        ghost_shown_now_ = true;
++        if (!multiplayer::show_remote(base_, client, local, frame->pose, detail)) {
++            why = detail.empty() ? std::string("the ghost is not shown yet") : detail;
++            return std::nullopt;
++        }
++        // Its outfit: once a new ghost is loaded, and again whenever the game builds the model anew.
++        const auto generation = multiplayer::remote_skater_generation();
++        if (serial != ghost_shown_serial_ || generation != ghost_outfit_generation_) {
++            if (!outfit) {
++                std::lock_guard lock(g.mutex);
++                outfit = g.outfit;
++            }
++            std::string outfit_why;
++            if (outfit) {
++                multiplayer::update_remote_cosmetics(base_, local, *outfit, outfit_why);
++            } else if (auto mine = multiplayer::capture_cosmetics(base_, local, outfit_why)) {
++                multiplayer::update_remote_cosmetics(base_, local, *mine, outfit_why); // a ghost with no outfit wears yours
++            }
++            ghost_shown_serial_ = serial;
++            ghost_outfit_generation_ = generation;
++        }
++        out.shown = true;
++        return out;
++    }
++    void tas_ghost_hide() override {
++        if (!ghost_shown_now_) return;
++        const multiplayer::PeerScope scope(multiplayer::max_remote_players - 1);
++        multiplayer::remove_remote(base_);
++        ghost_shown_now_ = false;
++        ghost_shown_serial_ = 0;
++        ghost_outfit_generation_ = 0;
++    }
 +    std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
 +        auto& m = tas_motion();
 +        std::lock_guard lock(m.frames_mutex);
@@ -1997,7 +2985,13 @@ index 5c0acee..cacc622 100644
 +        const char* mode = waiting ? "waiting" : s.mode == input::StepScript::Mode::recording ? "recording" : s.mode == input::StepScript::Mode::playing ? "playing" : "off";
 +        return {mode, s.step, s.length, s.stopped, tas_motion().captured.load(std::memory_order_acquire), tas_motion().restores.load(std::memory_order_relaxed),
 +            s.unread, s.first_unread, tas_motion().since_spawn.load(std::memory_order_acquire), virtual_time::active(), virtual_time::reads(),
-+            tas_motion().replay_off.load(std::memory_order_relaxed), tas_motion().replay_off_at.load(std::memory_order_relaxed)};
++            tas_motion().replay_off.load(std::memory_order_relaxed), tas_motion().replay_off_at.load(std::memory_order_relaxed),
++            tas_motion().sensor.load(std::memory_order_acquire), tas_motion().sensor_writes.load(std::memory_order_relaxed)};
++    }
++    std::string tas_sensor_start() override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        tas_motion().sensor_start_wanted.store(true, std::memory_order_release);
++        return {};
 +    }
 +    std::string tas_save(unsigned slot) override {
 +        if (auto why = tas_refusal(input_allowed()); !why.empty()) return why;
@@ -2042,7 +3036,7 @@ index 5c0acee..cacc622 100644
      std::optional<StickInput> joystick(int device) override {
          if (!joystick::game_in_foreground()) return std::nullopt;
          const auto sample = joystick::poll(device);
-@@ -1876,6 +2649,8 @@ public:
+@@ -1876,6 +3067,8 @@ public:
      }
      void release(std::string_view plugin) override {
          input::pad_outputs().release(plugin);
@@ -2274,6 +3268,31 @@ index 0000000..9b3d5da
 +void match_flight_step(const NoBailSkater& skater, float step) noexcept;
 +bool restore(const NoBailSkater& skater, const Snapshot& snapshot, bool skeleton) noexcept;
 +}
+diff --git a/Extension/Skater/skater_movement.cpp b/Extension/Skater/skater_movement.cpp
+index 8c1bf0b..f97b579 100644
+--- a/Extension/Skater/skater_movement.cpp
++++ b/Extension/Skater/skater_movement.cpp
+@@ -23,6 +23,7 @@ bool sane(const std::array<float, 3>& v) {
+ }
+ }
+ void set_client(std::uintptr_t client) noexcept { client_now.store(client, std::memory_order_relaxed); }
++std::uintptr_t client() noexcept { return client_now.load(std::memory_order_relaxed); }
+ std::optional<plugins::SkaterMovement> read(std::uintptr_t base) {
+     namespace at = addr::skater_movement;
+     namespace flight = addr::offboard_flight;
+diff --git a/Extension/Skater/skater_movement.h b/Extension/Skater/skater_movement.h
+index 7635fd6..e011651 100644
+--- a/Extension/Skater/skater_movement.h
++++ b/Extension/Skater/skater_movement.h
+@@ -8,6 +8,8 @@
+ namespace dingosdk::skater_movement {
+ // The client the camera is read through for `stick` (Runtime/client_tick.cpp, every tick).
+ void set_client(std::uintptr_t client) noexcept;
++// The client set last (0 before the first): for what needs it outside the client tick's own calls.
++std::uintptr_t client() noexcept;
+ // Nothing without a local skater or when its velocity does not read as a velocity.
+ std::optional<plugins::SkaterMovement> read(std::uintptr_t base);
+ }
 diff --git a/Extension/Skater/skater_physics.cpp b/Extension/Skater/skater_physics.cpp
 index d358e81..4f1cc25 100644
 --- a/Extension/Skater/skater_physics.cpp
@@ -2453,10 +3472,10 @@ index 48d462b..b6b8283 100644
  }
 diff --git a/Extension/Skater/state_dump.cpp b/Extension/Skater/state_dump.cpp
 new file mode 100644
-index 0000000..4e2b366
+index 0000000..062f950
 --- /dev/null
 +++ b/Extension/Skater/state_dump.cpp
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,184 @@
 +#include "state_dump.h"
 +#include "Engine/Core/Platform/memory.h"
 +#include "Engine/Game/Build/addresses.h"
@@ -2470,6 +3489,7 @@ index 0000000..4e2b366
 +#include <format>
 +#include <fstream>
 +#include <mutex>
++#include <thread>
 +#include <unordered_set>
 +#include <vector>
 +
@@ -2623,15 +3643,21 @@ index 0000000..4e2b366
 +std::string save(const std::filesystem::path& file) {
 +    auto& d = dump();
 +    d.armed.store(false, std::memory_order_release);
-+    std::lock_guard lock(d.mutex);
-+    if (d.bytes.size() <= 4) return "nothing was taken";
-+    std::error_code error;
-+    std::filesystem::create_directories(file.parent_path(), error);
-+    if (error) return "the folder could not be made: " + error.message();
-+    std::ofstream stream(file, std::ios::binary | std::ios::trunc);
-+    stream.write(reinterpret_cast<const char*>(d.bytes.data()), static_cast<std::streamsize>(d.bytes.size()));
-+    d.bytes.clear();
-+    return stream.good() ? std::string{} : std::string("the file could not be written");
++    // What was taken, out of the way at once (the next arm may come straight after); written on a thread of its own:
++    // up to 64 MB is far past a plugin call's 50 ms.
++    std::vector<unsigned char> bytes;
++    {
++        std::lock_guard lock(d.mutex);
++        if (d.bytes.size() <= 4) return "nothing was taken";
++        bytes.swap(d.bytes);
++    }
++    std::thread([bytes = std::move(bytes), file] {
++        std::error_code error;
++        std::filesystem::create_directories(file.parent_path(), error);
++        std::ofstream stream(file, std::ios::binary | std::ios::trunc);
++        stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    }).detach();
++    return {};
 +}
 +}
 diff --git a/Extension/Skater/state_dump.h b/Extension/Skater/state_dump.h

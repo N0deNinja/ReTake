@@ -23,6 +23,7 @@ bool sane(const std::array<float, 3>& v) {
 }
 }
 void set_client(std::uintptr_t client) noexcept { client_now.store(client, std::memory_order_relaxed); }
+std::uintptr_t client() noexcept { return client_now.load(std::memory_order_relaxed); }
 std::optional<plugins::SkaterMovement> read(std::uintptr_t base) {
     namespace at = addr::skater_movement;
     namespace flight = addr::offboard_flight;

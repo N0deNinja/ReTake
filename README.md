@@ -15,7 +15,7 @@
 </p>
 
 > [!WARNING]
-> **This is version 0.0.4, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
+> **This is version 0.0.5, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
 
 ![How ReTake works, step by step](docs/how-it-works.jpg)
 
@@ -26,11 +26,14 @@ You skate a line. ReTake records it. When you mess up, open the timeline, pick a
 - **Timeline (F11).** Slows the game down and shows your whole line. Scrub it and a ghost skater shows where you were.
 - **Replay from here.** Fast-forwards your line to the moment you picked, slows down, counts 3, 2, 1, and you're back in.
 - **Play whole line.** Plays every retake back as one run, at full speed.
-- **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate. The skater rides in it just as at full speed.
+- **Takes.** Every try is kept. Step back to an earlier take in the timeline and carry on from it, to combine the best parts.
+- **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate. The skater rides in it just as at full speed. Put it on any button you like, or turn the button off, with **Slow-mo key** in the timeline.
 - **Bails off.** One switch so you don't fall off from big drops.
 - **Stop all.** One button that stops everything ReTake is doing.
-- **My lines.** Save your lines and come back to them later, even after closing the game.
+- **My lines.** Save your lines and come back to them later, even after closing the game. **Share** one by sending its `.retake` file.
+- **Ghost lines (F10).** Make a ghost of your line and send it to friends. They see a pin where it starts, can **Watch** it through your camera, then **Try it** with your skater riding beside them as a ghost, in your outfit, with your name over it.
 - **Report a problem.** Write what went wrong; ReTake saves it in a file with the last 30 seconds of the game, for us to look at.
+- **Looks like the game.** ReTake's screens use skate.'s own menu style: its tiles, fonts and keycaps.
 
 ## Install
 
@@ -41,7 +44,7 @@ You need:
 
 Then:
 
-1. Download **`ReTake-v0.0.4.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
+1. Download **`ReTake-v0.0.5.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
 2. Close skate. and the ReSkate launcher.
 3. Double-click **`Install ReTake.bat`**.
    It finds your game on its own (or lets you pick the folder), backs up your `ReSkate.dll`, installs ReTake, and asks to turn off the launcher's automatic updates.
@@ -86,11 +89,19 @@ Close the game and double-click **`Uninstall ReTake.bat`**. It puts your old `Re
 | | |
 |---|---|
 | **F11** | Open or close the timeline |
+| **F10** | Open or close Ghost lines; stop watching or trying one |
 | **Drag, mouse wheel, ← / →** | Scrub the timeline |
 | **Enter** | Replay from the picked moment |
 | **Esc** | Close the timeline |
-| **L3 + R3** (click both sticks) | Slow motion on and off |
+| **L3 + R3** (click both sticks) | Slow motion on and off (change it with **Slow-mo key**) |
 | **Ctrl + R** | Go back 1 second (press again to go further) |
+
+### Ghost lines
+
+1. **Make one.** Skate a line (retakes and all), press **F10** and click **Make a ghost of my line**. The line plays once, hands off, while ReTake records your skater, your outfit and your camera. Set the name shown over your skater with `retake name <name>`.
+2. **Share it.** Click **Open folder** and send the `.ghost` file. Whoever gets it puts it in the same folder (`Mods\.reskate_plugin_data\ReTake\ghosts`).
+3. **Find it.** A tag floats over the start of each ghost line on the map you're on, with its distance, and ReTake tells you when you're close. The F10 window lists them nearest first, with a map of the ones around you. One on another map travels there first.
+4. **Watch** it through its skater's camera, then **Try it**: you start where they started, at their speed, after 3, 2, 1, with their skater riding beside you as a ghost. The ghost doesn't collide with you.
 
 ### In the timeline
 
@@ -102,9 +113,11 @@ Close the game and double-click **`Uninstall ReTake.bat`**. It puts your old `Re
 | **Catch-up** | How fast the replay fast-forwards (1× to 8×) |
 | **Slow-mo** | How slow slow motion is |
 | **Bails** | The game's bails on or off |
+| **Slow-mo key** | Click it, then press the buttons you want for slow motion and let go. Click it twice for no button |
 | **New line** | Throw this line away and start a new one (press twice) |
 | **Stop all** | Stop everything ReTake is doing |
-| **My lines** | Top right: save this line, or load or delete a saved one |
+| **< Take 2 of 3 >** | Top right, once you've retaken: step between your tries and carry on from any of them |
+| **My lines** | Top right: save this line, load, share or delete a saved one |
 | **Report a problem** | Top right: write what went wrong and save it to a file you can send us |
 
 ### Console
@@ -117,9 +130,16 @@ retake save [name]        save the line, to come back to it after closing the ga
 retake lines              your saved lines, numbered (also: F11, My lines)
 retake load <number>      load a saved line, in place of the one you have
 retake delete <number>    delete a saved line
+retake ghosts             ghost lines: other skaters' lines to watch and try (also: F10)
+retake ghost make [name]  make a ghost line of your line, to share (it plays once, hands off)
+retake ghost watch <n>    watch a ghost line through its skater's eyes
+retake ghost try <n>      try a ghost line, its skater riding beside you
+retake ghost stop         stop watching or trying
+retake name [name]        the name on the ghost lines you make; alone, says it
 retake back [seconds]     go back that far (default 1)
 retake whole              play the whole line as one run
 retake slowmo [0.05-0.9]  slow motion on and off, or how slow (default 0.25)
+retake slowmo key [combo] the slow-motion button: Pad.LB+Pad.RB, Ctrl+K, off or default; alone, says it
 retake speed [1-8]        how fast going back catches up (default 4)
 retake bails              the game's bails off and on
 retake stop               stop everything ReTake is doing
@@ -131,7 +151,7 @@ retake slowtest [m:ss]    test slow motion at that moment of the line (replaces 
 retake skatertest         stand still: the skater is rebuilt at full speed and in slow motion, and saved each time
 ```
 
-The last two are for tracking down bugs; you won't need them to skate.
+The last two are for tracking down bugs; you won't need them to skate. `retake` alone also lists a few research commands (`statetest`, `ghosttest`, `warmtest`).
 
 ## Known issues
 
@@ -165,9 +185,9 @@ cd ..
 powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
 ```
 
-That writes `dist\ReTake-v0.0.4.zip`.
+That writes `dist\ReTake-v0.0.5.zip`.
 
-ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that keeps the skater as the game would build it at the shorter step (the board's flight, the joints and everything else worked out from the step length) so it rides the same, a no-bail switch, sharper plugin fonts, and **no crash reports**: this build never uploads anything.
+ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that keeps the skater as the game would build it at the shorter step (the board's flight, the joints and everything else worked out from the step length) so it rides the same, a no-bail switch, ghost lines (the skater's pose, camera and outfit at every step, compressed the way multiplayer sends a player, and shown as a multiplayer player model), sharper plugin fonts, and **no crash reports**: this build never uploads anything.
 
 ## Credits and licence
 

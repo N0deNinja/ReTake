@@ -162,6 +162,8 @@ struct TasStatus {
     std::uint64_t clock_reads{}; // reads of the clock the hook has seen
     float replay_off{};          // the last run up: the most the board was from its recording before a step was put back, m
     std::size_t replay_off_at{}; // and at which step
+    int sensor{-1};              // the skater's sensor block: 1 started (ridden since the game started), 0 not, -1 unread
+    std::size_t sensor_writes{}; // starts written by tas_sensor_start (research)
 };
 // A line: one recording from a standing start that can go back to any step of it (reskate.tas.line).
 struct TasLine {
@@ -172,6 +174,19 @@ struct TasLine {
 struct TasBodies {
     std::array<float, 16> board{};
     std::array<std::array<float, 3>, 26> skeleton{};
+};
+// Ghost lines (Extension/Plugins/ghost_file.h): the one being recorded, the one loaded to show, and the file thread.
+struct TasGhostStatus {
+    bool recording{}, recorded_outfit{}, loaded_outfit{}, shown{};
+    std::size_t recorded{}, loaded{};                  // samples, a step each
+    std::uint32_t recorded_first{}, recorded_last{}, loaded_first{}, loaded_last{};
+    std::string file; // "saving", "loading", "saved", "loaded", why the last failed, or empty before the first
+};
+// The loaded ghost at a step: where its skater is, what its camera saw, whether that is past its end.
+struct TasGhostFrame {
+    std::array<float, 3> root{}, head{}, camera_position{}, camera_forward{}, camera_up{};
+    float fov{};
+    bool ended{}, shown{};
 };
 // What a script's playing puts back of the motion taken when it was recorded.
 // `lock`: every step of the playing, the bodies are put back as that step was recorded, so nothing can drift.
@@ -1147,9 +1162,35 @@ public:
     // A line saved to `path` in the plugin's data folder, and loaded back as this plugin's line on `controller`, stopped
     // where it ended (Extension/Plugins/line_file.h). Both run in the background: tas_line_file_status says "saving",
     // "loading", "saved", "loaded", why one failed, or nothing before the first.
-    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
+    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
+    // A line file's note (what ReTake keeps of it, as text; empty in a file saved before notes), without loading it.
+    virtual std::optional<std::string> tas_line_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
+        why = unavailable;
+        return std::nullopt;
+    }
     virtual std::string tas_line_import(std::string_view /*plugin*/, std::string_view /*path*/, unsigned /*controller*/) { return unavailable; }
     virtual std::string tas_line_file_status() { return {}; }
+    // Research: a real skater model posed as the local skater, moved by `offset`; false hides it (a ghost's test).
+    virtual std::string tas_ghost_probe(bool /*show*/, std::array<float, 3> /*offset*/) { return unavailable; }
+    // Ghost lines: recording the local skater a step at a time (`on` clears what was recorded), saving that to a
+    // file in the plugin's data folder and loading one back (both in the background), and showing the loaded one as a
+    // real skater in its outfit, at any step, in the last multiplayer slot. Offline only.
+    virtual std::string tas_ghost_record(bool /*on*/) { return unavailable; }
+    virtual std::string tas_ghost_capture(std::uint32_t /*step*/) { return unavailable; }
+    virtual TasGhostStatus tas_ghost_status() { return {}; }
+    virtual std::string tas_ghost_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
+    virtual std::optional<std::string> tas_ghost_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
+        why = unavailable;
+        return std::nullopt;
+    }
+    virtual std::string tas_ghost_load(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
+    virtual std::optional<TasGhostFrame> tas_ghost_frame(double /*step*/, bool /*show*/, std::string& why) {
+        why = unavailable;
+        return std::nullopt;
+    }
+    virtual void tas_ghost_hide() {}
+    // Research: the skater's sensor block written as it is in a ridden skater, on the next physics step.
+    virtual std::string tas_sensor_start() { return unavailable; }
     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
     // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
     virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }

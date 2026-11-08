@@ -13,7 +13,10 @@
 // the sizes in the header saying so. The file is the header, then the payload, compressed (the runtime's).
 namespace dingosdk::line_file {
 inline constexpr char magic[4] = {'R', 'T', 'K', 'L'};
-inline constexpr std::uint32_t version = 1;
+// 1: the header, then the payload. 2: the header, a u32 note size and the note (what ReTake keeps of the line, its
+// name and where it starts, as text), then the payload: one file is a whole line, to send to someone.
+inline constexpr std::uint32_t version = 2;
+inline constexpr std::uint32_t most_note = 1u << 20;
 
 #pragma pack(push, 1)
 struct Header {
@@ -50,15 +53,22 @@ template <class Snapshot> Header header_for(std::size_t inputs, std::size_t fram
     return h;
 }
 
-// Empty when the header is one this build can load, else why not.
-template <class Snapshot> std::string check(const Header& h, std::size_t file_size, std::size_t most_steps) {
+// Where the payload starts: after the header, and in version 2 the note.
+inline std::size_t payload_at(const Header& h, std::uint32_t note_size) {
+    return sizeof(Header) + (h.version >= 2 ? sizeof(std::uint32_t) + note_size : 0);
+}
+
+// Empty when the header is one this build can load, else why not. `note_size` is the note's, read after the header
+// (version 2), else 0.
+template <class Snapshot> std::string check(const Header& h, std::size_t file_size, std::size_t most_steps, std::uint32_t note_size = 0) {
     if (std::memcmp(h.magic, magic, sizeof(magic)) != 0) return "it is not a ReTake line";
-    if (h.version != version) return "it was saved by another version of ReTake";
+    if (h.version != 1 && h.version != 2) return "it was saved by another version of ReTake";
+    if (note_size > most_note) return "its note is too long";
     if (h.pad_size != sizeof(input::PadOutput) || h.snapshot_size != sizeof(Snapshot)) return "it was saved by another build of ReTake's ReSkate.dll";
     if (h.inputs == 0 || h.inputs > most_steps || h.frames > most_steps) return "its length is not a line's";
     const auto raw = static_cast<std::uint64_t>(h.inputs) * sizeof(input::PadOutput) + static_cast<std::uint64_t>(h.frames) * sizeof(Snapshot);
     if (h.raw_size != raw) return "its sizes do not add up";
-    if (h.packed_size != file_size - sizeof(Header)) return "the file is cut short";
+    if (file_size < payload_at(h, note_size) || h.packed_size != file_size - payload_at(h, note_size)) return "the file is cut short";
     return {};
 }
 

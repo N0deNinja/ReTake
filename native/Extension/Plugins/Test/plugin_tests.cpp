@@ -16,6 +16,7 @@
 #include "Engine/Game/Input/pad_output.h"
 #include "Engine/Game/Input/step_script.h"
 #include "Extension/Plugins/line_file.h"
+#include "Extension/Plugins/ghost_file.h"
 #include "Engine/Game/Input/playstation_report.h"
 #include "Engine/Game/Input/gameplay_options.h"
 #ifdef _WIN32 // reads memory as the game does (Engine/Core/Platform/memory.h)
@@ -4258,20 +4259,85 @@ void plugins_script_input_by_physics_step() {
     const std::vector<PadOutput> steps{pad(5), pad(6), pad(7)};
     const std::vector<Motion> motion{{{1, 2, 3, 4}, true}, {{5, 6, 7, 8}, false}};
     const auto raw = dingosdk::line_file::pack(steps, motion);
+    // Version 2: the header, the note's size and the note (20 bytes here), then the 100 bytes of payload.
     auto header = dingosdk::line_file::header_for<Motion>(steps.size(), motion.size(), raw.size(), 100);
-    check(dingosdk::line_file::check<Motion>(header, sizeof(header) + 100, 36000).empty(), "a line's header passes");
+    const std::size_t with_note = sizeof(header) + 4 + 20 + 100;
+    check(header.version == 2 && dingosdk::line_file::payload_at(header, 20) == sizeof(header) + 24, "a line's file has its note before the payload");
+    check(dingosdk::line_file::check<Motion>(header, with_note, 36000, 20).empty(), "a line's header passes");
     std::vector<PadOutput> steps_back;
     std::vector<Motion> motion_back;
     check(dingosdk::line_file::unpack(raw, header, steps_back, motion_back) && steps_back.size() == 3 && steps_back[2].left_x == 7 &&
               motion_back.size() == 2 && motion_back[1].place[3] == 8 && !motion_back[1].valid,
           "and its steps and motion come back as they were");
-    check(!dingosdk::line_file::check<Motion>(header, sizeof(header) + 99, 36000).empty(), "a file cut short is refused");
+    check(!dingosdk::line_file::check<Motion>(header, with_note - 1, 36000, 20).empty(), "a file cut short is refused");
+    check(!dingosdk::line_file::check<Motion>(header, with_note, 36000, dingosdk::line_file::most_note + 1).empty(), "a note too long is refused");
+    auto old = header;
+    old.version = 1;
+    check(dingosdk::line_file::check<Motion>(old, sizeof(old) + 100, 36000).empty() && dingosdk::line_file::payload_at(old, 0) == sizeof(old),
+          "a line saved before notes still loads");
     auto other = header;
     other.snapshot_size += 4;
-    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "one from another build is refused");
+    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "one from another build is refused");
+    other = header;
+    other.version = 3;
+    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "one from a later ReTake is refused");
     other = header;
     other.magic[0] = 'X';
-    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "and anything else");
+    check(!dingosdk::line_file::check<Motion>(other, with_note, 36000, 20).empty(), "and anything else");
+
+    // A ghost line: a pose a step, each the difference from the one before (every 60th whole), with the camera.
+    namespace gf = dingosdk::ghost_file;
+    namespace mp = dingosdk::multiplayer;
+    const auto pose_at = [](float x) {
+        mp::Pose pose;
+        pose.root.position = {x, 1, 2};
+        for (int bone = 0; bone < 30; ++bone) {
+            mp::Transform t;
+            t.position = {x + bone * 0.01f, 0.5f, 0};
+            const float angle = x * 0.1f + bone * 0.02f;
+            t.rotation = {0, std::sin(angle / 2), 0, std::cos(angle / 2)};
+            pose.skater.push_back(t);
+        }
+        pose.board.push_back(pose.root);
+        return pose;
+    };
+    gf::Recorder recorder;
+    for (std::uint32_t step = 10; step < 140; ++step) {
+        gf::Camera camera{{static_cast<float>(step), 3, 0}, {0, 0, 1}, {0, 1, 0}, 60};
+        check(recorder.add(step, pose_at(static_cast<float>(step) * 0.1f), camera), "a ghost keeps each step");
+    }
+    check(recorder.add(139, pose_at(13.95f), {{139, 3, 0}, {0, 0, 1}, {0, 1, 0}, 60}) && recorder.track.samples.size() == 130,
+          "a step seen again replaces the one there");
+    check(!recorder.add(100, pose_at(1), {}), "and one before the last is refused");
+    std::size_t wholes = 0;
+    for (const auto& sample : recorder.track.samples) wholes += mp::pose_codec::whole(sample.pose) ? 1 : 0;
+    check(wholes == 3 && mp::pose_codec::whole(recorder.track.samples.front().pose), "every 60th pose is whole, the first among them");
+    recorder.track.appearance = {1, 2, 3};
+    const auto ghost_raw = gf::pack(recorder.track);
+    gf::Track back;
+    check(gf::unpack(ghost_raw, back) && back == recorder.track, "a ghost's payload comes back as it was");
+    check(!gf::unpack(std::string_view(ghost_raw).substr(0, ghost_raw.size() - 1), back), "a payload cut short is refused");
+    gf::Player ghost(recorder.track);
+    check(ghost.first_step() == 10 && ghost.last_step() == 139, "a ghost knows its steps");
+    const auto close_to = [](float a, float b) { return std::fabs(a - b) < 0.003f; };
+    auto at = ghost.at(75);
+    check(at && close_to(at->pose.root.position[0], 7.5f) && close_to(at->pose.skater[29].position[0], 7.79f) && !at->ended && at->camera.position[0] == 75,
+          "a ghost at a step shows that step's pose and camera");
+    at = ghost.at(75.5);
+    check(at && close_to(at->pose.root.position[0], 7.55f) && close_to(at->camera.position[0], 75.5f), "and between two steps, between them");
+    at = ghost.at(12); // decoded again from the first whole pose
+    check(at && close_to(at->pose.root.position[0], 1.2f), "from anywhere, back to the start");
+    at = ghost.at(131); // from the whole pose at the 120th sample
+    check(at && close_to(at->pose.skater[3].position[0], 13.13f), "and on past a whole pose");
+    at = ghost.at(500);
+    check(at && at->ended && close_to(at->pose.root.position[0], 13.95f), "after its end it holds its last pose");
+    at = ghost.at(0);
+    check(at && !at->ended && close_to(at->pose.root.position[0], 1.0f), "and before its start, its first");
+    auto ghost_header = gf::header_for(20, ghost_raw.size(), 100);
+    check(gf::check(ghost_header, sizeof(ghost_header) + 120).empty(), "a ghost's header passes");
+    check(!gf::check(ghost_header, sizeof(ghost_header) + 119).empty(), "a ghost file cut short is refused");
+    ghost_header.magic[3] = 'L';
+    check(!gf::check(ghost_header, sizeof(ghost_header) + 120).empty(), "and a line is not a ghost");
 }
 
 void controller_reports_preserve_non_controls() {

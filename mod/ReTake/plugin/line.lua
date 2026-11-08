@@ -6,6 +6,7 @@
 local U = require("util")
 local C = require("clock")
 local R = require("report")
+local S = require("ui")
 local L = {}
 
 local STEPS = 60
@@ -26,6 +27,7 @@ local SCREEN = "TAS Timeline"
 
 local line = {phase = "off", length = 0, step = 0, since_spawn = 0}
 local start = nil   -- {position=, heading=, on_board=}: where the line began
+local line_uid = nil -- the line's id (L.line_id)
 local marks = {}    -- {step=, position=}, a tenth of a second apart, oldest first
 local bails = {}    -- steps of the line where the skater bailed
 local joins = {}    -- steps of the line where a retake took over
@@ -240,10 +242,23 @@ local function recorded_on_board()
     return nil
 end
 
+-- Whether the skater has been ridden since the game started (ReSkate.dll reads a sensor block of the game's that only
+-- starts when the skater is ridden). Until then a replay takes rails the other way: a line loaded straight after starting
+-- the game went off at its first rail, every time. True when the DLL can't tell.
+function L.sensor_ready()
+    local ok, s = pcall(reskate.tas.status)
+    return not (ok and type(s) == "table" and s.sensor_started == false)
+end
+
 local function seek(to, hand_over, retries)
     if not start then return false, "no line is recorded" end
+    if not retries and not L.sensor_ready() then
+        return false, "ride for a moment first: until you've skated since the game started, a replay goes off on rails"
+    end
     full_speed()
     count = nil
+    -- A retake: the line as it is now is kept as a take first (takes.lua), before it is cut at the moment.
+    if hand_over and not retries and to < line.length and L.on_retake then L.on_retake(to) end
     local on_board = recorded_on_board()
     if on_board == nil then on_board = start.on_board end
     local ok, why = reskate.skater.teleport(start.position, start.heading, {on_board = on_board})
@@ -537,6 +552,8 @@ function L.new_line()
     ok, why = reskate.tas.line_start(pad, START_STEP)
     if not ok then return false, why end
     start = {position = s.position, heading = s.heading, on_board = true}
+    line_uid = os.date("%Y%m%d-%H%M%S")
+    if L.on_new_line then L.on_new_line(line_uid) end
     marks, bails, joins = {}, {}, {}
     count, filming, probe = nil, nil, nil
     pending = {from = 0, to = 0, hand_over = true, retries = 0, asked_at = U.now()}
@@ -596,6 +613,26 @@ end
 function L.set_catch_up(speed)
     catch_up = U.clamp(speed, 1, 8)
     return true
+end
+
+function L.catch_up_speed()
+    return catch_up
+end
+
+-- A ghost line is about to move the skater: whatever the line is doing stops, and the line is kept as it is
+-- (recording, it ends here; it is never forgotten).
+function L.keep_still()
+    test_cancel("a ghost line")
+    close_player()
+    full_speed()
+    count, pending = nil, nil
+    slowmo_on = false
+    if line.phase ~= "off" and line.phase ~= "played" then reskate.tas.line_halt() end
+end
+
+-- Where the line starts, for a ghost line made of it.
+function L.start()
+    return start
 end
 
 local function going_back()
@@ -687,20 +724,25 @@ local function layout()
     local gap = 10 * k
     local function at(x, w) return {x0 = x, x1 = x + w * k, y0 = y0, y1 = y1} end
     local b = {}
-    b.replay = at(left, 232)
-    b.whole = at(b.replay.x1 + gap, 176)
-    b.carry_on = at(b.whole.x1 + gap, 136)
-    b.stop = at(right - 132 * k, 132)
-    b.new = at(b.stop.x0 - gap - 132 * k, 132)
+    b.replay = at(left, 252)
+    b.whole = at(b.replay.x1 + gap, 196)
+    b.carry_on = at(b.whole.x1 + gap, 146)
+    b.stop = at(right - 140 * k, 140)
+    b.new = at(b.stop.x0 - gap - 150 * k, 150)
     local chip = 164
     local mid = (b.carry_on.x1 + b.new.x0) / 2
-    local x = mid - (3 * chip * k + 2 * gap) / 2
+    local key_chip = 214
+    local x = mid - ((3 * chip + key_chip) * k + 3 * gap) / 2
     b.speed = at(x, chip)
     b.slowmo = at(b.speed.x1 + gap, chip)
     b.bails = at(b.slowmo.x1 + gap, chip)
+    b.slowkey = at(b.bails.x1 + gap, key_chip)
     -- In the header, on the right: the header row's middle is panel.y0 + 52k.
-    b.report = {x0 = right - 196 * k, x1 = right, y0 = panel.y0 + 36 * k, y1 = panel.y0 + 68 * k}
-    b.lines = {x0 = b.report.x0 - gap - 132 * k, x1 = b.report.x0 - gap, y0 = b.report.y0, y1 = b.report.y1}
+    b.report = {x0 = right - 222 * k, x1 = right, y0 = panel.y0 + 34 * k, y1 = panel.y0 + 70 * k}
+    b.lines = {x0 = b.report.x0 - gap - 128 * k, x1 = b.report.x0 - gap, y0 = b.report.y0, y1 = b.report.y1}
+    -- Takes, left of My lines: the arrows either side of "Take 2 of 4".
+    b.take_next = {x0 = b.lines.x0 - 22 * k - 34 * k, x1 = b.lines.x0 - 22 * k, y0 = b.report.y0, y1 = b.report.y1}
+    b.take_prev = {x0 = b.take_next.x0 - 150 * k - 34 * k, x1 = b.take_next.x0 - 150 * k, y0 = b.report.y0, y1 = b.report.y1}
     return k, panel, bar, b
 end
 
@@ -763,6 +805,8 @@ local function press(name)
         slowmo_speed = SLOWMOS[at % #SLOWMOS + 1]
     elseif name == "bails" then
         say_failure(L.toggle_bails())
+    elseif name == "slowkey" then
+        if L.on_slowkey then say_failure(L.on_slowkey()) end
     elseif name == "stop" then
         L.stop_all()
     elseif name == "report" then
@@ -771,6 +815,9 @@ local function press(name)
     elseif name == "lines" then
         end_preview()
         if L.on_lines then say_failure(L.on_lines()) end
+    elseif (name == "take_prev" or name == "take_next") and L.takes_status and L.takes_status() then
+        end_preview()
+        if L.on_take_step then say_failure(L.on_take_step(name == "take_next" and 1 or -1)) end
     end
 end
 
@@ -979,32 +1026,18 @@ function L.tick(busy)
 end
 
 -- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
-local VERSION = "0.0.4"
+local VERSION = "0.0.5"
 local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
 local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
-local PANEL = {colour = "#0c0d11eb", fill = true, rounding = 16}
-local PANEL_EDGE = {colour = "#ffffff1c", thickness = 1, rounding = 16}
-local SURFACE = {colour = "#ffffff14", fill = true, rounding = 10}
-local SURFACE_HOVER = {colour = "#ffffff26", fill = true, rounding = 10}
-local SURFACE_OFF = {colour = "#ffffff08", fill = true, rounding = 10}
-local PRIMARY = {colour = ACCENT, fill = true, rounding = 10}
-local PRIMARY_HOVER = {colour = "#ffe175", fill = true, rounding = 10}
-local DANGER_EDGE = {colour = "#ff5a5a90", thickness = 1.5, rounding = 10}
-local DANGER_HOVER = {colour = "#ff5a5a2a", fill = true, rounding = 10}
-local ARMED = {colour = RED, fill = true, rounding = 10}
-local TRACK = {colour = "#ffffff1f", fill = true, rounding = 4}
-local PLAYED = {colour = ACCENT, fill = true, rounding = 4}
-local PILL = {colour = "#02f7da26", fill = true, rounding = 6}
-local CHIP_PAUSED = {colour = "#ffffff1a", fill = true, rounding = 6}
-local BUBBLE = {colour = "#000000e6", fill = true, rounding = 6}
-local HUD_PILL = {colour = "#0c0d11c0", fill = true, rounding = 16}
 local PATH_DONE = {colour = "#02f7daa0", thickness = 2}
 local PATH_AFTER = {colour = "#ffffff50", thickness = 1}
 local BONE = {colour = "#ffffff", thickness = 5}
 local DECK = {colour = ACCENT, thickness = 5}
 local HEAD_DOT = {colour = "#ffffff", fill = true}
-local BIG_STYLE = {colour = "#ffffff", size = 150, shadow = true}
-local SMALL_STYLE = {colour = "#ffffffd0", size = 26, shadow = true}
+-- The countdown in the game's marker, as its "LEGENDARY!"; what is going on under it in capitals.
+local BIG_STYLE = {colour = "#ffffff", size = 160, shadow = true, font = "title_large"}
+local GO_STYLE = {colour = "#02f7da", size = 160, shadow = true, font = "title_large"}
+local SMALL_STYLE = {colour = "#ffffffe0", size = 24, shadow = true, font = "heading"}
 
 local function txt(size, colour, font)
     return {colour = colour, size = size, font = font or "heading"}
@@ -1075,163 +1108,129 @@ local function draw_player(d)
     if player.shown and player.ghost then draw_ghost(d, player.ghost) end
     local mouse = reskate.input.cursor()
     local left = bar.x0
-    d:rect(v(panel.x0, panel.y0), v(panel.x1, panel.y1), PANEL)
-    d:rect(v(panel.x0, panel.y0), v(panel.x1, panel.y1), PANEL_EDGE)
+    S.panel(d, panel, k, 11)
 
-    -- The logo (it has the name in it) and the version.
+    -- The logo (it has the name in it), the version, and whether it is paused or ended, on a sticky note.
     local top = panel.y0 + 32 * k -- the header row's text; its middle is top + 20k
     local logo = 100 * k
     d:image(LOGO, v(left - 8 * k, panel.y0 + 6 * k), v(left - 8 * k + logo, panel.y0 + 6 * k + logo))
-    local ver = "v" .. VERSION
-    local ver_style = txt(15, ACCENT, "bold")
-    local ver_size = d:measure(ver, ver_style)
     local vx = left - 8 * k + logo + 6 * k
-    d:rect(v(vx, top + 9 * k), v(vx + ver_size.x + 14 * k, top + 31 * k), PILL)
-    d:text(v(vx + 7 * k, top + 20 * k - ver_size.y / 2), ver, ver_style)
+    local tag_y = top + 9 * k
+    local vw = S.tag(d, vx, tag_y, "v" .. VERSION, k, S.TILE_LIGHT, S.ACCENT)
 
     -- The moment, large, in the middle; or what to do without a line.
     if has_line() then
-        local now_style, all_style = txt(32, TEXT), txt(22, MUTED)
+        local now_style, all_style = S.font(34, S.TEXT, "heading", true), S.font(22, S.MUTED, "heading", true)
         local now, all = clock_text(player.cursor), " / " .. clock_text(line.length)
         local a, b = d:measure(now, now_style), d:measure(all, all_style)
         local x = width / 2 - (a.x + b.x) / 2
-        d:text(v(x, top), now, now_style)
-        d:text(v(x + a.x, top + (a.y - b.y) - 2 * k), all, all_style)
-        local state = line.phase == "played" and "LINE ENDED" or "PAUSED"
-        local chip_style = txt(13, MUTED, "bold")
-        local c = d:measure(state, chip_style)
-        local cx = vx + ver_size.x + 26 * k
-        d:rect(v(cx, top + 9 * k), v(cx + c.x + 16 * k, top + 31 * k), CHIP_PAUSED)
-        d:text(v(cx + 8 * k, top + 20 * k - c.y / 2), state, chip_style)
+        d:text(v(x, top - 2 * k), now, now_style)
+        d:text(v(x + a.x, top - 2 * k + (a.y - b.y) - 3 * k), all, all_style)
+        S.tag(d, vx + vw + 10 * k, tag_y, line.phase == "played" and "LINE ENDED" or "PAUSED", k)
     else
-        centred(d, "No line yet", txt(28, TEXT), width / 2, top - 2 * k)
-        centred(d, "Stand where your line should start, then press New line.", txt(16, MUTED, "body"), width / 2, top + 34 * k)
+        S.centred(d, "NO LINE YET", S.font(28, S.TEXT, "heading", true), width / 2, top + 10 * k)
+        S.centred(d, "Stand where your line should start, then press New line.", S.font(15, S.MUTED, "body", true), width / 2, top + 44 * k)
     end
-    -- Report a problem, top right: quiet, an outline with a "!" in a circle.
-    local rb = buttons.report
-    local report_hover = mouse and inside(mouse.position, rb)
-    if report_hover then d:rect(v(rb.x0, rb.y0), v(rb.x1, rb.y1), SURFACE_HOVER) end
-    d:rect(v(rb.x0, rb.y0), v(rb.x1, rb.y1), {colour = report_hover and "#ffffff60" or "#ffffff30", thickness = 1, rounding = 10})
-    local report_style = txt(15, report_hover and TEXT or MUTED, "bold")
-    local rs = d:measure("Report a problem", report_style)
-    local rcy = (rb.y0 + rb.y1) / 2
-    local rx = (rb.x0 + rb.x1) / 2 - (rs.x + 24 * k) / 2
-    d:circle(v(rx + 8 * k, rcy), 8 * k, {colour = report_hover and TEXT or MUTED, thickness = 1.5})
-    d:rect(v(rx + 7 * k, rcy - 4.5 * k), v(rx + 9 * k, rcy + 1 * k), {colour = report_hover and TEXT or MUTED, fill = true})
-    d:rect(v(rx + 7 * k, rcy + 2.5 * k), v(rx + 9 * k, rcy + 4.5 * k), {colour = report_hover and TEXT or MUTED, fill = true})
-    d:text(v(rx + 24 * k, rcy - rs.y / 2), "Report a problem", report_style)
-    -- My lines, beside it: the lines saved, to save this one or go back to another.
-    local lb = buttons.lines
-    local lines_hover = mouse and inside(mouse.position, lb)
-    d:rect(v(lb.x0, lb.y0), v(lb.x1, lb.y1), lines_hover and PILL or SURFACE_OFF)
-    d:rect(v(lb.x0, lb.y0), v(lb.x1, lb.y1), {colour = lines_hover and ACCENT or "#02f7da80", thickness = 1, rounding = 10})
-    local lines_style = txt(15, lines_hover and TEXT or ACCENT, "bold")
-    local ls = d:measure("My lines", lines_style)
-    d:text(v((lb.x0 + lb.x1) / 2 - ls.x / 2, (lb.y0 + lb.y1) / 2 - ls.y / 2), "My lines", lines_style)
+    -- Report a problem, top right: quiet, with a "!" in a circle. My lines beside it.
+    local function bang(dd, x, y, colour)
+        dd:circle(v(x, y), 8 * k, {colour = colour, thickness = 1.8})
+        dd:rect(v(x - 1 * k, y - 4.5 * k), v(x + 1 * k, y + 1 * k), {colour = colour, fill = true})
+        dd:rect(v(x - 1 * k, y + 2.5 * k), v(x + 1 * k, y + 4.5 * k), {colour = colour, fill = true})
+    end
+    S.button(d, buttons.report, "Report a problem", {kind = "quiet", mouse = mouse, k = k, size = 13, icon = bang})
+    S.button(d, buttons.lines, "My lines", {mouse = mouse, k = k, size = 13})
 
-    local keys = "Enter: retake      Esc: close" -- scrubbing explains itself; room for My lines
-    local keys_style = txt(15, MUTED, "body")
-    local ks = d:measure(keys, keys_style)
-    d:text(v(buttons.lines.x0 - 22 * k - ks.x, top + 12 * k), keys, keys_style)
+    -- With takes: "< Take 2 of 4 >" where the keys are; else the keys.
+    local takes = L.takes_status and L.takes_status()
+    if takes then
+        local tp, tn = buttons.take_prev, buttons.take_next
+        S.button(d, tp, "<", {mouse = mouse, k = k, off = takes.index <= 1, size = 15})
+        S.button(d, tn, ">", {mouse = mouse, k = k, off = takes.index >= takes.count, size = 15})
+        local label = takes.busy and "SWITCHING…" or string.format("TAKE %d OF %d", takes.index, takes.count)
+        S.centred(d, label, S.font(14, takes.index == takes.count and S.TEXT or S.ACCENT, "bold", true), (tp.x1 + tn.x0) / 2, (tp.y0 + tp.y1) / 2)
+    else
+        local x = buttons.lines.x0 - 26 * k - S.keycap_width(d, "Esc", "Close", k) - 22 * k - S.keycap_width(d, "Enter", "Retake", k)
+        local ky = (buttons.lines.y0 + buttons.lines.y1) / 2 - 11 * k
+        x += S.keycap(d, x, ky, "Enter", "Retake", k) + 22 * k
+        S.keycap(d, x, ky, "Esc", "Close", k)
+    end
 
     -- The timeline: what has played in teal, retakes above, bails below, the playhead on top.
-    d:rect(v(bar.x0, bar.y0), v(bar.x1, bar.y1), TRACK)
+    local mid = (bar.y0 + bar.y1) / 2
+    d:rect(v(bar.x0 - 2 * k, bar.y0 - 2 * k), v(bar.x1 + 2 * k, bar.y1 + 2 * k), {colour = "#000000", fill = true})
+    d:rect(v(bar.x0, bar.y0), v(bar.x1, bar.y1), {colour = "#ffffff22", fill = true})
     local span = math.max(1, line.length)
     local function x_of(step) return bar.x0 + (bar.x1 - bar.x0) * step / span end
-    local mid = (bar.y0 + bar.y1) / 2
     if has_line() then
         local head = x_of(player.cursor)
-        if head > bar.x0 + 2 then d:rect(v(bar.x0, bar.y0), v(head, bar.y1), PLAYED) end
+        if head > bar.x0 + 1 then d:rect(v(bar.x0, bar.y0), v(head, bar.y1), {colour = S.ACCENT, fill = true}) end
         for _, step in joins do
             local x = x_of(step)
-            d:poly({v(x - 6 * k, bar.y0 - 14 * k), v(x + 6 * k, bar.y0 - 14 * k), v(x, bar.y0 - 4 * k)}, {colour = ACCENT, fill = true})
+            d:poly({v(x - 7 * k, bar.y0 - 16 * k), v(x + 7 * k, bar.y0 - 16 * k), v(x, bar.y0 - 5 * k)}, {colour = S.ACCENT, fill = true})
         end
-        for _, step in bails do d:circle(v(x_of(step), bar.y1 + 11 * k), 4 * k, {colour = RED, fill = true}) end
+        for _, step in bails do d:circle(v(x_of(step), bar.y1 + 12 * k), 4.5 * k, {colour = S.RED, fill = true}) end
         -- Where the mouse would put it.
         local over = mouse and inside(mouse.position, {x0 = bar.x0, x1 = bar.x1, y0 = bar.y0 - 20 * k, y1 = bar.y1 + 20 * k})
         local function bubble(x, label)
-            local style = txt(14, TEXT, "bold")
+            local style = S.font(14, S.INK, "bold")
             local size = d:measure(label, style)
-            local bx = U.clamp(x - size.x / 2 - 8 * k, panel.x0 + 8 * k, panel.x1 - size.x - 24 * k)
-            d:rect(v(bx, bar.y0 - 46 * k), v(bx + size.x + 16 * k, bar.y0 - 22 * k), BUBBLE)
-            d:text(v(bx + 8 * k, bar.y0 - 34 * k - size.y / 2), label, style)
+            local bx = U.clamp(x - size.x / 2 - 9 * k, panel.x0 + 8 * k, panel.x1 - size.x - 26 * k)
+            local r = {x0 = bx, x1 = bx + size.x + 18 * k, y0 = bar.y0 - 50 * k, y1 = bar.y0 - 24 * k}
+            S.tile(d, r, S.PAPER, 31, k * 0.5)
+            d:text(v(bx + 9 * k, (r.y0 + r.y1) / 2 - size.y / 2), label, style)
         end
         if over and not player.dragging then
             local x = mouse.position.x
-            d:line(v(x, bar.y0 - 6 * k), v(x, bar.y1 + 6 * k), {colour = "#ffffff70", thickness = 2})
+            d:line(v(x, bar.y0 - 8 * k), v(x, bar.y1 + 8 * k), {colour = "#ffffff90", thickness = 2})
             bubble(x, clock_text(U.clamp((x - bar.x0) / (bar.x1 - bar.x0), 0, 1) * line.length))
         end
-        d:circle(v(head, mid), 11 * k, {colour = INK_HEX, fill = true})
-        d:circle(v(head, mid), 8 * k, {colour = "#ffffff", fill = true})
+        d:circle(v(head, mid), 13 * k, {colour = "#000000", fill = true})
+        d:circle(v(head, mid), 10 * k, {colour = S.PAPER, fill = true})
+        d:circle(v(head, mid), 4 * k, {colour = S.ACCENT, fill = true})
         if player.dragging then bubble(head, clock_text(player.cursor)) end
         -- What the marks are.
-        local legend = txt(13, MUTED, "body")
-        local lx, ly = bar.x0, bar.y1 + 20 * k
-        d:poly({v(lx, ly + 2 * k), v(lx + 10 * k, ly + 2 * k), v(lx + 5 * k, ly + 10 * k)}, {colour = ACCENT, fill = true})
-        d:text(v(lx + 16 * k, ly - 1 * k), "Retake", legend)
-        local rx = lx + 16 * k + d:measure("Retake", legend).x + 18 * k
-        d:circle(v(rx + 4 * k, ly + 6 * k), 4 * k, {colour = RED, fill = true})
-        d:text(v(rx + 14 * k, ly - 1 * k), "Bail", legend)
+        local legend = S.font(12, S.MUTED, "bold", true)
+        local lx, ly = bar.x0, bar.y1 + 22 * k
+        d:poly({v(lx, ly + 2 * k), v(lx + 11 * k, ly + 2 * k), v(lx + 5.5 * k, ly + 11 * k)}, {colour = S.ACCENT, fill = true})
+        d:text(v(lx + 17 * k, ly - 1 * k), "RETAKE", legend)
+        local rx = lx + 17 * k + d:measure("RETAKE", legend).x + 18 * k
+        d:circle(v(rx + 4.5 * k, ly + 6 * k), 4.5 * k, {colour = S.RED, fill = true})
+        d:text(v(rx + 15 * k, ly - 1 * k), "BAIL", legend)
     end
 
-    -- The buttons. One primary action; settings as chips; the ones that end things on the right.
-    local function button(r, kind, label, value, value_colour)
-        local disabled = not has_line() and (kind == "primary" or r == buttons.whole)
-        local hover = not disabled and mouse and inside(mouse.position, r)
-        local fill, ink = SURFACE, TEXT
-        if disabled then fill, ink = SURFACE_OFF, "#ffffff55"
-        elseif kind == "primary" then fill, ink = hover and PRIMARY_HOVER or PRIMARY, INK_HEX
-        elseif kind == "armed" then fill, ink = ARMED, INK_HEX
-        elseif kind == "danger" then fill, ink = hover and DANGER_HOVER or nil, RED
-        elseif hover then fill = SURFACE_HOVER end
-        if fill then d:rect(v(r.x0, r.y0), v(r.x1, r.y1), fill) end
-        if kind == "danger" then d:rect(v(r.x0, r.y0), v(r.x1, r.y1), DANGER_EDGE) end
-        local cy = (r.y0 + r.y1) / 2
-        if value then
-            local ls, vs = txt(15, MUTED, "body"), txt(18, value_colour or TEXT)
-            local a, b = d:measure(label, ls), d:measure(value, vs)
-            local x = (r.x0 + r.x1) / 2 - (a.x + 8 * k + b.x) / 2
-            d:text(v(x, cy - a.y / 2), label, ls)
-            d:text(v(x + a.x + 8 * k, cy - b.y / 2), value, vs)
-            return
-        end
-        local style = txt(18, ink)
-        local size = d:measure(label, style)
-        local icon = kind == "primary" and 26 * k or 0
-        local x = (r.x0 + r.x1) / 2 - (size.x + icon) / 2
-        if icon > 0 then replay_icon(d, x + 9 * k, cy, 9 * k, ink) end
-        d:text(v(x + icon, cy - size.y / 2), label, style)
+    -- The buttons. One primary action; settings as the game's setting tiles; the ones that end things on the right.
+    local off = not has_line()
+    S.button(d, buttons.replay, "Replay from here", {kind = "primary", mouse = mouse, k = k, off = off, size = 15,
+        icon = function(dd, x, y, colour) replay_icon(dd, x, y, 9 * k, colour) end})
+    S.button(d, buttons.whole, "Play whole line", {mouse = mouse, k = k, off = off, size = 15})
+    S.button(d, buttons.carry_on, "Carry on", {mouse = mouse, k = k, size = 15})
+    S.setting(d, buttons.speed, "Catch-up", string.format("%d×", catch_up), {mouse = mouse, k = k})
+    S.setting(d, buttons.slowmo, "Slow-mo", string.format("%d%%", math.floor(slowmo_speed * 100 + 0.5)), {mouse = mouse, k = k})
+    S.setting(d, buttons.bails, "Bails", no_bail and "Off" or "On", {mouse = mouse, k = k, value_colour = no_bail and S.RED or nil})
+    if L.slowkey_label then
+        local text, listening = L.slowkey_label()
+        S.setting(d, buttons.slowkey, "Slow-mo key", text, {mouse = mouse, k = k,
+            value_colour = listening and S.STICKY or (text == "Off" and S.MUTED or nil)})
     end
-    button(buttons.replay, "primary", "Replay from here")
-    button(buttons.whole, "normal", "Play whole line")
-    button(buttons.carry_on, "normal", "Carry on")
-    button(buttons.speed, "chip", "Catch-up", string.format("%d×", catch_up))
-    button(buttons.slowmo, "chip", "Slow-mo", string.format("%d%%", math.floor(slowmo_speed * 100 + 0.5)))
-    button(buttons.bails, "chip", "Bails", no_bail and "Off" or "On", no_bail and RED or nil)
-    button(buttons.new, player.confirm and "armed" or "normal", player.confirm and "Erase line?" or "New line")
-    button(buttons.stop, "danger", "Stop all")
+    S.button(d, buttons.new, player.confirm and "Erase line?" or "New line", {kind = player.confirm and "armed" or "tile", mouse = mouse, k = k, size = 15})
+    S.button(d, buttons.stop, "Stop all", {kind = "danger", mouse = mouse, k = k, size = 15})
 end
 
--- A small status pill in the top left, for while you skate.
+-- A small status tile in the top left, for while you skate: a dot, what it is, and its key.
 local function hud_pill(d, k, y, dot, label, label_colour, key)
-    local style = txt(17, label_colour or TEXT)
+    local style = S.font(16, label_colour or S.TEXT, "bold", true)
     local size = d:measure(label, style)
     local x = 32 * k
-    local w = 20 * k + (dot and 16 * k or 0) + size.x + (key and 46 * k or 0)
-    d:rect(v(x, y), v(x + w, y + 32 * k), HUD_PILL)
-    local tx = x + 10 * k
+    local cap = key and S.keycap_width(d, key, nil, k) + 12 * k or 0
+    local w = 24 * k + (dot and 18 * k or 0) + size.x + cap
+    S.tile(d, {x0 = x, x1 = x + w, y0 = y, y1 = y + 34 * k}, "#1a1a1ae0", S.seed(label), k * 0.6)
+    local tx = x + 12 * k
     if dot then
-        d:circle(v(tx + 5 * k, y + 16 * k), 5 * k, {colour = dot, fill = true})
-        tx += 16 * k
+        d:circle(v(tx + 6 * k, y + 17 * k), 6 * k, {colour = dot, fill = true})
+        tx += 18 * k
     end
-    d:text(v(tx, y + 16 * k - size.y / 2), label, style)
-    if key then
-        local ks = txt(12, INK_HEX, "bold")
-        local kz = d:measure(key, ks)
-        local kx = tx + size.x + 10 * k
-        d:rect(v(kx, y + 7 * k), v(kx + kz.x + 12 * k, y + 25 * k), {colour = "#ffffffd0", fill = true, rounding = 4})
-        d:text(v(kx + 6 * k, y + 16 * k - kz.y / 2), key, ks)
-    end
+    d:text(v(tx, y + 17 * k - size.y / 2), label, style)
+    if key then S.keycap(d, tx + size.x + 12 * k, y + 6 * k, key, nil, k) end
 end
 
 function L.draw(d)
@@ -1251,9 +1250,9 @@ function L.draw(d)
     end
     if count then
         local shown = centred(d, tostring(math.max(1, math.ceil((count.ends - U.now()) / 1000))), BIG_STYLE, width / 2, middle)
-        centred(d, "Hands on the controller", SMALL_STYLE, width / 2, middle + shown.y + 8 * k)
+        centred(d, "HANDS ON THE CONTROLLER", SMALL_STYLE, width / 2, middle + shown.y + 8 * k)
     elseif U.now() < go_until then
-        centred(d, "GO", BIG_STYLE, width / 2, middle)
+        centred(d, "GO!", GO_STYLE, width / 2, middle)
     elseif line.phase == "seeking" or line.phase == "counting" then
         centred(d, pending and pending.to == 0 and "New line: stand still" or "Going back", SMALL_STYLE, width / 2, middle)
     elseif line.phase == "running_up" and pending and pending.hand_over then
@@ -1275,6 +1274,14 @@ function L.phase()
 end
 
 L.on_lines = nil -- the timeline's My lines: library.lua opens its window
+L.on_slowkey = nil -- the timeline's Slow-mo key: slowkey.lua listens for the buttons
+L.slowkey_label = nil -- what slow motion is on, and whether it is listening
+
+
+-- The line's own id: given when it begins, kept when it is saved and loaded, so its takes stay with it.
+function L.line_id()
+    return line_uid
+end
 L.find_pad = function() return find_pad() end
 
 -- Going back, counting down or testing: the line is not to be saved or replaced now.
@@ -1296,6 +1303,7 @@ end
 -- A saved line, loaded back by ReSkate.dll: where it starts and its marks again. Its path is read back from its steps.
 function L.adopt(meta)
     local s = meta.start or {}
+    line_uid = meta.line_id or line_uid or os.date("%Y%m%d-%H%M%S")
     start = {position = vector.create(s.x or 0, s.y or 0, s.z or 0), heading = s.heading or 0, on_board = s.on_board ~= false}
     joins, bails, marks = {}, {}, {}
     for _, step in meta.joins or {} do table.insert(joins, step) end
