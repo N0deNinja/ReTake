@@ -75,6 +75,24 @@ public:
         }
         return why;
     }
+    // Client thread: a line saved before, back as `owner`'s line on this controller, stopped where it ended: going
+    // back in it works as in one just recorded. Refused while a script runs.
+    std::string load_line(std::string_view owner, unsigned controller, std::vector<PadOutput> frames) {
+        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
+        if (frames.empty() || frames.size() > max_steps) return "a line is 1 to 36000 steps";
+        std::lock_guard lock(mutex_);
+        if (const auto why = taken(owner); !why.empty()) return why;
+        if (mode_ != Mode::off) return "a script is running";
+        frames_ = std::move(frames);
+        limit_ = max_steps;
+        latest_ = {};
+        latched_ = frames_.back();
+        begin(owner, controller, Mode::off, 0);
+        line_ = true;
+        step_ = frames_.size();
+        stopped_ = "loaded";
+        return {};
+    }
     // Physics thread: a line holds: no step counts and the game reads a neutral controller, until it runs
     // up. What was recorded stays. False with nothing recorded and nothing running.
     bool hold() {

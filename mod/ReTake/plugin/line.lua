@@ -226,16 +226,32 @@ end
 
 -- Back to a moment: where the line started, then up to it. The teleport first: refused (at most two a
 -- second), nothing has happened.
+-- On the board at the line's start, as it was recorded, or on foot: the board upright under the skater (its up axis
+-- 1.0 high) or carried (0.3). New line asks for the board, but the game can leave the skater on foot, and a line
+-- begun on foot (run, then Triangle onto the board) replayed on the board goes wrong from its first step: after a
+-- trip to another map the teleport put the board under the skater, and the replay jumped about (2026-11-08). So
+-- going back starts as the recording did. nil when the recording cannot say.
+local function recorded_on_board()
+    if not reskate.tas.line_bodies then return nil end
+    for _, step in {0, 1, 2} do
+        local ok, bodies = pcall(reskate.tas.line_bodies, step)
+        if ok and bodies and bodies.board and bodies.board[6] then return bodies.board[6] > 0.8 end
+    end
+    return nil
+end
+
 local function seek(to, hand_over, retries)
     if not start then return false, "no line is recorded" end
     full_speed()
     count = nil
-    local ok, why = reskate.skater.teleport(start.position, start.heading, {on_board = start.on_board})
+    local on_board = recorded_on_board()
+    if on_board == nil then on_board = start.on_board end
+    local ok, why = reskate.skater.teleport(start.position, start.heading, {on_board = on_board})
     if not ok then return false, why end
     ok, why = reskate.tas.line_seek(0, to, START_STEP, hand_over)
     if not ok then return false, why end
     local soon = (retries and pending and pending.air_soon) or air_soon(to)
-    pending = {from = 0, to = to, hand_over = hand_over, retries = retries or 0, asked_at = U.now(), air_soon = soon}
+    pending = {from = 0, to = to, hand_over = hand_over, retries = retries or 0, asked_at = U.now(), air_soon = soon, on_board = on_board}
     if retries then return true end
     if hand_over then
         R.line(string.format("[line] back to %s of %s", clock_text(to), clock_text(line.length)))
@@ -455,6 +471,14 @@ end
 C.listen(function(s)
     if not s.x then return end
     if test then test_step(s) end
+    -- Off the board while going back, in a line that started on it: once a going back, where and how, for a report.
+    -- After a trip to another map the board went its recorded way and the skater stayed at the start on foot (2026-11-08).
+    if pending and not pending.off_logged and line.phase == "running_up" and pending.on_board and (s.state == 504 or s.state == 300) then
+        pending.off_logged = true
+        local root = reskate.skater.position()
+        R.line(string.format("[line] off the board while going back, at step %d (state %s): board at %.1f, %.1f, %.1f, skater at %s, %d steps since the teleport",
+            line.step, tostring(s.state), s.x, s.y, s.z, root and string.format("%.1f, %.1f, %.1f", root.x, root.y, root.z) or "?", line.since_spawn or -1))
+    end
     local function f(v) return string.format("%.4f", v or 0) end
     if filming and line.phase == "running_up" and #filming.rows < ROWS_KEPT then
         table.insert(filming.rows, {#filming.rows, f(s.x), f(s.y), f(s.z), f(s.vx), f(s.vy), f(s.vz), tostring(s.state or ""),
@@ -676,6 +700,7 @@ local function layout()
     b.bails = at(b.slowmo.x1 + gap, chip)
     -- In the header, on the right: the header row's middle is panel.y0 + 52k.
     b.report = {x0 = right - 196 * k, x1 = right, y0 = panel.y0 + 36 * k, y1 = panel.y0 + 68 * k}
+    b.lines = {x0 = b.report.x0 - gap - 132 * k, x1 = b.report.x0 - gap, y0 = b.report.y0, y1 = b.report.y1}
     return k, panel, bar, b
 end
 
@@ -743,6 +768,9 @@ local function press(name)
     elseif name == "report" then
         end_preview()
         if L.on_report then say_failure(L.on_report()) end
+    elseif name == "lines" then
+        end_preview()
+        if L.on_lines then say_failure(L.on_lines()) end
     end
 end
 
@@ -919,8 +947,27 @@ function L.tick(busy)
         local want = slowmo_on and slowmo_speed or 1
         if want ~= applied_speed then set_speed(want, true) end
     end
-    -- Rolling after the teleport (one in three did): going again costs only a moment.
-    if line.phase == "counting" and pending and pending.retries < RETRIES and line.since_spawn >= START_STEP - 30 and line.since_spawn < START_STEP - 20 and skater.speed > 0.5 then
+    -- After arriving, not as the line began, on the board or on foot (recorded_on_board): the teleport could not
+    -- change it. Replayed so, the recording is put back each step on a skater the game moves another way, and it
+    -- jumps about (2026-11-08). So the same, again; and if it never takes, stopped, with a word.
+    local state = C.last and C.last.state
+    local on_foot = state == 504 or state == 300
+    local wrong = pending and pending.on_board ~= nil and state ~= nil and ((pending.on_board and on_foot) or (not pending.on_board and not on_foot))
+    if line.phase == "counting" and wrong and line.since_spawn >= START_STEP - 30 and line.since_spawn < START_STEP - 20 then
+        local p = pending
+        local want = p.on_board and "on the board" or "on foot"
+        if p.retries < RETRIES then
+            R.line("[line] not " .. want .. " after arriving, as the line began: teleporting again")
+            seek(p.to, p.hand_over, p.retries + 1)
+        else
+            R.line("[line] still not " .. want .. " after " .. RETRIES .. " teleports: stopped")
+            pending = nil
+            reskate.tas.line_halt()
+            full_speed()
+            R.toast(p.on_board and "This line starts on the board: get on it, then retake." or "This line starts on foot: step off the board, then retake.", "warn")
+        end
+    elseif line.phase == "counting" and pending and pending.retries < RETRIES and line.since_spawn >= START_STEP - 30 and line.since_spawn < START_STEP - 20 and skater.speed > 0.5 then
+        -- Rolling after the teleport (one in three did): going again costs only a moment.
         local p = pending
         R.line(string.format("[line] still moving after arriving (%.2f m/s): teleporting again", skater.speed))
         seek(p.to, p.hand_over, p.retries + 1)
@@ -932,7 +979,7 @@ function L.tick(busy)
 end
 
 -- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
-local VERSION = "0.0.3"
+local VERSION = "0.0.4"
 local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
 local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
 local PANEL = {colour = "#0c0d11eb", fill = true, rounding = 16}
@@ -1073,11 +1120,19 @@ local function draw_player(d)
     d:rect(v(rx + 7 * k, rcy - 4.5 * k), v(rx + 9 * k, rcy + 1 * k), {colour = report_hover and TEXT or MUTED, fill = true})
     d:rect(v(rx + 7 * k, rcy + 2.5 * k), v(rx + 9 * k, rcy + 4.5 * k), {colour = report_hover and TEXT or MUTED, fill = true})
     d:text(v(rx + 24 * k, rcy - rs.y / 2), "Report a problem", report_style)
+    -- My lines, beside it: the lines saved, to save this one or go back to another.
+    local lb = buttons.lines
+    local lines_hover = mouse and inside(mouse.position, lb)
+    d:rect(v(lb.x0, lb.y0), v(lb.x1, lb.y1), lines_hover and PILL or SURFACE_OFF)
+    d:rect(v(lb.x0, lb.y0), v(lb.x1, lb.y1), {colour = lines_hover and ACCENT or "#02f7da80", thickness = 1, rounding = 10})
+    local lines_style = txt(15, lines_hover and TEXT or ACCENT, "bold")
+    local ls = d:measure("My lines", lines_style)
+    d:text(v((lb.x0 + lb.x1) / 2 - ls.x / 2, (lb.y0 + lb.y1) / 2 - ls.y / 2), "My lines", lines_style)
 
-    local keys = "Scrub: drag · wheel · ←/→      Enter: retake      Esc: close"
+    local keys = "Enter: retake      Esc: close" -- scrubbing explains itself; room for My lines
     local keys_style = txt(15, MUTED, "body")
     local ks = d:measure(keys, keys_style)
-    d:text(v(rb.x0 - 22 * k - ks.x, top + 12 * k), keys, keys_style)
+    d:text(v(buttons.lines.x0 - 22 * k - ks.x, top + 12 * k), keys, keys_style)
 
     -- The timeline: what has played in teal, retakes above, bails below, the playhead on top.
     d:rect(v(bar.x0, bar.y0), v(bar.x1, bar.y1), TRACK)
@@ -1217,6 +1272,47 @@ end
 
 function L.phase()
     return line.phase, line.length
+end
+
+L.on_lines = nil -- the timeline's My lines: library.lua opens its window
+L.find_pad = function() return find_pad() end
+
+-- Going back, counting down or testing: the line is not to be saved or replaced now.
+function L.busy()
+    return going_back() or count ~= nil or test ~= nil or (pending ~= nil and not pending.armed)
+end
+
+-- What a saved line keeps beside its steps: where it started, and where it was retaken and bailed.
+function L.info()
+    local function copy(t)
+        local out = {}
+        for _, value in t do table.insert(out, value) end
+        return out
+    end
+    local now_line = reskate.tas.line() -- as it is now, not as the last tick saw it
+    return {phase = now_line.phase, length = now_line.length, start = start, joins = copy(joins), bails = copy(bails)}
+end
+
+-- A saved line, loaded back by ReSkate.dll: where it starts and its marks again. Its path is read back from its steps.
+function L.adopt(meta)
+    local s = meta.start or {}
+    start = {position = vector.create(s.x or 0, s.y or 0, s.z or 0), heading = s.heading or 0, on_board = s.on_board ~= false}
+    joins, bails, marks = {}, {}, {}
+    for _, step in meta.joins or {} do table.insert(joins, step) end
+    for _, step in meta.bails or {} do table.insert(bails, step) end
+    line = reskate.tas.line()
+    for step = 0, line.length, MARK_EVERY do
+        local ok, place = pcall(reskate.tas.line_position, step)
+        if ok and place then table.insert(marks, {step = step, position = place, air = false}) end
+    end
+    pending, count, probe, filming = nil, nil, nil, nil
+    previous_phase = line.phase
+    hint_until = U.now() + HINT_MS
+    hint_text = "Line loaded.  F11: timeline"
+    if player then
+        player.cursor, player.following, player.ghost, player.confirm = line.length, true, nil, false
+    end
+    R.line(string.format("[line] loaded %q, %s, %d retakes", tostring(meta.name), clock_text(line.length), #joins))
 end
 
 -- What the report's recorder takes every frame: cheap, no copies.

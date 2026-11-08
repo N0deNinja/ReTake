@@ -5,13 +5,21 @@ local R = require("report")
 local L = require("line")
 local P = require("problem")
 local T = require("coretest")
+local LIB = require("library")
 
--- Report a problem, in the timeline: its window sits over the timeline, which freezes the recorder as it opens.
+-- Report a problem and My lines, in the timeline: their windows sit over the timeline, which waits under them (and
+-- freezes the recorder as it opens).
 L.on_report = function() return P.open(true) end
-L.report_open = P.is_open
+L.on_lines = function() return LIB.open(true) end
+L.report_open = function() return P.is_open() or LIB.is_open() end
 L.on_stop_all = function() T.stop("Stop all") end
 L.on_timeline = function(open)
-    if open then P.freeze("you opened the timeline") elseif P.is_open() then P.drop() end
+    if open then
+        P.freeze("you opened the timeline")
+    else
+        if P.is_open() then P.drop() end
+        if LIB.is_open() then LIB.drop() end
+    end
 end
 
 local function say(text)
@@ -31,6 +39,10 @@ local function help()
     say("Ctrl+R                    go back 1 second; press again to go further back")
     say("Click both sticks         slow motion on and off")
     say("retake new                start a new line where you stand")
+    say("retake save [name]        save the line, to come back to it after closing the game")
+    say("retake lines              your saved lines, numbered (also: F11, My lines)")
+    say("retake load <number>      load a saved line, in place of the one you have")
+    say("retake delete <number>    delete a saved line")
     say("retake back [seconds]     go back that far (default 1)")
     say("retake whole              play the whole line as one take")
     say("retake slowmo [0.05-0.9]  slow motion on and off, or how slow (default 0.25)")
@@ -87,6 +99,29 @@ reskate.console.command("retake", "ReTake: rewind and retake your lines", functi
         if args[2] == "on" then on = true elseif args[2] == "off" then on = false end
         say(L.ease(on) and "ReTake: easing is ON, slowing down and speeding up ease in (retake ease off: at once)"
             or "ReTake: easing is OFF, speed changes are at once (retake ease on: they ease in)")
+    elseif sub == "save" then
+        local name = table.concat(args, " ", 2)
+        local ok, why = LIB.save(name)
+        answer(ok, why)
+        if ok then say("ReTake: saving the line…") end
+    elseif sub == "lines" then
+        local entries = LIB.list()
+        if #entries == 0 then say("ReTake: no lines saved yet. retake save saves the one you have") end
+        for index, e in entries do
+            local seconds = (e.meta.length or 0) / 60
+            say(string.format("%3d  %s  (%d:%05.2f, saved %s)", index, tostring(e.meta.name), math.floor(seconds / 60), seconds % 60, tostring(e.meta.saved)))
+        end
+    elseif sub == "load" or sub == "delete" then
+        local entry = LIB.list()[tonumber(args[2]) or 0]
+        if not entry then
+            answer(false, "which one? retake lines numbers them")
+        elseif sub == "load" then
+            answer(LIB.load(entry.id))
+        else
+            local ok, why = LIB.delete(entry.id)
+            answer(ok, why)
+            if ok then say("ReTake: deleted " .. tostring(entry.meta.name)) end
+        end
     elseif sub == "skatertest" then
         if T.running() then
             T.stop("stopped from the console")
@@ -99,6 +134,10 @@ reskate.console.command("retake", "ReTake: rewind and retake your lines", functi
     end
 end, {
     {name = "new", help = "Start a new line where you stand"},
+    {name = "save", args = "[name]", help = "Save the line, to come back to it after closing the game"},
+    {name = "lines", help = "Your saved lines, numbered"},
+    {name = "load", args = "<number>", help = "Load a saved line, in place of the one you have"},
+    {name = "delete", args = "<number>", help = "Delete a saved line"},
     {name = "back", args = "[seconds]", help = "Go back in the line (default 1 second)"},
     {name = "whole", help = "Play the whole line as one take"},
     {name = "slowmo", args = "[0.05 to 0.9]", help = "Slow motion on and off, or how slow"},
@@ -134,6 +173,7 @@ end)
 reskate.on("screen_closed", function(title)
     L.on_screen_closed(title)
     P.on_screen_closed(title)
+    LIB.on_screen_closed(title)
 end)
 
 reskate.on("bail", function(e)
@@ -143,6 +183,7 @@ end)
 reskate.on("tick", function()
     L.tick(T.running())
     T.tick()
+    LIB.tick(U.now())
     P.tick(U.now())
     R.tick(U.now())
 end)
@@ -151,6 +192,7 @@ reskate.on("draw", function(d)
     L.draw(d)
     T.draw(d, {colour = "#ffffffd0", size = 26 * d:size().y / 1080, shadow = true, font = "heading"})
     P.draw(d)
+    LIB.draw(d)
 end)
 
 reskate.on("unload", function()

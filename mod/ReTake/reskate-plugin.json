@@ -17,6 +17,7 @@
         "events.physics.geometry",
         "game.speed",
         "ui.screen",
-        "camera"
+        "camera",
+        "travel"
     ]
 }

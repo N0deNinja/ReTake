@@ -3191,6 +3191,30 @@ struct WorldApi {
         lua_pushlstring(L, status.data(), status.size());
         return 1;
     }
+    // tas.line_export(path): the line, every step of it, to a file in the plugin's data folder, to load after the game
+    // has been closed. tas.line_import(path, controller): such a file back as the plugin's line, stopped where it ended.
+    // Both run in the background: tas.line_file_status() is "saving", "loading", "saved", "loaded", why not, or "".
+    static int tas_line_export(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.line_export");
+        need(L, plugin, "files", "reskate.tas.line_export");
+        const auto path = data_path(L, 1, false);
+        return result(L, game(plugin).tas_line_export(plugin.id(), path));
+    }
+    static int tas_line_import(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.line_import");
+        need(L, plugin, "files", "reskate.tas.line_import");
+        const auto path = data_path(L, 1, false);
+        return result(L, game(plugin).tas_line_import(plugin.id(), path, tas_controller(L, 2)));
+    }
+    static int tas_line_file_status(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.line_file_status");
+        const auto status = game(plugin).tas_line_file_status();
+        lua_pushlstring(L, status.data(), status.size());
+        return 1;
+    }
     static int tas_stop(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "tas", "reskate.tas.stop");
@@ -3581,7 +3605,8 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
     add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
         {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
         {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status}});
+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
+        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status}});
     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
     add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                   {"ready", entities_ready}, {"blueprints", entities_blueprints},

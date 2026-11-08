@@ -15,6 +15,7 @@
 #include "Engine/Vfs/mod_list.h"
 #include "Engine/Game/Input/pad_output.h"
 #include "Engine/Game/Input/step_script.h"
+#include "Extension/Plugins/line_file.h"
 #include "Engine/Game/Input/playstation_report.h"
 #include "Engine/Game/Input/gameplay_options.h"
 #ifdef _WIN32 // reads memory as the game does (Engine/Core/Platform/memory.h)
@@ -4233,6 +4234,44 @@ void plugins_script_input_by_physics_step() {
     s.interrupt();
     check(s.status().mode == StepScript::Mode::off, "a held read ends it too");
     check(!StepScript::frame_at(0, 0, 5) && !StepScript::frame_at(1, -2, 5) && StepScript::frame_at(4, -2, 5) == 1 && StepScript::frame_at(4, 8, 5) == 4, "lead stays in the script");
+
+    // A saved line, loaded back: stopped where it ended, and going back in it plays it up to the moment.
+    StepScript loaded;
+    check(!loaded.load_line("one", 0, {}).empty(), "an empty line is refused");
+    check(loaded.load_line("one", 0, {pad(1), pad(2), pad(3), pad(4)}).empty(), "a saved line loads");
+    check(loaded.status().mode == StepScript::Mode::off && loaded.status().length == 4 && loaded.status().stopped == "loaded", "stopped, as long as it was");
+    check(loaded.recorded().size() == 4 && loaded.recorded()[2].left_x == 3, "its steps as saved");
+    check(loaded.hold(), "a loaded line holds like any line");
+    loaded.run_up(0, 2, true);
+    check(loaded.on_read(0, pad(50), true)->left_x == 0, "neutral until its first step");
+    loaded.step();
+    check(loaded.on_read(0, pad(50), true)->left_x == 1, "then plays it");
+    loaded.step();
+    check(loaded.status().mode == StepScript::Mode::recording && loaded.status().length == 2, "and hands over at the moment, the rest forgotten");
+    check(!loaded.load_line("two", 0, {pad(1)}).empty(), "nothing loads while a script runs");
+
+    // A line's file: the header says what follows, and what does not fit it is refused.
+    struct Motion {
+        float place[4];
+        bool valid;
+    };
+    const std::vector<PadOutput> steps{pad(5), pad(6), pad(7)};
+    const std::vector<Motion> motion{{{1, 2, 3, 4}, true}, {{5, 6, 7, 8}, false}};
+    const auto raw = dingosdk::line_file::pack(steps, motion);
+    auto header = dingosdk::line_file::header_for<Motion>(steps.size(), motion.size(), raw.size(), 100);
+    check(dingosdk::line_file::check<Motion>(header, sizeof(header) + 100, 36000).empty(), "a line's header passes");
+    std::vector<PadOutput> steps_back;
+    std::vector<Motion> motion_back;
+    check(dingosdk::line_file::unpack(raw, header, steps_back, motion_back) && steps_back.size() == 3 && steps_back[2].left_x == 7 &&
+              motion_back.size() == 2 && motion_back[1].place[3] == 8 && !motion_back[1].valid,
+          "and its steps and motion come back as they were");
+    check(!dingosdk::line_file::check<Motion>(header, sizeof(header) + 99, 36000).empty(), "a file cut short is refused");
+    auto other = header;
+    other.snapshot_size += 4;
+    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "one from another build is refused");
+    other = header;
+    other.magic[0] = 'X';
+    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "and anything else");
 }
 
 void controller_reports_preserve_non_controls() {

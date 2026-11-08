@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.0.4 (2026-11-08)
+
+### My lines: save your lines and come back to them
+
+- **Save a line and come back to it later, even after closing the game.** F11, **My lines** (top right of the timeline), **Save this line**. Your saved lines are listed there with their length, date and number of retakes, to **Load** or **Delete** (it asks "Sure?" first).
+- **Loading a line** replaces the one you have. It is stopped at its end, as if you had just recorded it: open the timeline, pick any moment and retake it, retakes and all.
+- **A line keeps its map.** Load one that was saved on another map and ReTake travels there first, the way the game's own travel does, then loads it. Lines saved on maps the game doesn't travel to (custom parks) aren't travelled to: ReTake tells you which map the line is on. ReTake asks for the **"travel"** permission for this, so ReSkate asks you to allow it again.
+- **Console:** `retake save [name]` (with a name of your own), `retake lines` (numbered), `retake load <number>`, `retake delete <number>`.
+- A line is saved whole: every step of the controller and of the skater (board and body), compressed, in `Mods\.reskate_plugin_data\ReTake\lines`. Saving and loading run in the background, so the game never stutters. A saved line only loads into the same ReTake `ReSkate.dll` build; another one refuses it and says why.
+
+### Fixed
+
+- **Going back starts the way your line started.** A line begun on foot (run, then hop on the board) is now replayed from on foot, and one begun on the board from the board: ReTake reads it from the recording. If the game doesn't put you in that state after the teleport, ReTake teleports again, and after three tries stops and tells you, instead of replaying the line onto a skater in the wrong state (who then jumped about on the spot).
+- Reports log the step where the skater comes off the board during a fast-forward.
+
+### Known
+
+- **Lines are most reliable when they start on the board.** A line begun on foot can come out differently after the game is restarted, because ReTake can't hold a skater on foot to the recording (on foot, the stick moves you relative to the camera). Get on your board before New line.
+- Replays can still drift on rails and jumps, saved lines or not. Pinning down what the game keeps beside the board and body is next.
+
+### ReSkate.dll
+
+- `reskate.tas.line_export(path)`, `reskate.tas.line_import(path, controller)` and `reskate.tas.line_file_status()`, in the background (zstd).
+
+### Installer
+
+- Knows 0.0.3's `ReSkate.dll`.
+
 ## 0.0.3 (2026-11-08)
 
 Slow motion rides like the real game now. The 3, 2, 1 countdown, the timeline and L3 + R3 slow motion all use it, so retakes come out of the countdown the way they went in.

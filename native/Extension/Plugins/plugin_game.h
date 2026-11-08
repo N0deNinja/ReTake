@@ -1144,6 +1144,12 @@ public:
     virtual std::string tas_skater_dump(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
     // How the last skater dump went: "writing", "saved", why it failed, or empty before the first.
     virtual std::string tas_skater_dump_status() { return {}; }
+    // A line saved to `path` in the plugin's data folder, and loaded back as this plugin's line on `controller`, stopped
+    // where it ended (Extension/Plugins/line_file.h). Both run in the background: tas_line_file_status says "saving",
+    // "loading", "saved", "loaded", why one failed, or nothing before the first.
+    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
+    virtual std::string tas_line_import(std::string_view /*plugin*/, std::string_view /*path*/, unsigned /*controller*/) { return unavailable; }
+    virtual std::string tas_line_file_status() { return {}; }
     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
     // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
     virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }

@@ -29,6 +29,8 @@
 #include "Engine/Core/Log/logging.h"
 #include <mutex>
 #include <thread>
+#include "zstd.h"
+#include "line_file.h"
 #include "Extension/Assets/live_mods.h"
 #include "Extension/Skater/game_speed.h"
 #include "Extension/Skater/motion_snapshot.h"
@@ -1568,7 +1570,7 @@ public:
     // (buttons as bits, triggers 0 to 255, sticks -32768 to 32767), and the board is where the line had it.
     static constexpr std::size_t line_save_most_bytes = 8u << 20;
     std::string tas_line_save(std::string_view plugin, std::string_view path, std::string_view text) override {
-        const auto inputs = input::step_script().recorded();
+        auto inputs = input::step_script().recorded();
         std::vector<std::array<float, 3>> boards;
         std::vector<char> valid;
         {
@@ -1649,6 +1651,145 @@ public:
         auto& state = skater_dump_state();
         std::lock_guard lock(state.mutex);
         return state.running ? std::string("writing") : state.outcome;
+    }
+    // A line saved to a file and loaded back (line_file.h). A minute of line is about 11 MB of motion before it is
+    // compressed: far past a plugin call's 50 ms, so both run on a thread of their own, one at a time, and the plugin
+    // asks how it went (tas_line_file_status).
+    struct LineFile {
+        std::mutex mutex;
+        bool running{};
+        std::string doing;   // "saving" or "loading"
+        std::string outcome; // "saved", "loaded", or why not; empty before the first
+    };
+    static LineFile& line_file_state() {
+        static auto* value = new LineFile; // a thread may still be writing at exit
+        return *value;
+    }
+    static constexpr std::uint64_t line_file_most_bytes = 512ull << 20;
+    static bool line_file_begin(const char* doing) {
+        auto& state = line_file_state();
+        std::lock_guard lock(state.mutex);
+        if (state.running) return false;
+        state.running = true;
+        state.doing = doing;
+        state.outcome.clear();
+        return true;
+    }
+    static void line_file_end(std::string outcome) {
+        auto& state = line_file_state();
+        std::lock_guard lock(state.mutex);
+        state.outcome = std::move(outcome);
+        state.running = false;
+    }
+    std::string tas_line_export(std::string_view plugin, std::string_view path) override {
+        auto& m = tas_motion();
+        auto inputs = input::step_script().recorded();
+        if (inputs.empty()) return "no line is recorded";
+        std::filesystem::path root, file;
+        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
+        std::vector<motion_snapshot::Snapshot> frames;
+        {
+            std::lock_guard lock(m.frames_mutex);
+            frames.assign(m.frames.begin(), m.frames.begin() + static_cast<std::ptrdiff_t>(std::min(m.frames.size(), inputs.size())));
+        }
+        if (!line_file_begin("saving")) return "a line is being saved or loaded";
+        std::thread([inputs = std::move(inputs), frames = std::move(frames), file] {
+            std::string outcome = "saved";
+            try {
+                const auto raw = line_file::pack(inputs, frames);
+                std::string packed(ZSTD_compressBound(raw.size()), '\0');
+                const std::size_t packed_size = ZSTD_compress(packed.data(), packed.size(), raw.data(), raw.size(), 3);
+                if (ZSTD_isError(packed_size)) {
+                    outcome = "the line could not be compressed";
+                } else {
+                    const auto header = line_file::header_for<motion_snapshot::Snapshot>(inputs.size(), frames.size(), raw.size(), packed_size);
+                    std::error_code error;
+                    std::filesystem::create_directories(file.parent_path(), error);
+                    auto temporary = file;
+                    temporary += ".tmp";
+                    {
+                        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+                        if (!out || !out.write(reinterpret_cast<const char*>(&header), sizeof(header)) ||
+                            !out.write(packed.data(), static_cast<std::streamsize>(packed_size)))
+                            outcome = "the file cannot be written";
+                    }
+                    if (outcome == "saved") {
+                        std::filesystem::rename(temporary, file, error);
+                        if (error) outcome = "the file cannot be written";
+                    }
+                    if (outcome != "saved") std::filesystem::remove(temporary, error);
+                }
+            } catch (...) {
+                outcome = "the line could not be saved";
+            }
+            line_file_end(std::move(outcome));
+        }).detach();
+        return {};
+    }
+    std::string tas_line_import(std::string_view plugin, std::string_view path, unsigned controller) override {
+        if (auto why = tas_refusal(true); !why.empty()) return why;
+        auto& m = tas_motion();
+        if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off && m.line.load(std::memory_order_acquire) != TasMotion::Line::played)
+            return "the line is going: stop it first";
+        if (input::step_script().status().mode != input::StepScript::Mode::off) return "a script is running: stop it first";
+        std::filesystem::path root, file;
+        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
+        if (!line_file_begin("loading")) return "a line is being saved or loaded";
+        std::thread([owner = std::string(plugin), controller, file] {
+            std::string outcome = "loaded";
+            try {
+                std::error_code error;
+                const auto size = std::filesystem::file_size(file, error);
+                line_file::Header header{};
+                std::ifstream in(file, std::ios::binary);
+                if (error || !in) {
+                    outcome = "there is no such line";
+                } else if (size > line_file_most_bytes || size < sizeof(header) || !in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+                    outcome = "it is not a ReTake line";
+                } else if (auto why = line_file::check<motion_snapshot::Snapshot>(header, static_cast<std::size_t>(size), input::StepScript::max_steps);
+                           !why.empty()) {
+                    outcome = std::move(why);
+                } else {
+                    std::string packed(static_cast<std::size_t>(header.packed_size), '\0');
+                    std::string raw(static_cast<std::size_t>(header.raw_size), '\0');
+                    std::vector<input::PadOutput> inputs;
+                    std::vector<motion_snapshot::Snapshot> frames;
+                    if (!in.read(packed.data(), static_cast<std::streamsize>(packed.size())) ||
+                        ZSTD_decompress(raw.data(), raw.size(), packed.data(), packed.size()) != raw.size() || !line_file::unpack(raw, header, inputs, frames)) {
+                        outcome = "the file is damaged";
+                    } else if (auto refused = input::step_script().load_line(owner, controller, std::move(inputs)); !refused.empty()) {
+                        outcome = std::move(refused);
+                    } else {
+                        auto& m = tas_motion();
+                        {
+                            std::lock_guard lock(m.waiting_mutex);
+                            m.waiting.reset();
+                            m.line_owner = owner;
+                            m.line_controller = controller;
+                        }
+                        {
+                            std::lock_guard lock(m.frames_mutex);
+                            m.frames = std::move(frames);
+                        }
+                        m.locked = false;
+                        m.line_time = 0;
+                        const auto length = input::step_script().status().length;
+                        m.line_length.store(length, std::memory_order_release);
+                        m.line_step.store(length, std::memory_order_release);
+                        m.line.store(TasMotion::Line::played, std::memory_order_release);
+                    }
+                }
+            } catch (...) {
+                outcome = "the line could not be loaded";
+            }
+            line_file_end(std::move(outcome));
+        }).detach();
+        return {};
+    }
+    std::string tas_line_file_status() override {
+        auto& state = line_file_state();
+        std::lock_guard lock(state.mutex);
+        return state.running ? state.doing : state.outcome;
     }
     std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
         auto& m = tas_motion();

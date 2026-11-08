@@ -61,10 +61,10 @@ index b67509e..bb3f717 100644
  inline constexpr std::uintptr_t rig_physics_offset = 0x2f10;  // rig
 diff --git a/Engine/Game/Input/step_script.h b/Engine/Game/Input/step_script.h
 new file mode 100644
-index 0000000..726a69d
+index 0000000..e52e626
 --- /dev/null
 +++ b/Engine/Game/Input/step_script.h
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,284 @@
 +#pragma once
 +#include "pad_output.h"
 +#include <cstddef>
@@ -141,6 +141,24 @@ index 0000000..726a69d
 +            line_ = true;
 +        }
 +        return why;
++    }
++    // Client thread: a line saved before, back as `owner`'s line on this controller, stopped where it ended: going
++    // back in it works as in one just recorded. Refused while a script runs.
++    std::string load_line(std::string_view owner, unsigned controller, std::vector<PadOutput> frames) {
++        if (controller > PadOutputs::playstation) return "controller is 0 to 3, or playstation";
++        if (frames.empty() || frames.size() > max_steps) return "a line is 1 to 36000 steps";
++        std::lock_guard lock(mutex_);
++        if (const auto why = taken(owner); !why.empty()) return why;
++        if (mode_ != Mode::off) return "a script is running";
++        frames_ = std::move(frames);
++        limit_ = max_steps;
++        latest_ = {};
++        latched_ = frames_.back();
++        begin(owner, controller, Mode::off, 0);
++        line_ = true;
++        step_ = frames_.size();
++        stopped_ = "loaded";
++        return {};
 +    }
 +    // Physics thread: a line holds: no step counts and the game reads a neutral controller, until it runs
 +    // up. What was recorded stays. False with nothing recorded and nothing running.
@@ -332,18 +350,19 @@ index 0000000..726a69d
 +inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
 +}
 diff --git a/Extension/Plugins/Test/plugin_tests.cpp b/Extension/Plugins/Test/plugin_tests.cpp
-index 6c43ca0..782d97f 100644
+index 6c43ca0..e699685 100644
 --- a/Extension/Plugins/Test/plugin_tests.cpp
 +++ b/Extension/Plugins/Test/plugin_tests.cpp
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include "Extension/Throwdowns/throwdown_kit.h"
  #include "Engine/Vfs/mod_list.h"
  #include "Engine/Game/Input/pad_output.h"
 +#include "Engine/Game/Input/step_script.h"
++#include "Extension/Plugins/line_file.h"
  #include "Engine/Game/Input/playstation_report.h"
  #include "Engine/Game/Input/gameplay_options.h"
  #ifdef _WIN32 // reads memory as the game does (Engine/Core/Platform/memory.h)
-@@ -926,6 +927,29 @@ struct FakeGame final : Game {
+@@ -926,6 +928,29 @@ struct FakeGame final : Game {
      std::string set_animation_value(std::string_view name, double) override { return name == "Animation/Dingo/Float.Physics.Example" ? "" : "not a live numeric physics output"; }
      int read_controller = -1;
      std::optional<PadInput> written_pad; unsigned written_controller{};
@@ -373,7 +392,7 @@ index 6c43ca0..782d97f 100644
      std::string write_pad(std::string_view, unsigned controller, std::optional<PadInput> value) override { written_controller = controller; written_pad = value; return {}; }
      std::optional<StickInput> joystick(int device) override {
          if (device > 1) return std::nullopt;
-@@ -3980,6 +4004,237 @@ void plugins_write_normalized_controllers() {
+@@ -3980,6 +4005,275 @@ void plugins_write_normalized_controllers() {
      check(!outputs.read(4, 1201, true), "stop releases native pads too");
  }
  
@@ -606,12 +625,50 @@ index 6c43ca0..782d97f 100644
 +    s.interrupt();
 +    check(s.status().mode == StepScript::Mode::off, "a held read ends it too");
 +    check(!StepScript::frame_at(0, 0, 5) && !StepScript::frame_at(1, -2, 5) && StepScript::frame_at(4, -2, 5) == 1 && StepScript::frame_at(4, 8, 5) == 4, "lead stays in the script");
++
++    // A saved line, loaded back: stopped where it ended, and going back in it plays it up to the moment.
++    StepScript loaded;
++    check(!loaded.load_line("one", 0, {}).empty(), "an empty line is refused");
++    check(loaded.load_line("one", 0, {pad(1), pad(2), pad(3), pad(4)}).empty(), "a saved line loads");
++    check(loaded.status().mode == StepScript::Mode::off && loaded.status().length == 4 && loaded.status().stopped == "loaded", "stopped, as long as it was");
++    check(loaded.recorded().size() == 4 && loaded.recorded()[2].left_x == 3, "its steps as saved");
++    check(loaded.hold(), "a loaded line holds like any line");
++    loaded.run_up(0, 2, true);
++    check(loaded.on_read(0, pad(50), true)->left_x == 0, "neutral until its first step");
++    loaded.step();
++    check(loaded.on_read(0, pad(50), true)->left_x == 1, "then plays it");
++    loaded.step();
++    check(loaded.status().mode == StepScript::Mode::recording && loaded.status().length == 2, "and hands over at the moment, the rest forgotten");
++    check(!loaded.load_line("two", 0, {pad(1)}).empty(), "nothing loads while a script runs");
++
++    // A line's file: the header says what follows, and what does not fit it is refused.
++    struct Motion {
++        float place[4];
++        bool valid;
++    };
++    const std::vector<PadOutput> steps{pad(5), pad(6), pad(7)};
++    const std::vector<Motion> motion{{{1, 2, 3, 4}, true}, {{5, 6, 7, 8}, false}};
++    const auto raw = dingosdk::line_file::pack(steps, motion);
++    auto header = dingosdk::line_file::header_for<Motion>(steps.size(), motion.size(), raw.size(), 100);
++    check(dingosdk::line_file::check<Motion>(header, sizeof(header) + 100, 36000).empty(), "a line's header passes");
++    std::vector<PadOutput> steps_back;
++    std::vector<Motion> motion_back;
++    check(dingosdk::line_file::unpack(raw, header, steps_back, motion_back) && steps_back.size() == 3 && steps_back[2].left_x == 7 &&
++              motion_back.size() == 2 && motion_back[1].place[3] == 8 && !motion_back[1].valid,
++          "and its steps and motion come back as they were");
++    check(!dingosdk::line_file::check<Motion>(header, sizeof(header) + 99, 36000).empty(), "a file cut short is refused");
++    auto other = header;
++    other.snapshot_size += 4;
++    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "one from another build is refused");
++    other = header;
++    other.magic[0] = 'X';
++    check(!dingosdk::line_file::check<Motion>(other, sizeof(other) + 100, 36000).empty(), "and anything else");
 +}
 +
  void controller_reports_preserve_non_controls() {
      using namespace dingosdk;
      for (int variant = 0; variant < 5; ++variant) {
-@@ -7822,6 +8077,7 @@ int main() {
+@@ -7822,6 +8116,7 @@ int main() {
          run(plugins_place_world_entities);
          run(plugins_have_what_a_prop_hunt_needs);
          run(plugins_write_normalized_controllers);
@@ -619,11 +676,92 @@ index 6c43ca0..782d97f 100644
          run(controller_reports_preserve_non_controls);
          run(plugins_read_frames_and_hold_gameplay_options);
  #ifdef _WIN32
+diff --git a/Extension/Plugins/line_file.h b/Extension/Plugins/line_file.h
+new file mode 100644
+index 0000000..2d0b637
+--- /dev/null
++++ b/Extension/Plugins/line_file.h
+@@ -0,0 +1,75 @@
++#pragma once
++#include "Engine/Game/Input/pad_output.h"
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <type_traits>
++#include <vector>
++
++// A line saved to a file, to load again after the game has been closed (reskate.tas.line_export and line_import):
++// the controller as recorded, a value a step, and the skater's motion at every step, which a going back puts back
++// step by step. The bytes are as this build keeps them in memory: a file only loads into the build that wrote it,
++// the sizes in the header saying so. The file is the header, then the payload, compressed (the runtime's).
++namespace dingosdk::line_file {
++inline constexpr char magic[4] = {'R', 'T', 'K', 'L'};
++inline constexpr std::uint32_t version = 1;
++
++#pragma pack(push, 1)
++struct Header {
++    char magic[4];
++    std::uint32_t version;
++    std::uint32_t pad_size;      // sizeof(PadOutput) when written
++    std::uint32_t snapshot_size; // sizeof the motion snapshot when written
++    std::uint32_t inputs;        // steps of controller
++    std::uint32_t frames;        // steps of motion
++    std::uint64_t raw_size;      // the payload, uncompressed
++    std::uint64_t packed_size;   // the payload as it follows the header
++};
++#pragma pack(pop)
++
++// The payload: the inputs, then the frames, byte for byte.
++template <class Snapshot> std::string pack(const std::vector<input::PadOutput>& inputs, const std::vector<Snapshot>& frames) {
++    static_assert(std::is_trivially_copyable_v<Snapshot>);
++    std::string raw(inputs.size() * sizeof(input::PadOutput) + frames.size() * sizeof(Snapshot), '\0');
++    if (!inputs.empty()) std::memcpy(raw.data(), inputs.data(), inputs.size() * sizeof(input::PadOutput));
++    if (!frames.empty()) std::memcpy(raw.data() + inputs.size() * sizeof(input::PadOutput), frames.data(), frames.size() * sizeof(Snapshot));
++    return raw;
++}
++
++template <class Snapshot> Header header_for(std::size_t inputs, std::size_t frames, std::size_t raw_size, std::size_t packed_size) {
++    Header h{};
++    std::memcpy(h.magic, magic, sizeof(magic));
++    h.version = version;
++    h.pad_size = sizeof(input::PadOutput);
++    h.snapshot_size = sizeof(Snapshot);
++    h.inputs = static_cast<std::uint32_t>(inputs);
++    h.frames = static_cast<std::uint32_t>(frames);
++    h.raw_size = raw_size;
++    h.packed_size = packed_size;
++    return h;
++}
++
++// Empty when the header is one this build can load, else why not.
++template <class Snapshot> std::string check(const Header& h, std::size_t file_size, std::size_t most_steps) {
++    if (std::memcmp(h.magic, magic, sizeof(magic)) != 0) return "it is not a ReTake line";
++    if (h.version != version) return "it was saved by another version of ReTake";
++    if (h.pad_size != sizeof(input::PadOutput) || h.snapshot_size != sizeof(Snapshot)) return "it was saved by another build of ReTake's ReSkate.dll";
++    if (h.inputs == 0 || h.inputs > most_steps || h.frames > most_steps) return "its length is not a line's";
++    const auto raw = static_cast<std::uint64_t>(h.inputs) * sizeof(input::PadOutput) + static_cast<std::uint64_t>(h.frames) * sizeof(Snapshot);
++    if (h.raw_size != raw) return "its sizes do not add up";
++    if (h.packed_size != file_size - sizeof(Header)) return "the file is cut short";
++    return {};
++}
++
++// The payload back. False when it is not the size the header says.
++template <class Snapshot> bool unpack(std::string_view raw, const Header& h, std::vector<input::PadOutput>& inputs, std::vector<Snapshot>& frames) {
++    static_assert(std::is_trivially_copyable_v<Snapshot>);
++    if (raw.size() != h.raw_size) return false;
++    inputs.resize(h.inputs);
++    frames.resize(h.frames);
++    std::memcpy(inputs.data(), raw.data(), inputs.size() * sizeof(input::PadOutput));
++    if (!frames.empty()) std::memcpy(frames.data(), raw.data() + inputs.size() * sizeof(input::PadOutput), frames.size() * sizeof(Snapshot));
++    return true;
++}
++}
 diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
-index 8abd30b..fe446e4 100644
+index 8abd30b..32439db 100644
 --- a/Extension/Plugins/plugin_api_world.cpp
 +++ b/Extension/Plugins/plugin_api_world.cpp
-@@ -2930,6 +2930,310 @@ struct WorldApi {
+@@ -2930,6 +2930,334 @@ struct WorldApi {
          lua_setfield(L, -2, "playstation");
          return 1;
      }
@@ -888,6 +1026,30 @@ index 8abd30b..fe446e4 100644
 +        lua_pushlstring(L, status.data(), status.size());
 +        return 1;
 +    }
++    // tas.line_export(path): the line, every step of it, to a file in the plugin's data folder, to load after the game
++    // has been closed. tas.line_import(path, controller): such a file back as the plugin's line, stopped where it ended.
++    // Both run in the background: tas.line_file_status() is "saving", "loading", "saved", "loaded", why not, or "".
++    static int tas_line_export(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_export");
++        need(L, plugin, "files", "reskate.tas.line_export");
++        const auto path = data_path(L, 1, false);
++        return result(L, game(plugin).tas_line_export(plugin.id(), path));
++    }
++    static int tas_line_import(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_import");
++        need(L, plugin, "files", "reskate.tas.line_import");
++        const auto path = data_path(L, 1, false);
++        return result(L, game(plugin).tas_line_import(plugin.id(), path, tas_controller(L, 2)));
++    }
++    static int tas_line_file_status(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.line_file_status");
++        const auto status = game(plugin).tas_line_file_status();
++        lua_pushlstring(L, status.data(), status.size());
++        return 1;
++    }
 +    static int tas_stop(lua_State* L) {
 +        auto& plugin = plugin_of(L);
 +        need(L, plugin, "tas", "reskate.tas.stop");
@@ -934,14 +1096,15 @@ index 8abd30b..fe446e4 100644
      // A whole replacement for a real controller, in the same units as input.gamepad().
      static int input_write(lua_State* L) {
          auto& plugin = plugin_of(L);
-@@ -3274,6 +3578,10 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+@@ -3274,6 +3602,11 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
      add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
      add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
      add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
 +    add_functions(L, "tas", {{"record", tas_record}, {"play", tas_play}, {"stop", tas_stop}, {"status", tas_status}, {"dump", tas_dump}, {"dump_save", tas_dump_save}, {"virtual_time", tas_virtual_time}, {"save", tas_save}, {"load", tas_load}, {"saves", tas_saves},
 +        {"history", tas_history}, {"rewind", tas_rewind}, {"history_counts", tas_history_counts},
 +        {"line_start", tas_line_start}, {"line_seek", tas_line_seek}, {"line_go", tas_line_go}, {"line_stop", tas_line_stop}, {"line_paused", tas_line_paused}, {"line_hold", tas_line_hold}, {"line_halt", tas_line_halt}, {"clock", tas_clock}, {"no_bail", tas_no_bail},
-+        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status}});
++        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
++        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status}});
      add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
      add_functions(L, "entities", {{"set", entities_set}, {"remove", entities_remove}, {"clear", entities_clear}, {"status", entities_status},
                                    {"ready", entities_ready}, {"blueprints", entities_blueprints},
@@ -966,7 +1129,7 @@ index 173bdd7..6decf4f 100644
              if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
              if (has("capture")) actions.push_back("record your screen");
 diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
-index 61689ee..af54fb1 100644
+index 61689ee..a410ecf 100644
 --- a/Extension/Plugins/plugin_game.h
 +++ b/Extension/Plugins/plugin_game.h
 @@ -143,7 +143,39 @@ struct PhysicsStep {
@@ -1009,7 +1172,7 @@ index 61689ee..af54fb1 100644
  // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
  // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
  struct LaunchShape {
-@@ -1076,6 +1108,42 @@ public:
+@@ -1076,6 +1108,48 @@ public:
      virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
      virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
      virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
@@ -1049,18 +1212,26 @@ index 61689ee..af54fb1 100644
 +    virtual std::string tas_skater_dump(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
 +    // How the last skater dump went: "writing", "saved", why it failed, or empty before the first.
 +    virtual std::string tas_skater_dump_status() { return {}; }
++    // A line saved to `path` in the plugin's data folder, and loaded back as this plugin's line on `controller`, stopped
++    // where it ended (Extension/Plugins/line_file.h). Both run in the background: tas_line_file_status says "saving",
++    // "loading", "saved", "loaded", why one failed, or nothing before the first.
++    virtual std::string tas_line_export(std::string_view /*plugin*/, std::string_view /*path*/) { return unavailable; }
++    virtual std::string tas_line_import(std::string_view /*plugin*/, std::string_view /*path*/, unsigned /*controller*/) { return unavailable; }
++    virtual std::string tas_line_file_status() { return {}; }
      // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
      // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
      virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
 diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
-index 5c0acee..062552f 100644
+index 5c0acee..cacc622 100644
 --- a/Extension/Plugins/plugin_game_runtime.cpp
 +++ b/Extension/Plugins/plugin_game_runtime.cpp
-@@ -28,8 +28,13 @@
+@@ -28,8 +28,15 @@
  #include "Engine/Vfs/mod_catalog.h"
  #include "Engine/Core/Log/logging.h"
  #include <mutex>
 +#include <thread>
++#include "zstd.h"
++#include "line_file.h"
  #include "Extension/Assets/live_mods.h"
  #include "Extension/Skater/game_speed.h"
 +#include "Extension/Skater/motion_snapshot.h"
@@ -1070,7 +1241,7 @@ index 5c0acee..062552f 100644
  #include "Extension/Skater/launches.h"
  #include "Extension/Skater/pad_hide.h"
  #include "Engine/Game/Skater/first_person_cycle.h"
-@@ -46,6 +51,7 @@
+@@ -46,6 +53,7 @@
  #include "Extension/Music/spotify_station.h"
  #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
  #include "Extension/Profile/local_profile_runtime.h"
@@ -1078,7 +1249,7 @@ index 5c0acee..062552f 100644
  #include "Extension/Settings/named_settings.h"
  #include "Engine/Game/Settings/multiplayer_settings_lock.h"
  #include "Extension/Skater/ai_skaters.h"
-@@ -75,6 +81,7 @@
+@@ -75,6 +83,7 @@
  #include "Extension/UI/Overlay/viewmodel.h"
  #include "Extension/UI/Overlay/scripted_pad.h"
  #include "Engine/Game/Input/pad_output.h"
@@ -1086,7 +1257,7 @@ index 5c0acee..062552f 100644
  #include "Engine/Game/Skater/animation_values.h"
  #include "Extension/Skater/grind_target.h"
  #include "Engine/Game/Input/gameplay_options.h"
-@@ -87,6 +94,7 @@
+@@ -87,6 +96,7 @@
  #include <shellapi.h>
  #include <algorithm>
  #include <array>
@@ -1094,7 +1265,7 @@ index 5c0acee..062552f 100644
  #include <cmath>
  #include <format>
  #include <fstream>
-@@ -697,6 +705,12 @@ public:
+@@ -697,6 +707,12 @@ public:
              for (std::size_t i = 1; i < skater_body::count; ++i) {
                  const auto& c = s.body.bodies[i];
                  if (const auto& pose = s.poses[i]) step.poses.emplace(skater_body::names[i], PhysicsStep::Pose{pose->transform, pose->velocity});
@@ -1107,7 +1278,7 @@ index 5c0acee..062552f 100644
                  if (!c.touching) continue;
                  const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
                  step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
-@@ -1085,6 +1099,624 @@ public:
+@@ -1085,6 +1101,763 @@ public:
              axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
          return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
      }
@@ -1580,7 +1751,7 @@ index 5c0acee..062552f 100644
 +    // (buttons as bits, triggers 0 to 255, sticks -32768 to 32767), and the board is where the line had it.
 +    static constexpr std::size_t line_save_most_bytes = 8u << 20;
 +    std::string tas_line_save(std::string_view plugin, std::string_view path, std::string_view text) override {
-+        const auto inputs = input::step_script().recorded();
++        auto inputs = input::step_script().recorded();
 +        std::vector<std::array<float, 3>> boards;
 +        std::vector<char> valid;
 +        {
@@ -1662,6 +1833,145 @@ index 5c0acee..062552f 100644
 +        std::lock_guard lock(state.mutex);
 +        return state.running ? std::string("writing") : state.outcome;
 +    }
++    // A line saved to a file and loaded back (line_file.h). A minute of line is about 11 MB of motion before it is
++    // compressed: far past a plugin call's 50 ms, so both run on a thread of their own, one at a time, and the plugin
++    // asks how it went (tas_line_file_status).
++    struct LineFile {
++        std::mutex mutex;
++        bool running{};
++        std::string doing;   // "saving" or "loading"
++        std::string outcome; // "saved", "loaded", or why not; empty before the first
++    };
++    static LineFile& line_file_state() {
++        static auto* value = new LineFile; // a thread may still be writing at exit
++        return *value;
++    }
++    static constexpr std::uint64_t line_file_most_bytes = 512ull << 20;
++    static bool line_file_begin(const char* doing) {
++        auto& state = line_file_state();
++        std::lock_guard lock(state.mutex);
++        if (state.running) return false;
++        state.running = true;
++        state.doing = doing;
++        state.outcome.clear();
++        return true;
++    }
++    static void line_file_end(std::string outcome) {
++        auto& state = line_file_state();
++        std::lock_guard lock(state.mutex);
++        state.outcome = std::move(outcome);
++        state.running = false;
++    }
++    std::string tas_line_export(std::string_view plugin, std::string_view path) override {
++        auto& m = tas_motion();
++        auto inputs = input::step_script().recorded();
++        if (inputs.empty()) return "no line is recorded";
++        std::filesystem::path root, file;
++        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
++        std::vector<motion_snapshot::Snapshot> frames;
++        {
++            std::lock_guard lock(m.frames_mutex);
++            frames.assign(m.frames.begin(), m.frames.begin() + static_cast<std::ptrdiff_t>(std::min(m.frames.size(), inputs.size())));
++        }
++        if (!line_file_begin("saving")) return "a line is being saved or loaded";
++        std::thread([inputs = std::move(inputs), frames = std::move(frames), file] {
++            std::string outcome = "saved";
++            try {
++                const auto raw = line_file::pack(inputs, frames);
++                std::string packed(ZSTD_compressBound(raw.size()), '\0');
++                const std::size_t packed_size = ZSTD_compress(packed.data(), packed.size(), raw.data(), raw.size(), 3);
++                if (ZSTD_isError(packed_size)) {
++                    outcome = "the line could not be compressed";
++                } else {
++                    const auto header = line_file::header_for<motion_snapshot::Snapshot>(inputs.size(), frames.size(), raw.size(), packed_size);
++                    std::error_code error;
++                    std::filesystem::create_directories(file.parent_path(), error);
++                    auto temporary = file;
++                    temporary += ".tmp";
++                    {
++                        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++                        if (!out || !out.write(reinterpret_cast<const char*>(&header), sizeof(header)) ||
++                            !out.write(packed.data(), static_cast<std::streamsize>(packed_size)))
++                            outcome = "the file cannot be written";
++                    }
++                    if (outcome == "saved") {
++                        std::filesystem::rename(temporary, file, error);
++                        if (error) outcome = "the file cannot be written";
++                    }
++                    if (outcome != "saved") std::filesystem::remove(temporary, error);
++                }
++            } catch (...) {
++                outcome = "the line could not be saved";
++            }
++            line_file_end(std::move(outcome));
++        }).detach();
++        return {};
++    }
++    std::string tas_line_import(std::string_view plugin, std::string_view path, unsigned controller) override {
++        if (auto why = tas_refusal(true); !why.empty()) return why;
++        auto& m = tas_motion();
++        if (m.line.load(std::memory_order_acquire) != TasMotion::Line::off && m.line.load(std::memory_order_acquire) != TasMotion::Line::played)
++            return "the line is going: stop it first";
++        if (input::step_script().status().mode != input::StepScript::Mode::off) return "a script is running: stop it first";
++        std::filesystem::path root, file;
++        if (auto why = data_file(plugin, path, root, file); !why.empty()) return why;
++        if (!line_file_begin("loading")) return "a line is being saved or loaded";
++        std::thread([owner = std::string(plugin), controller, file] {
++            std::string outcome = "loaded";
++            try {
++                std::error_code error;
++                const auto size = std::filesystem::file_size(file, error);
++                line_file::Header header{};
++                std::ifstream in(file, std::ios::binary);
++                if (error || !in) {
++                    outcome = "there is no such line";
++                } else if (size > line_file_most_bytes || size < sizeof(header) || !in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
++                    outcome = "it is not a ReTake line";
++                } else if (auto why = line_file::check<motion_snapshot::Snapshot>(header, static_cast<std::size_t>(size), input::StepScript::max_steps);
++                           !why.empty()) {
++                    outcome = std::move(why);
++                } else {
++                    std::string packed(static_cast<std::size_t>(header.packed_size), '\0');
++                    std::string raw(static_cast<std::size_t>(header.raw_size), '\0');
++                    std::vector<input::PadOutput> inputs;
++                    std::vector<motion_snapshot::Snapshot> frames;
++                    if (!in.read(packed.data(), static_cast<std::streamsize>(packed.size())) ||
++                        ZSTD_decompress(raw.data(), raw.size(), packed.data(), packed.size()) != raw.size() || !line_file::unpack(raw, header, inputs, frames)) {
++                        outcome = "the file is damaged";
++                    } else if (auto refused = input::step_script().load_line(owner, controller, std::move(inputs)); !refused.empty()) {
++                        outcome = std::move(refused);
++                    } else {
++                        auto& m = tas_motion();
++                        {
++                            std::lock_guard lock(m.waiting_mutex);
++                            m.waiting.reset();
++                            m.line_owner = owner;
++                            m.line_controller = controller;
++                        }
++                        {
++                            std::lock_guard lock(m.frames_mutex);
++                            m.frames = std::move(frames);
++                        }
++                        m.locked = false;
++                        m.line_time = 0;
++                        const auto length = input::step_script().status().length;
++                        m.line_length.store(length, std::memory_order_release);
++                        m.line_step.store(length, std::memory_order_release);
++                        m.line.store(TasMotion::Line::played, std::memory_order_release);
++                    }
++                }
++            } catch (...) {
++                outcome = "the line could not be loaded";
++            }
++            line_file_end(std::move(outcome));
++        }).detach();
++        return {};
++    }
++    std::string tas_line_file_status() override {
++        auto& state = line_file_state();
++        std::lock_guard lock(state.mutex);
++        return state.running ? state.doing : state.outcome;
++    }
 +    std::optional<TasBodies> tas_line_bodies(std::size_t step) override {
 +        auto& m = tas_motion();
 +        std::lock_guard lock(m.frames_mutex);
@@ -1732,7 +2042,7 @@ index 5c0acee..062552f 100644
      std::optional<StickInput> joystick(int device) override {
          if (!joystick::game_in_foreground()) return std::nullopt;
          const auto sample = joystick::poll(device);
-@@ -1876,6 +2508,8 @@ public:
+@@ -1876,6 +2649,8 @@ public:
      }
      void release(std::string_view plugin) override {
          input::pad_outputs().release(plugin);

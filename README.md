@@ -15,7 +15,7 @@
 </p>
 
 > [!WARNING]
-> **This is version 0.0.3, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
+> **This is version 0.0.4, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
 
 ![How ReTake works, step by step](docs/how-it-works.jpg)
 
@@ -29,6 +29,7 @@ You skate a line. ReTake records it. When you mess up, open the timeline, pick a
 - **Slow motion.** Click both sticks (L3 + R3) to switch it on and off, even mid-air, at full frame rate. The skater rides in it just as at full speed.
 - **Bails off.** One switch so you don't fall off from big drops.
 - **Stop all.** One button that stops everything ReTake is doing.
+- **My lines.** Save your lines and come back to them later, even after closing the game.
 - **Report a problem.** Write what went wrong; ReTake saves it in a file with the last 30 seconds of the game, for us to look at.
 
 ## Install
@@ -40,7 +41,7 @@ You need:
 
 Then:
 
-1. Download **`ReTake-v0.0.3.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
+1. Download **`ReTake-v0.0.4.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
 2. Close skate. and the ReSkate launcher.
 3. Double-click **`Install ReTake.bat`**.
    It finds your game on its own (or lets you pick the folder), backs up your `ReSkate.dll`, installs ReTake, and asks to turn off the launcher's automatic updates.
@@ -103,6 +104,7 @@ Close the game and double-click **`Uninstall ReTake.bat`**. It puts your old `Re
 | **Bails** | The game's bails on or off |
 | **New line** | Throw this line away and start a new one (press twice) |
 | **Stop all** | Stop everything ReTake is doing |
+| **My lines** | Top right: save this line, or load or delete a saved one |
 | **Report a problem** | Top right: write what went wrong and save it to a file you can send us |
 
 ### Console
@@ -111,6 +113,10 @@ Open the ReSkate console and type `retake` to see all of these:
 
 ```
 retake new                start a new line where you stand
+retake save [name]        save the line, to come back to it after closing the game
+retake lines              your saved lines, numbered (also: F11, My lines)
+retake load <number>      load a saved line, in place of the one you have
+retake delete <number>    delete a saved line
 retake back [seconds]     go back that far (default 1)
 retake whole              play the whole line as one run
 retake slowmo [0.05-0.9]  slow motion on and off, or how slow (default 0.25)
@@ -130,6 +136,7 @@ The last two are for tracking down bugs; you won't need them to skate.
 ## Known issues
 
 - **Replays can drift, mostly on rails and ledges.** The game's grind logic doesn't always come out the same way twice, so a replayed line can end up somewhere slightly different from the original. Going back to a moment a bit earlier usually works. We're working on making it exact.
+- **Start your lines on the board.** A line begun on foot can come out differently after the game is restarted, because ReTake can't hold a skater on foot to the recording. Get on your board before New line.
 - **Offline only.** ReTake refuses to run in a multiplayer session, by design.
 - **Only for ReSkate 2.1.4-2** and the skate. build it supports. A new ReSkate version needs a new ReTake build.
 - **Lines can be up to 10 minutes long.**
@@ -158,7 +165,7 @@ cd ..
 powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
 ```
 
-That writes `dist\ReTake-v0.0.3.zip`.
+That writes `dist\ReTake-v0.0.4.zip`.
 
 ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that keeps the skater as the game would build it at the shorter step (the board's flight, the joints and everything else worked out from the step length) so it rides the same, a no-bail switch, sharper plugin fonts, and **no crash reports**: this build never uploads anything.
 

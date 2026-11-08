@@ -1,7 +1,7 @@
 {
     "name": "ReTake",
     "author": "N0deNinja",
-    "version_number": "0.0.3",
+    "version_number": "0.0.4",
     "website_url": "https://github.com/N0deNinja/ReTake",
     "description": "Mess up anywhere in your line, go back to any moment, and carry on from there. Offline only.",
     "dependencies": []
