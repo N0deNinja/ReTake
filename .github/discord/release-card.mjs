@@ -79,7 +79,7 @@ export function releaseAnnouncement(r) {
       author: { name: `NEW RELEASE · ${r.tag_name}` },
       title: r.name || r.tag_name,
       url: r.html_url,
-      description: notes(r.body, 1800),
+      description: notes(r.body, 3800), // an embed's description holds 4096
       image: { url: `${RAW}/how-it-works.jpg` },
       footer: { text: FOOTER },
       timestamp: r.published_at,
