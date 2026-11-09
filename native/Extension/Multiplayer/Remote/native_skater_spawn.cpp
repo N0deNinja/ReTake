@@ -507,7 +507,7 @@ void remove_remote(std::uintptr_t base) noexcept {
     }
 }
 void update_remote_cosmetics(std::uintptr_t base, const NativeFrame &local, const Appearance &appearance,
-                             std::string &detail) {
+                             std::string &detail, bool dress_gaps) {
     auto &r = remote();
     try {
         require(valid_appearance(appearance), "Peer cosmetic recipe is invalid.");
@@ -536,7 +536,7 @@ void update_remote_cosmetics(std::uintptr_t base, const NativeFrame &local, cons
         if (!r.skater_appearance) r.stand_ins_applied = stand_ins_now;
         try {
             if (!r.skater_appearance || *r.skater_appearance != appearance.skater) {
-                apply_cosmetic_recipe(base, r.entity, local.entity, appearance.skater);
+                apply_cosmetic_recipe(base, r.entity, local.entity, appearance.skater, dress_gaps);
                 r.skater_appearance = appearance.skater;
             }
             r.rejected_appearance.reset();

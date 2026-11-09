@@ -48,6 +48,8 @@
 #include "Extension/Throwdowns/throwdown_kit.h"
 #include "plugin_camera.h"
 #include "Extension/Multiplayer/Session/session.h"
+#include "Extension/Multiplayer/Steam/steam_social.h"
+#include "Engine/Core/Platform/launcher_support.h"
 #include "Extension/Multiplayer/Remote/stand_ins.h"
 #include "Extension/Multiplayer/Remote/native_cosmetics.h"
 #include "Extension/Multiplayer/Session/peer_slots.h"
@@ -1915,6 +1917,7 @@ public:
     }
     bool ghost_shown_now_{};
     std::uint64_t ghost_shown_serial_{}, ghost_outfit_generation_{};
+    std::string ghost_owner_; // the plugin that last recorded or showed a ghost (tas_ghost_claim)
     static std::vector<std::uint8_t> encode_outfit(const multiplayer::Appearance& outfit) {
         multiplayer::Packet p;
         p.kind = multiplayer::PacketKind::cosmetics;
@@ -1972,6 +1975,11 @@ public:
         if (outfit) g.recorded_outfit = std::move(outfit);
         if (!g.recorder.add(step, local.pose, camera)) return "that step is before the last one, or the ghost is full";
         return {};
+    }
+    std::string tas_player_name() override {
+        const auto social = multiplayer::steam_social_snapshot();
+        if (!social || social->local.name.empty() || social->local.name == launcher::offline_player_name) return {};
+        return social->local.name;
     }
     TasGhostStatus tas_ghost_status() override {
         auto& g = ghosts();
@@ -2176,6 +2184,7 @@ public:
             why = detail.empty() ? std::string("the ghost is not shown yet") : detail;
             return std::nullopt;
         }
+        xray::set_ghost(multiplayer::remote_skater_entity()); // its head as drawn, for the name over it (d:follow)
         // Its outfit: once a new ghost is loaded, and again whenever the game builds the model anew.
         const auto generation = multiplayer::remote_skater_generation();
         if (serial != ghost_shown_serial_ || generation != ghost_outfit_generation_) {
@@ -2185,7 +2194,7 @@ public:
             }
             std::string outfit_why;
             if (outfit) {
-                multiplayer::update_remote_cosmetics(base_, local, *outfit, outfit_why);
+                multiplayer::update_remote_cosmetics(base_, local, *outfit, outfit_why, true); // missing mod items: the default outfit
             } else if (auto mine = multiplayer::capture_cosmetics(base_, local, outfit_why)) {
                 multiplayer::update_remote_cosmetics(base_, local, *mine, outfit_why); // a ghost with no outfit wears yours
             }
@@ -2195,8 +2204,23 @@ public:
         out.shown = true;
         return out;
     }
+    void tas_ghost_claim(std::string_view plugin) override {
+        if (ghost_owner_ != plugin) ghost_owner_ = plugin;
+    }
+    // A stopped plugin's ghost: taken down, and a recording it had going ended.
+    void release_ghost(std::string_view plugin) {
+        if (ghost_owner_.empty() || ghost_owner_ != plugin) return;
+        tas_ghost_hide();
+        {
+            auto& g = ghosts();
+            std::lock_guard lock(g.mutex);
+            g.recording = false;
+        }
+        ghost_owner_.clear();
+    }
     void tas_ghost_hide() override {
         if (!ghost_shown_now_) return;
+        xray::set_ghost(0);
         const multiplayer::PeerScope scope(multiplayer::max_remote_players - 1);
         multiplayer::remove_remote(base_);
         ghost_shown_now_ = false;
@@ -3068,6 +3092,7 @@ public:
     void release(std::string_view plugin) override {
         input::pad_outputs().release(plugin);
         tas_stop(plugin);
+        release_ghost(plugin);
         if (virtual_time::active()) (void)virtual_time::set(false);
         grind_target::release(plugin);
         input::gameplay_options().release(plugin);

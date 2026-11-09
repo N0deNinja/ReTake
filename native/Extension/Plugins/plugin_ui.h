@@ -58,8 +58,13 @@ struct Shape {
     // rough_rect: skate.'s hand-cut tile from points[0] to [1], `seed` its edge, `radius` its scale.
     // halftone: a screen-print of `columns` x `rows` dots from points[0]. scribble: the dry-brush
     // scribble over points[0] to [1]. clip: what follows is clipped to points[0] to [1], until unclip.
+    // follow: the screen shapes after it, until unfollow, are drawn about world point points[0], which
+    // the plugin saw at points[1]: moved by where the camera puts it as the frame is drawn, so a tag over
+    // something in the world keeps to it while the camera moves (the plugin's camera is a tick older).
+    // With `fit` 1 the point is the middle of a ghost line's skater's head as the renderer drew it,
+    // `radius` metres up (xray::ghost_head), points[0] until it is drawn.
     enum class Kind { text, rect, line, circle, poly, world_text, world_line, world_circle, image, world_image, game_image, gradient, skeleton,
-                      rough_rect, halftone, scribble, clip, unclip } kind{Kind::text};
+                      rough_rect, halftone, scribble, clip, unclip, follow, unfollow } kind{Kind::text};
     std::vector<Vec3> points;
     float radius{};
     std::string text;

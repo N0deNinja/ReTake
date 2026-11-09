@@ -12,6 +12,7 @@ local G = {}
 
 local FOLDER = "ghosts"
 local NAME_FILE = "name.txt"
+local LABELS_FILE = "labels.txt"
 local SCREEN = "ReTake Ghost lines"
 local STEPS = 60
 local NEAR_M = 40          -- this close to a ghost line's start, ReTake says it is there
@@ -23,9 +24,11 @@ local END_HOLD_MS = 1500   -- the ghost stays at its end this long
 local LIST_MS = 20000      -- the folder is looked at again this often
 local LOAD_MS = 15000
 local MAKE_MS = 15000      -- the line's playing has to start within this
-local HEAD_UP = 2.15       -- the name, this far above the skater's root
+local HEAD_UP = 1.95       -- the name's point, this far above the skater's root (until the head is drawn)
+local ABOVE_HEAD = 0.3     -- and this far above the middle of the ghost's head as the game draws it
 local ROWS_SHOWN = 6
-local VK_ESCAPE = 27
+local VK_ESCAPE, VK_BACK, VK_TAB, VK_RETURN, VK_CONTROL = 27, 8, 9, 13, 17
+local TITLE_MOST, AUTHOR_MOST = 40, 24
 
 local library = nil -- library.lua: the map, travelling
 local cache, cache_at, notes = nil, -math.huge, {} -- the ghost lines there are; notes by file, read once
@@ -36,6 +39,7 @@ local last_entry = nil -- the one last watched or tried, first in the window
 local near_said = {} -- file -> true while you are near its start
 local near_at = -math.huge
 local name = nil     -- the player's name for the ghosts they make
+local labels = nil   -- the floating labels shown: "all", "near" or "off"
 local window = nil   -- {left=, escape=, scroll=, confirm=, message=, error=}
 local width, height = 1920, 1080
 
@@ -82,6 +86,46 @@ function G.set_name(text)
     if not ok then return false, why end
     name = text
     return true
+end
+
+-- ---- the floating labels ------------------------------------------------------------------------------------
+-- Over the starts of the ghost lines around you and over a ghost's skater: all of them, only the ones near you
+-- (where F10 can start them), or none.
+local LABEL_NAMES = {all = "All", near = "Near only", off = "Off"}
+local LABEL_ORDER = {"all", "near", "off"}
+
+function G.labels()
+    if labels == nil then
+        local text = reskate.files.read(LABELS_FILE)
+        text = text and string.lower(string.match(text, "^%s*(.-)%s*$")) or ""
+        labels = LABEL_NAMES[text] and text or "all"
+    end
+    return labels
+end
+
+function G.set_labels(what)
+    what = string.lower(tostring(what or ""))
+    if not LABEL_NAMES[what] then return false, "the labels are all, near or off" end
+    labels = what
+    local ok, why = reskate.files.write(LABELS_FILE, what)
+    if not ok then return false, why end
+    R.line("[ghosts] labels " .. what)
+    return true
+end
+
+function G.labels_text(what)
+    what = what or G.labels()
+    if what == "near" then return string.format("near only (within %d m of a start)", NEAR_M) end
+    if what == "off" then return "off (no names over the starts or the ghosts)" end
+    return string.format("all (every start within %d m)", PIN_M)
+end
+
+local function next_labels()
+    local now = G.labels()
+    for i, what in LABEL_ORDER do
+        if what == now then return LABEL_ORDER[i % #LABEL_ORDER + 1] end
+    end
+    return "all"
 end
 
 -- ---- the folder ---------------------------------------------------------------------------------------------
@@ -143,8 +187,8 @@ local function make_fail(why)
     say("The ghost line could not be made: " .. tostring(why), "warn")
 end
 
--- The line you have, played once from its start, hands off, kept as a ghost line called `title`.
-function G.make(title)
+-- Whether a ghost line can be made of the line you have now, and why not.
+local function make_check()
     if U.in_session() then return false, "ReTake is offline only" end
     if not has_api() then return false, "this ReSkate.dll cannot make ghost lines: install ReTake's DLL from this version" end
     if making then return false, "a ghost line is being made" end
@@ -154,14 +198,30 @@ function G.make(title)
     if L.busy() then return false, "wait for the countdown" end
     if library and library.busy() then return false, "a line is being saved or loaded" end
     if not L.sensor_ready() then return false, "ride for a moment first: until you've skated since the game started, a replay goes off on rails" end
+    return true
+end
+
+-- A ghost line's title when none is given: the saved line's name, or when it was made.
+local function default_title()
+    local source = library and library.source()
+    return (source and source.name) or ("Ghost " .. os.date("%d %b, %H:%M"))
+end
+
+-- The line you have, played once from its start, hands off, kept as a ghost line called `title`, signed `author`
+-- (your name: the one you set, else your Steam name).
+function G.make(title, author)
+    local can, why_not = make_check()
+    if not can then return false, why_not end
+    local info = L.info()
     local p = info.start.position
     local source = library and library.source()
-    title = (title and title ~= "") and title or (source and source.name) or ("Ghost " .. os.date("%d %b, %H:%M"))
+    title = (title and title ~= "") and title or default_title()
+    author = (author and author ~= "") and author or G.name() or "a skater"
     local map = library and library.current_map()
     making = {
         title = title, catch_up = L.catch_up_speed(), stage = "playing", at = U.now(), seen = false,
         meta = {
-            name = title, author = G.name() or "a skater", made = os.date("%Y-%m-%d %H:%M"), retake = L.version, map = map,
+            name = title, author = author, made = os.date("%Y-%m-%d %H:%M"), retake = L.version, map = map,
             map_name = map and library and library.map_name(map) or nil,
             start = {x = p.x, y = p.y, z = p.z, heading = info.start.heading, on_board = info.start.on_board ~= false},
             line = source and source.name or nil,
@@ -508,6 +568,7 @@ local function layout()
         close = {x0 = box.x1 - pad - 160 * k, x1 = box.x1 - pad, y0 = box.y1 - 78 * k, y1 = box.y1 - 30 * k},
         folder = {x0 = box.x0 + pad, x1 = box.x0 + pad + 170 * k, y0 = box.y1 - 78 * k, y1 = box.y1 - 30 * k},
     }
+    buttons.labels = {x0 = buttons.folder.x1 + 12 * k, x1 = buttons.folder.x1 + 12 * k + 300 * k, y0 = buttons.folder.y0, y1 = buttons.folder.y1}
     local rows = {}
     local entries = ordered()
     for index = 1, ROWS_SHOWN do
@@ -543,7 +604,102 @@ function G.delete(entry)
     return true
 end
 
+-- ---- naming a ghost line before it is made --------------------------------------------------------------------
+local function drop_last(text)
+    local i = #text
+    if i == 0 then return text end
+    while i > 1 and bit32.band(string.byte(text, i), 0xC0) == 0x80 do i -= 1 end
+    return string.sub(text, 1, i - 1)
+end
+
+local function cut(text, most)
+    local n = utf8.len(text)
+    if n and n > most then return string.sub(text, 1, utf8.offset(text, most + 1) - 1) end
+    return text
+end
+
+-- The Make button: a title and a name to type first, filled in already.
+local function start_naming()
+    local can, why = make_check()
+    if not can then return say(tostring(why), "warn") end
+    local known = library and library.player_name() or nil
+    window.naming = {title = cut(default_title(), TITLE_MOST), author = cut(G.name() or "", AUTHOR_MOST), field = "title", steam = known,
+        back = true, back_at = 0, enter = true, tab = true, escape = true, opened = U.now()}
+    reskate.input.text(true) -- nothing typed before it counts
+end
+
+local function naming_layout(box, k)
+    local w, h = 660 * k, 360 * k
+    local r = {x0 = (box.x0 + box.x1) / 2 - w / 2, y0 = (box.y0 + box.y1) / 2 - h / 2 + 20 * k}
+    r.x1, r.y1 = r.x0 + w, r.y0 + h
+    local pad = 30 * k
+    local f = {
+        title = {x0 = r.x0 + pad, x1 = r.x1 - pad, y0 = r.y0 + 112 * k, y1 = r.y0 + 156 * k},
+        author = {x0 = r.x0 + pad, x1 = r.x1 - pad, y0 = r.y0 + 196 * k, y1 = r.y0 + 240 * k},
+        make = {x0 = r.x1 - pad - 190 * k, x1 = r.x1 - pad, y0 = r.y1 - 72 * k, y1 = r.y1 - 26 * k},
+    }
+    f.back = {x0 = f.make.x0 - 12 * k - 150 * k, x1 = f.make.x0 - 12 * k, y0 = f.make.y0, y1 = f.make.y1}
+    return r, f
+end
+
+local function finish_naming()
+    local n = window.naming
+    local title, author = string.match(n.title, "^%s*(.-)%s*$"), string.match(n.author, "^%s*(.-)%s*$")
+    if author == "" then
+        n.error = "Type the name to show over your skater"
+        n.field = "author"
+        return
+    end
+    -- A name typed over your Steam name is kept for next time; your Steam name itself needs keeping by no one.
+    G.set_name(author ~= (n.steam or "") and author or "")
+    window.naming = nil
+    if answer(G.make(title, author)) then close_window() end
+end
+
+local function naming_tick(now)
+    local n = window.naming
+    local typed = reskate.input.text(true)
+    if typed ~= "" then
+        typed = string.gsub(typed, "[%c]", "")
+        if n.field == "title" then n.title = cut(n.title .. typed, TITLE_MOST) else n.author = cut(n.author .. typed, AUTHOR_MOST) end
+        n.error = nil
+    end
+    local back = reskate.input.key(VK_BACK)
+    if back then
+        if not n.back or now >= n.back_at then
+            if n.field == "title" then n.title = drop_last(n.title) else n.author = drop_last(n.author) end
+            n.back_at = now + (n.back and 35 or 450)
+            n.back = true
+        end
+    else
+        n.back = false
+    end
+    local tab = reskate.input.key(VK_TAB)
+    if tab and not n.tab then n.field = n.field == "title" and "author" or "title" end
+    n.tab = tab
+    local escape = reskate.input.key(VK_ESCAPE)
+    if escape and not n.escape then
+        window.naming = nil
+        window.escape = true
+        return
+    end
+    n.escape = escape
+    local enter = reskate.input.key(VK_RETURN)
+    if enter and not n.enter then return finish_naming() end
+    n.enter = enter
+end
+
+local function naming_click(p)
+    local k, box = layout()
+    local _, f = naming_layout(box, k)
+    if inside(p, f.title) then window.naming.field = "title"
+    elseif inside(p, f.author) then window.naming.field = "author"
+    elseif inside(p, f.make) then finish_naming()
+    elseif inside(p, f.back) then window.naming = nil end
+end
+
 local function click(mouse)
+    if window.naming then return naming_click(mouse.position) end
     local _, _, _, _, buttons, rows = layout()
     local p = mouse.position
     if inside(p, buttons.close) then return close_window() end
@@ -553,8 +709,11 @@ local function click(mouse)
         cache = nil
         return
     end
-    if inside(p, buttons.make) then
-        if answer(G.make()) then close_window() end
+    if inside(p, buttons.make) then return start_naming() end
+    if inside(p, buttons.labels) then
+        local ok, why = G.set_labels(next_labels())
+        if ok then window.message, window.error = "Floating labels: " .. G.labels_text(), nil
+        else window.message, window.error = nil, tostring(why) end
         return
     end
     for _, r in rows do
@@ -576,6 +735,16 @@ local function click(mouse)
 end
 
 function G.window_tick()
+    if window.naming then naming_tick(U.now()) end
+    if not window then return end
+    if window.naming then
+        local mouse = reskate.input.cursor()
+        if mouse then
+            if mouse.left and not window.left then click(mouse) end
+            if window then window.left = mouse.left end
+        end
+        return
+    end
     reskate.input.text(true)
     local escape = reskate.input.key(VK_ESCAPE)
     if escape and not window.escape then return close_window() end
@@ -648,6 +817,39 @@ local function draw_map(d, k, m)
     d:poly({v(cx, cy - 13 * k), v(cx + 9 * k, cy + 10 * k), v(cx, cy + 5 * k), v(cx - 9 * k, cy + 10 * k)}, {colour = S.ACCENT, fill = true})
 end
 
+-- The naming step: a tile over the window, two white fields, Back and Make it.
+local function draw_naming(d, k, box, mouse)
+    local n = window.naming
+    d:rect(v(box.x0, box.y0), v(box.x1, box.y1), {colour = "#000000a0", fill = true})
+    local r, f = naming_layout(box, k)
+    S.panel(d, r, k, 71)
+    local x = r.x0 + 30 * k
+    S.title(d, x, r.y0 + 20 * k, "Name your ghost line", k, false)
+    local caret_on = math.floor((U.now() - n.opened) / 500) % 2 == 0
+    local function field(rect, label, text, hint, on)
+        d:text(v(rect.x0, rect.y0 - 22 * k), label, S.font(13, on and S.ACCENT or S.MUTED, "bold", true))
+        if on then S.tile(d, {x0 = rect.x0 - 3 * k, x1 = rect.x1 + 3 * k, y0 = rect.y0 - 3 * k, y1 = rect.y1 + 3 * k}, S.ACCENT, S.seed(label) + 2, k) end
+        S.tile(d, rect, S.PAPER, S.seed(label), k)
+        local style = S.font(18, text == "" and "#6e6e6e" or S.INK, "body")
+        local shown = text == "" and hint or text
+        local m = d:measure(shown, style)
+        local cy = (rect.y0 + rect.y1) / 2
+        d:text(v(rect.x0 + 14 * k, cy - m.y / 2), shown, style)
+        if on and caret_on then
+            local cx = rect.x0 + 14 * k + (text == "" and 0 or m.x + 2 * k)
+            d:rect(v(cx, cy - 12 * k), v(cx + 2.5 * k, cy + 12 * k), {colour = S.INK, fill = true})
+        end
+    end
+    field(f.title, "TITLE", n.title, "What the line is called", n.field == "title")
+    field(f.author, "YOUR NAME, OVER YOUR SKATER", n.author, "Type your name", n.field == "author")
+    local note = n.error or (n.steam and n.author == n.steam and "Your Steam name. Type over it to sign with another.")
+        or (not n.steam and "Your Steam name couldn't be read: type the name to show.") or "Kept for your next ghost lines."
+    S.note(d, f.author.x0, f.author.y1 + 10 * k, note, k, n.error ~= nil)
+    S.keycap(d, x, (f.make.y0 + f.make.y1) / 2 - 11 * k, "Tab", "Next field", k)
+    S.button(d, f.back, "Back", {mouse = mouse, k = k, key = "Esc"})
+    S.button(d, f.make, "Make it", {kind = "primary", mouse = mouse, k = k, key = "Enter"})
+end
+
 local function draw_window(d)
     local k, box, list, m, buttons, rows, pad, count = layout()
     local mouse = reskate.input.cursor()
@@ -691,16 +893,23 @@ local function draw_window(d)
     draw_map(d, k, m)
     local who = G.name()
     d:text(v(m.x0, m.y1 + 14 * k), "Your ghosts are signed " .. (who and ("\"" .. who .. "\"") or "\"a skater\""), S.font(14, S.SOFT, "body", true))
-    d:text(v(m.x0, m.y1 + 36 * k), "retake name <name> in the console to change it", S.font(12, S.MUTED, "body", true))
+    d:text(v(m.x0, m.y1 + 36 * k), "Change it when you make one (or: retake name <name>)", S.font(12, S.MUTED, "body", true))
     local note = window.error or window.message
-    if note then S.note(d, x, box.y1 - 96 * k, note, k, window.error ~= nil) end
+    if note then S.note(d, x, box.y1 - 112 * k, note, k, window.error ~= nil) end
     S.button(d, buttons.close, "Close", {mouse = mouse, k = k, key = "F10"})
     S.button(d, buttons.folder, "Open folder", {kind = "quiet", mouse = mouse, k = k})
+    S.setting(d, buttons.labels, "Floating labels", LABEL_NAMES[G.labels()], {mouse = mouse, k = k,
+        value_colour = G.labels() == "off" and S.MUTED or nil})
+    if window.naming then draw_naming(d, k, box, mouse) end
 end
 
 -- A name over a point in the world, with how far it is: the ghost's tag, and the pins over the starts.
-local function tag(d, k, at, title, under, colour)
-    local p = d:world_to_screen(at)
+local function tag(d, k, at, title, under, colour, follow_with)
+    -- d:follow: the overlay moves the tag to where the camera has the point as each frame is drawn, so it holds
+    -- still over it while the camera swings (the camera here is a tick old). Older ReSkates: world_to_screen.
+    local follow = d.follow ~= nil
+    local p
+    if follow then p = d:follow(at, follow_with) else p = d:world_to_screen(at) end
     if not p then return end
     local style = S.font(18, S.INK, "heading")
     local label = title -- a name as its skater wrote it
@@ -722,6 +931,7 @@ local function tag(d, k, at, title, under, colour)
         S.tile(d, {x0 = sx, x1 = sx + sw, y0 = y0 + (h - sh) / 2, y1 = y0 + (h + sh) / 2}, "#1a1a1ad8", S.seed(under), k * 0.5)
         d:text(v(sx + 7 * k, y0 + h / 2 - ms.y / 2), under, sub)
     end
+    if follow then d:follow() end
 end
 
 -- What is going on, along the bottom: a tile with its words and a key.
@@ -745,9 +955,10 @@ function G.draw(d)
     local r = run
     if r then
         -- Their name over their skater.
-        if r.frame then
+        if r.frame and G.labels() ~= "off" then
             local h = r.frame.root
-            tag(d, k, vector.create(h.x, h.y + HEAD_UP, h.z), tostring(r.entry.meta.author or "someone"), nil, GHOST)
+            tag(d, k, vector.create(h.x, h.y + HEAD_UP, h.z), tostring(r.entry.meta.author or "someone"), nil, GHOST,
+                {ghost_head = ABOVE_HEAD})
         end
         local status
         if r.kind == "try" and r.stage == "count" then
@@ -770,16 +981,20 @@ function G.draw(d)
         status_bar(d, k, "Making a ghost line: hands off")
         return
     end
-    -- Pins over the starts of the ghost lines on this map.
+    -- Pins over the starts of the ghost lines on this map: smaller the further off they are.
+    local shown = G.labels()
+    if shown == "off" then return end
     local at = skater_at()
     if not at then return end
+    local most = shown == "near" and NEAR_M or PIN_M
     for _, entry in G.list() do
         if here_ok(entry) then
             local s = start_of(entry)
             local dist = distance(at, s)
-            if dist < PIN_M and dist > 3 then
+            if dist < most and dist > 3 then
                 local under = distance_text(dist) .. (dist < NEAR_M and "  ·  F10" or "")
-                tag(d, k, vector.create(s.x, s.y + 2.6, s.z), tostring(entry.meta.name), under, GHOST)
+                local far = math.clamp((dist - NEAR_M) / (PIN_M - NEAR_M), 0, 1)
+                tag(d, k * (1 - 0.3 * far), vector.create(s.x, s.y + 2.6, s.z), tostring(entry.meta.name), under, GHOST)
             end
         end
     end

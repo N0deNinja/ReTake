@@ -15,7 +15,7 @@
 </p>
 
 > [!WARNING]
-> **This is version 0.0.5, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
+> **This is version 0.0.6, an early release.** Sometimes a replay drifts away from what you actually skated, mostly on **rails, ledges and other grinds**. We're working on it. If it happens, go back to a moment a little earlier and try again.
 
 ![How ReTake works, step by step](docs/how-it-works.jpg)
 
@@ -44,7 +44,7 @@ You need:
 
 Then:
 
-1. Download **`ReTake-v0.0.5.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
+1. Download **`ReTake-v0.0.6.zip`** from [Releases](https://github.com/N0deNinja/ReTake/releases/latest) and unzip it anywhere.
 2. Close skate. and the ReSkate launcher.
 3. Double-click **`Install ReTake.bat`**.
    It finds your game on its own (or lets you pick the folder), backs up your `ReSkate.dll`, installs ReTake, and asks to turn off the launcher's automatic updates.
@@ -98,9 +98,9 @@ Close the game and double-click **`Uninstall ReTake.bat`**. It puts your old `Re
 
 ### Ghost lines
 
-1. **Make one.** Skate a line (retakes and all), press **F10** and click **Make a ghost of my line**. The line plays once, hands off, while ReTake records your skater, your outfit and your camera. Set the name shown over your skater with `retake name <name>`.
+1. **Make one.** Skate a line (retakes and all), press **F10** and click **Make a ghost of my line**. The line plays once, hands off, while ReTake records your skater, your outfit and your camera. First it asks for a title and the name shown over your skater, both filled in already (your Steam name).
 2. **Share it.** Click **Open folder** and send the `.ghost` file. Whoever gets it puts it in the same folder (`Mods\.reskate_plugin_data\ReTake\ghosts`).
-3. **Find it.** A tag floats over the start of each ghost line on the map you're on, with its distance, and ReTake tells you when you're close. The F10 window lists them nearest first, with a map of the ones around you. One on another map travels there first.
+3. **Find it.** A tag floats over the start of each ghost line on the map you're on, with its distance, and ReTake tells you when you're close. The F10 window lists them nearest first, with a map of the ones around you. One on another map travels there first. Too many tags? **Floating labels** at the bottom of the window shows them all, only the near ones, or none.
 4. **Watch** it through its skater's camera, then **Try it**: you start where they started, at their speed, after 3, 2, 1, with their skater riding beside you as a ghost. The ghost doesn't collide with you.
 
 ### In the timeline
@@ -131,6 +131,7 @@ retake lines              your saved lines, numbered (also: F11, My lines)
 retake load <number>      load a saved line, in place of the one you have
 retake delete <number>    delete a saved line
 retake ghosts             ghost lines: other skaters' lines to watch and try (also: F10)
+retake ghosts labels [all|near|off]  the floating labels over ghost line starts
 retake ghost make [name]  make a ghost line of your line, to share (it plays once, hands off)
 retake ghost watch <n>    watch a ghost line through its skater's eyes
 retake ghost try <n>      try a ghost line, its skater riding beside you
@@ -185,7 +186,7 @@ cd ..
 powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
 ```
 
-That writes `dist\ReTake-v0.0.5.zip`.
+That writes `dist\ReTake-v0.0.6.zip`.
 
 ReTake's changes to ReSkate, in short: a `reskate.tas` plugin API that records a line's inputs per physics step and replays them locked to the recording, game-time control for the catch-up and the countdown, slow motion that keeps the skater as the game would build it at the shorter step (the board's flight, the joints and everything else worked out from the step length) so it rides the same, a no-bail switch, ghost lines (the skater's pose, camera and outfit at every step, compressed the way multiplayer sends a player, and shown as a multiplayer player model), sharper plugin fonts, and **no crash reports**: this build never uploads anything.
 

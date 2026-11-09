@@ -34,6 +34,12 @@ struct State {
     RenderView view_original{};
     std::array<std::atomic<std::uint32_t>, build::render_modes> indices{no_index, no_index};
     std::atomic<std::uint64_t> indices_until{};
+    std::atomic<std::uint64_t> camera_until{}; // the main view's camera kept on its own (follow_camera)
+    // A ghost line's skater (follow_ghost): its render objects, and its skinning matrices as last drawn.
+    std::array<std::atomic<std::uint32_t>, build::render_modes> ghost_indices{no_index, no_index};
+    std::atomic<std::uint64_t> ghost_until{};
+    std::vector<game::LinearTransform> ghost_skin; // under lock
+    std::uint64_t ghost_skin_at{};
     std::atomic<bool> found_logged{}, hiding{}, hide_logged{};
     std::mutex lock; // guards the picture's parts
     std::vector<game::LinearTransform> skin;
@@ -91,16 +97,21 @@ bool clear_byte(std::uintptr_t address) noexcept {
         return false;
     }
 }
-// Render threads, after each skinned draw packet: the local skater's visible one, as skinning
-// matrices in the world.
+// Render threads, after each skinned draw packet: the local skater's visible one, and a ghost line's
+// skater's (follow_ghost), as skinning matrices in the world.
 void observe_packet(std::uintptr_t object, std::uintptr_t packet) {
     auto& s = state();
     std::uint32_t index{}, count{}, locked{};
     std::uint8_t visible{}, relative{};
-    if (GetTickCount64() > s.indices_until.load(std::memory_order_acquire) ||
-        pointer_at(object) != s.base + build::render_object_vtable || !memory::peek(object + build::render_index_offset, index) ||
-        (index != s.indices[0].load(std::memory_order_acquire) && index != s.indices[1].load(std::memory_order_acquire)))
+    const auto now = GetTickCount64();
+    const bool local_on = now <= s.indices_until.load(std::memory_order_acquire), ghost_on = now <= s.ghost_until.load(std::memory_order_acquire);
+    if ((!local_on && !ghost_on) || pointer_at(object) != s.base + build::render_object_vtable ||
+        !memory::peek(object + build::render_index_offset, index))
         return;
+    const bool local = local_on && (index == s.indices[0].load(std::memory_order_acquire) || index == s.indices[1].load(std::memory_order_acquire));
+    const bool ghost = !local && ghost_on &&
+                       (index == s.ghost_indices[0].load(std::memory_order_acquire) || index == s.ghost_indices[1].load(std::memory_order_acquire));
+    if (!local && !ghost) return;
     if (!memory::peek(packet + build::packet_visible_offset, visible) || !visible ||
         !memory::peek(packet + build::packet_bone_count_offset, count) || !count || count > most_bones ||
         !memory::peek(packet + build::packet_relative_offset, relative) ||
@@ -119,6 +130,11 @@ void observe_packet(std::uintptr_t object, std::uintptr_t packet) {
         if (!draw_packet::skin(packed[bone], placed, skin[bone])) return;
     {
         std::lock_guard guard(s.lock);
+        if (ghost) {
+            s.ghost_skin = std::move(skin);
+            s.ghost_skin_at = GetTickCount64();
+            return;
+        }
         s.skin = std::move(skin);
         s.skin_at = GetTickCount64();
     }
@@ -144,7 +160,8 @@ void draw_packet_hook(std::uintptr_t object, std::uintptr_t packet) {
 // The camera of the main picture: a sound world matrix, close to the client's own camera.
 void observe_view(std::uintptr_t view) {
     auto& s = state();
-    if (GetTickCount64() > s.indices_until.load(std::memory_order_acquire)) return;
+    const auto now = GetTickCount64();
+    if (now > s.indices_until.load(std::memory_order_acquire) && now > s.camera_until.load(std::memory_order_acquire)) return;
     std::uint32_t kind{};
     std::array<std::byte, build::view_size> data{};
     if (!memory::peek(view - build::view_kind_back, kind) || kind != build::main_view_kind ||
@@ -271,6 +288,43 @@ void follow_render(bool wanted) noexcept {
 }
 
 void hide_skater(bool hidden) noexcept { state().hiding.store(hidden, std::memory_order_release); }
+void follow_camera(bool wanted) noexcept {
+    auto& s = state();
+    if (!s.ready.load(std::memory_order_acquire)) return;
+    s.camera_until.store(wanted ? GetTickCount64() + lease_ms : 0, std::memory_order_release);
+}
+void follow_ghost(std::uintptr_t entity) noexcept {
+    auto& s = state();
+    if (!s.ready.load(std::memory_order_acquire)) return;
+    if (!entity) {
+        s.ghost_until.store(0, std::memory_order_release);
+        return;
+    }
+    for (std::size_t mode = 0; mode < build::render_modes; ++mode)
+        s.ghost_indices[mode].store(render_index(s.base, entity, mode), std::memory_order_release);
+    s.ghost_until.store(GetTickCount64() + lease_ms, std::memory_order_release);
+}
+bool latest_ghost_skin(std::vector<game::LinearTransform>& skin) noexcept {
+    auto& s = state();
+    const auto now = GetTickCount64();
+    std::lock_guard guard(s.lock);
+    if (!s.ghost_skin_at || now - s.ghost_skin_at > fresh_ms) return false;
+    try {
+        skin = s.ghost_skin;
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+bool render_camera(std::array<float, 16>& camera, float& vertical_fov) noexcept {
+    auto& s = state();
+    const auto now = GetTickCount64();
+    std::lock_guard guard(s.lock);
+    if (!s.camera_at || now - s.camera_at > fresh_ms) return false;
+    camera = s.camera;
+    vertical_fov = s.vertical_fov;
+    return true;
+}
 bool latest_picture(Picture& picture) noexcept {
     auto& s = state();
     const auto now = GetTickCount64();

@@ -32,6 +32,7 @@ local marks = {}    -- {step=, position=}, a tenth of a second apart, oldest fir
 local bails = {}    -- steps of the line where the skater bailed
 local joins = {}    -- steps of the line where a retake took over
 local pending = nil -- {from=, to=, hand_over=, retries=}, while going back
+local sensor_was = nil -- the game's sensor block as last seen (logged when it changes)
 local count = nil   -- {ends=}: slowed right down at the moment
 local slowed = false
 local clock_now = 1
@@ -242,12 +243,20 @@ local function recorded_on_board()
     return nil
 end
 
--- Whether the skater has been ridden since the game started (ReSkate.dll reads a sensor block of the game's that only
--- starts when the skater is ridden). Until then a replay takes rails the other way: a line loaded straight after starting
--- the game went off at its first rail, every time. True when the DLL can't tell.
-function L.sensor_ready()
+-- The game's sensor block (ReSkate.dll reads it): on once the skater has been ridden since the game started, else off.
+-- true, false, or nil when the DLL can't tell.
+local function sensor_on()
     local ok, s = pcall(reskate.tas.status)
-    return not (ok and type(s) == "table" and s.sensor_started == false)
+    if not ok or type(s) ~= "table" or s.sensor_started == nil then return nil end
+    return s.sensor_started == true
+end
+
+-- Whether the line can be replayed as it was skated. A line skated with the sensor block on, replayed with it off, takes
+-- rails the other way: a line loaded straight after starting the game went off at its first rail, every time. A line
+-- skated with it off replays the same with it off, so that is fine. A line from before ReTake kept this counts as on.
+function L.sensor_ready()
+    if sensor_on() ~= false then return true end
+    return start ~= nil and start.sensor == false
 end
 
 local function seek(to, hand_over, retries)
@@ -551,7 +560,7 @@ function L.new_line()
     if not ok then return false, why end
     ok, why = reskate.tas.line_start(pad, START_STEP)
     if not ok then return false, why end
-    start = {position = s.position, heading = s.heading, on_board = true}
+    start = {position = s.position, heading = s.heading, on_board = true, sensor = sensor_on()}
     line_uid = os.date("%Y%m%d-%H%M%S")
     if L.on_new_line then L.on_new_line(line_uid) end
     marks, bails, joins = {}, {}, {}
@@ -908,7 +917,16 @@ function L.tick(busy)
     -- a flight is kept in step there, line or no line.
     if now >= listen_at then
         listen_at = now + 2000
-        reskate.tas.status()
+        local ok, s = pcall(reskate.tas.status)
+        local on = ok and type(s) == "table" and s.sensor_started
+        if on ~= nil and on ~= sensor_was then
+            if sensor_was ~= nil or not on then
+                R.line(string.format("[line] the game's sensor block is %s: phase %s, %d steps since the skater was built, line skated with it %s",
+                    on and "on" or "OFF", tostring(line.phase), line.since_spawn or -1,
+                    start == nil and "-" or start.sensor == nil and "?" or start.sensor and "on" or "off"))
+            end
+            sensor_was = on
+        end
     end
     if U.in_session() then
         if line.phase ~= "off" or slowed or clock_now ~= 1 then
@@ -1026,7 +1044,7 @@ function L.tick(busy)
 end
 
 -- ReTake's look: ink panels, neon teal for what matters, red for what stops or bails.
-local VERSION = "0.0.5"
+local VERSION = "0.0.6"
 local LOGO = "assets/retake_logo_teal.png" -- the game keeps a picture by its path until it restarts: a changed picture gets a new name
 local ACCENT, INK_HEX, TEXT, MUTED, RED = "#02f7da", "#0c0d11", "#f2f3f5", "#9aa0aa", "#ff5a5a"
 local PATH_DONE = {colour = "#02f7daa0", thickness = 2}
@@ -1305,6 +1323,7 @@ function L.adopt(meta)
     local s = meta.start or {}
     line_uid = meta.line_id or line_uid or os.date("%Y%m%d-%H%M%S")
     start = {position = vector.create(s.x or 0, s.y or 0, s.z or 0), heading = s.heading or 0, on_board = s.on_board ~= false}
+    if s.sensor == false then start.sensor = false end
     joins, bails, marks = {}, {}, {}
     for _, step in meta.joins or {} do table.insert(joins, step) end
     for _, step in meta.bails or {} do table.insert(bails, step) end

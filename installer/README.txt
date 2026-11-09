@@ -1,4 +1,4 @@
-ReTake 0.0.5: rewind and retake your lines in skate. (a ReSkate mod, offline only)
+ReTake 0.0.6: rewind and retake your lines in skate. (a ReSkate mod, offline only)
 https://github.com/N0deNinja/ReTake
 
 INSTALL

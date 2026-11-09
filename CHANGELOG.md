@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.0.6 (2026-11-09)
+
+Ghost lines get your Steam name and a naming step, floating labels you can turn down or off and that hold still, and default clothes and board parts for mods you don't have. Also fixes Watch breaking ReTake, ReTake not loading at game start, and "ride for a moment first" when you had.
+
+### Ghost lines
+
+- **Your real name over your ghost.** Offline, ghost lines were signed "a skater". ReTake now signs them with your Steam name, read the same way ReSkate's own name tags read it, and saved lines get it too.
+- **Name it when you make it.** **Make a ghost of my line** first asks for a **Title** and **Your name**, both filled in already. Type over either one; Tab switches fields, Enter makes it, Esc goes back. If your Steam name can't be read, the name field is empty and asks you to type one. A name you type is kept for your next ghost lines.
+- **Fewer floating labels, if you want.** A new **Floating labels** setting at the bottom of the F10 window goes round **All**, **Near only** (just the starts within 40 m, where F10 starts them) and **Off** (no names over the starts or the ghosts). Also: `retake ghosts labels all|near|off`. Far-off pins are drawn a little smaller.
+- **Labels hold still.** The names over ghost line starts and over a ghost's skater no longer shake while the camera moves: they're placed with the camera the game's renderer drew that frame with. The name over a ghost follows its head as the game draws it, so it stays on the skater while it moves, and it sits closer to the head.
+- **Mod clothes and boards you don't have.** A ghost line made with clothes or board parts from a cosmetics mod you don't have shows the default for each one you're missing, as multiplayer already did. On the board: a blank natural deck, plain black grip, basic trucks and white wheels, and no sticker where a modded one was. And if a missing piece leaves the ghost underdressed (a modded full-body costume, say), it wears the default outfit instead: a black tee, olive chinos and black slip-ons.
+
+### Fixes
+
+- **Watch broke ReTake.** Showing a ghost builds a skater model, and ReSkate counted that against ReTake's 50 ms a tick, so it stopped ReTake as the ghost first showed: two skaters, the ghost twitching in place, and no hotkeys. Building and taking down the ghost no longer count against ReTake. And if ReTake is ever stopped mid-watch, ReSkate now takes its ghost down.
+- **ReTake didn't load (F11 did nothing).** ReSkate stops a plugin whose load takes longer than 50 ms, and with the PC busy starting the game, ReTake's setup went over. It now loads a module at a time over the game's first ticks, each step well inside the limit. The log says how long the longest step took.
+- **"Ride for a moment first" when you had.** ReTake refused every replay while the game's sensor block was off, even for a line skated with it off, which replays just the same. Now it only refuses a line skated with the block on, replayed with it off (the case that goes off on rails). Lines remember which it was, saved ones too. Each time the block switches, ReTake's log says so, to find what turns it off mid-session.
+
+### ReSkate.dll
+
+- `reskate.tas.player_name()`: your Steam name, offline too (nil when it isn't known).
+- `d:follow(world_position)`: draw a tag about a point in the world that keeps to it while the camera moves (the overlay moves it with the camera of the frame being drawn). Returns where the point is on screen, or nil behind the camera; `d:follow()` ends it.
+- `d:follow(position, {ghost_head = metres})`: the tag keeps that far above the middle of the ghost line skater's head as the renderer drew it this frame (the position stands in until then).
+- Followed tags and world shapes (`d:world_text`, `d:world_line`, …) are projected with the camera the renderer drew the frame with, taken by the x-ray's view hook (on only while something is drawn over the world), so they stay put while the camera moves.
+- Ghost lines' outfits: a missing item that would leave a slot empty puts the default outfit on the empty slots.
+- Building and taking down a ghost (`ghost_frame` with show, `ghost_hide`) no longer counts against a plugin's time limit, and a plugin that is stopped or unloaded has its ghost taken down and its ghost recording stopped.
+- Still sends no crash reports.
+
+### Installer
+
+- Knows 0.0.5's `ReSkate.dll` and the 0.0.6 test builds, so updating never backs one of them up as your original.
+
 ## 0.0.5 (2026-11-08)
 
 Ghost lines: share a line with friends, who watch it through your eyes and then try it with your skater beside them. Also: every try kept as a take, sharing your lines, slow motion on any button, and a new look in the game's own style.

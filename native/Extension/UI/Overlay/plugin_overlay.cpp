@@ -7,7 +7,10 @@
 #include "Extension/UI/Overlay/xray_overlay.h"
 #include "Extension/UI/Overlay/overlay.h"
 #include "Extension/UI/Overlay/skate_style.h"
+#include "Extension/Skater/xray.h"
 #include <algorithm>
+#include <numbers>
+#include <optional>
 #include <array>
 #include <map>
 #include <imgui_internal.h>
@@ -503,7 +506,35 @@ void draw_plugins() {
                                        s.menu.heading ? s.menu.heading : fallback, s.menu.title ? s.menu.title : fallback,
                                        s.menu.title_large ? s.menu.title_large : s.menu.title ? s.menu.title : fallback};
     auto* draw = ImGui::GetBackgroundDrawList();
-    const auto camera = plugin_camera::projector(display.x, display.y);
+    using Kind = plugin_ui::Shape::Kind;
+    // World shapes and followed tags go through the camera the renderer drew the frame with (the
+    // x-ray's view hook, on while they are drawn), so they hold still on the world while the camera
+    // moves; the game's camera read now, a frame apart, until the renderer has given one.
+    bool over_world = false;
+    for (const auto& layer : *layers) {
+        for (const auto& shape : layer.shapes)
+            if (shape.kind == Kind::follow || shape.kind == Kind::world_text || shape.kind == Kind::world_line ||
+                shape.kind == Kind::world_circle || shape.kind == Kind::world_image) {
+                over_world = true;
+                break;
+            }
+        if (over_world) break;
+    }
+    std::optional<plugin_camera::Projector> camera;
+    if (over_world) {
+        std::array<float, 16> drawn{};
+        float fov{};
+        if (xray::camera(drawn, fov) && fov > 1 && fov < 175) {
+            plugin_camera::Projector p;
+            p.m = drawn;
+            p.width = display.x;
+            p.height = display.y;
+            p.focal = display.y / (2.0f * std::tan(fov * std::numbers::pi_v<float> / 360.0f));
+            camera = p;
+        } else {
+            camera = plugin_camera::projector(display.x, display.y);
+        }
+    }
     // The fonts' advances for d:measure, again whenever the atlas is new.
     static const void* measured{};
     if (measured != ImGui::GetIO().Fonts) {
@@ -516,7 +547,6 @@ void draw_plugins() {
             plugin_ui::set_font(i, m);
         }
     }
-    using Kind = plugin_ui::Shape::Kind;
     const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.25f);
     std::vector<std::string> covering; // plugins over most of the screen, named after the drawing
     for (const auto& layer : *layers) {
@@ -529,7 +559,13 @@ void draw_plugins() {
         if (over.hidden >= named_cover) covering.push_back(layer.plugin);
         int clips = 0;
         plugin_ui::Shape held;
+        // d:follow: screen shapes moved to where the followed point is in this frame's camera; left
+        // out while it is behind the camera.
+        ImVec2 shift{};
+        bool unseen = false;
+        const auto at = [&](const plugin_ui::Vec3& p) { return ImVec2(p[0] + shift.x, p[1] + shift.y); };
         for (const auto& source : layer.shapes) {
+            if (unseen && source.kind != Kind::unfollow) continue;
             // (Copied only while it is being dimmed.)
             const plugin_ui::Shape* drawn = &source;
             if (dim < 1.0f) {
@@ -617,6 +653,27 @@ void draw_plugins() {
                     draw->PopClipRect();
                     --clips;
                 }
+                break;
+            case Kind::follow: {
+                shift = {};
+                unseen = false;
+                if (p.size() < 2) break;
+                // Over a ghost's head: where the renderer drew it this frame, else the plugin's point.
+                plugin_ui::Vec3 anchor = p[0];
+                if (std::array<float, 3> head{}; shape.fit == 1 && xray::ghost_head(head))
+                    anchor = {head[0], head[1] + shape.radius, head[2]};
+                const auto now = camera ? camera->project(anchor) : std::nullopt;
+                // Behind the camera now, or swung so far that the tag would leave the screen: not drawn.
+                if (!now || !std::isfinite((*now)[0]) || !std::isfinite((*now)[1]) || std::fabs((*now)[0]) > 1e6f || std::fabs((*now)[1]) > 1e6f) {
+                    unseen = true;
+                    break;
+                }
+                shift = ImVec2((*now)[0] - p[1][0], (*now)[1] - p[1][1]);
+                break;
+            }
+            case Kind::unfollow:
+                shift = {};
+                unseen = false;
                 break;
             }
         }

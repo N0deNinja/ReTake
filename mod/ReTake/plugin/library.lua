@@ -171,11 +171,17 @@ function LIB.busy()
     return op ~= nil
 end
 
--- The player's name for a line they share, when the game has one (offline it may not).
+-- The player's name for a line they share: the session's name for them, or offline their Steam name (ReTake's
+-- ReSkate.dll reads it as ReSkate's own name tags do). nil when neither is known.
 function LIB.player_name()
-    if not reskate.session or not reskate.session.me then return nil end
-    local ok, me = pcall(reskate.session.me)
-    if ok and type(me) == "table" and type(me.name) == "string" and me.name ~= "" then return me.name end
+    if reskate.session and reskate.session.me then
+        local ok, me = pcall(reskate.session.me)
+        if ok and type(me) == "table" and type(me.name) == "string" and me.name ~= "" then return me.name end
+    end
+    if reskate.tas and reskate.tas.player_name then
+        local ok, name = pcall(reskate.tas.player_name)
+        if ok and type(name) == "string" and name ~= "" then return name end
+    end
     return nil
 end
 
@@ -222,7 +228,8 @@ function LIB.save(name, extra)
         name = (name and name ~= "") and name or ("Line " .. os.date("%d %b, %H:%M")),
         saved = os.date("%Y-%m-%d %H:%M"),
         length = info.length,
-        start = {x = p.x, y = p.y, z = p.z, heading = info.start.heading, on_board = info.start.on_board ~= false},
+        start = {x = p.x, y = p.y, z = p.z, heading = info.start.heading, on_board = info.start.on_board ~= false,
+            sensor = info.start.sensor == false and false or nil},
         joins = info.joins,
         bails = info.bails,
         retake = L.version,

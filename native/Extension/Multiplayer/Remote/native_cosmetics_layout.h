@@ -244,6 +244,30 @@ template <class Read> struct CosmeticMemory {
         }
         return swaps;
     }
+    // After substitute_missing, for a ghost line: when an item it wore became nothing here (a
+    // modded costume, say, that left the top and bottoms empty under it), every empty slot one of
+    // `defaults` fits takes it, so the skater wears the default outfit rather than going without.
+    // Returns how many slots were dressed.
+    template <class Defaults, class Blocked = bool (*)(const std::string &)>
+    std::size_t dress_gaps(std::uintptr_t res, CosmeticRecipe &r, const std::vector<std::pair<std::string, std::string>> &swaps,
+                           const Defaults &defaults, const Blocked &blocked = [](const std::string &) { return false; }) const {
+        if (std::none_of(swaps.begin(), swaps.end(), [](const auto &swap) { return !swap.first.empty() && swap.second.empty(); }))
+            return 0;
+        std::size_t dressed{};
+        for (std::size_t i = 0; i < r.items.size(); ++i) {
+            auto &item = r.items[i];
+            if (!item.asset.empty()) continue;
+            for (const auto &candidate : defaults) {
+                CosmeticSlot fallback{item.slot, std::string(candidate), item.parameters};
+                if (item_installed(res, i, fallback) && !blocked(fallback.asset)) {
+                    item = std::move(fallback);
+                    ++dressed;
+                    break;
+                }
+            }
+        }
+        return dressed;
+    }
     // A mod can add slots to the skater or the board (stickers, say), and then two players'
     // templates hold different slots. Puts a peer's items in this game's slots by slot hash:
     // a slot the peer does not have stays empty, and an item in a slot this game does not

@@ -619,6 +619,21 @@ void cosmetic_layout_regression() {
     const std::array<std::string_view, 1> none{"Own_NotInstalled"};
     fake.substitute_missing(res, modded, none);
     check(modded.items[0].asset.empty() && !reject(m, modded), "A missing peer item without a default must become empty");
+    // A ghost line: a missing item that became nothing puts the default outfit on the empty slots it fits.
+    {
+        auto ghost = wrong;
+        const auto gone = fake.substitute_missing(res, ghost, none);
+        check(fake.dress_gaps(res, ghost, gone, fallbacks) == 1 && ghost.items[0].asset == "Own_Shirt" && !reject(m, ghost),
+              "A ghost whose modded item left a slot empty must wear the default there");
+        auto kept = one;
+        kept.items[0].asset.clear();
+        check(fake.dress_gaps(res, kept, {}, fallbacks) == 0 && kept.items[0].asset.empty(),
+              "A slot left empty on purpose (nothing missing) must stay empty");
+        auto swapped = wrong;
+        const auto stood_in = fake.substitute_missing(res, swapped, fallbacks);
+        check(fake.dress_gaps(res, swapped, stood_in, fallbacks) == 0 && swapped.items[0].asset == "Own_Shirt",
+              "A missing item that already has a stand-in needs no more");
+    }
     modded = one;
     check(fake.substitute_missing(res, modded, fallbacks).empty() && modded == one, "Installed peer items must stay");
     // A peer whose mods add slots (or who lacks this game's): items go to this game's slots by slot hash.

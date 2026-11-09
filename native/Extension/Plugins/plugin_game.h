@@ -1178,6 +1178,8 @@ public:
     virtual std::string tas_ghost_record(bool /*on*/) { return unavailable; }
     virtual std::string tas_ghost_capture(std::uint32_t /*step*/) { return unavailable; }
     virtual TasGhostStatus tas_ghost_status() { return {}; }
+    // The player's own name, as ReSkate shows it: their Steam persona, offline too. Empty when it isn't known.
+    virtual std::string tas_player_name() { return {}; }
     virtual std::string tas_ghost_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
     virtual std::optional<std::string> tas_ghost_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
         why = unavailable;
@@ -1189,6 +1191,9 @@ public:
         return std::nullopt;
     }
     virtual void tas_ghost_hide() {}
+    // The plugin that last recorded or showed a ghost: when it stops (release), its ghost is taken down and its
+    // recording ended, so a plugin stopped mid-watch leaves no skater behind.
+    virtual void tas_ghost_claim(std::string_view /*plugin*/) {}
     // Research: the skater's sensor block written as it is in a ridden skater, on the next physics step.
     virtual std::string tas_sensor_start() { return unavailable; }
     // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).

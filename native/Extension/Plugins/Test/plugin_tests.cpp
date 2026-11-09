@@ -4992,6 +4992,14 @@ void plugins_draw_on_the_overlay() {
             assert(d:world_to_screen(vector.create(1000, 0, -0.06)) == nil, "far off the screen")
             assert(d:world_to_screen(vector.create(0, 1000, -0.06)) == nil, "far above the screen")
             assert(d:world_to_screen(vector.create(1, 0, -0.06)), "off the screen but drawable")
+            -- A tag kept to a point in the world: where it is now, then what is drawn about it.
+            local tag = d:follow(vector.create(1, 0, -10))
+            assert(tag and math.abs(tag.x - 1060) < 0.01, "follow gives the point on screen")
+            d:rect(tag, tag + vector.create(10, 10, 0))
+            d:follow()
+            assert(d:follow(vector.create(0, 0, 5)) == nil, "nothing follows a point behind the camera")
+            assert(d:follow(vector.create(1, 0, -10), {ghost_head = 0.3}), "over a ghost's head")
+            d:follow()
             assert(d:size().x == 1920 and d:size().y == 1080)
             assert(not pcall(d.text, d, vector.create(0, 0, 0), "x", {colour = "red"}), "a colour by name")
             assert(not pcall(d.text, d, vector.create(0 / 0, 0, 0), "x"), "NaN")
@@ -5019,8 +5027,17 @@ void plugins_draw_on_the_overlay() {
     check(environment.logged("unseen refused"), "Drawing needs overlay\n" + environment.all());
     ticks(host, environment, 1);
     running(host, "painter", environment);
-    check(environment.layers.size() == 1 && environment.layers[0].plugin == "painter" && environment.layers[0].shapes.size() == 8,
+    check(environment.layers.size() == 1 && environment.layers[0].plugin == "painter" && environment.layers[0].shapes.size() == 13,
           "Its shapes are handed to the overlay each tick\n" + environment.all());
+    {
+        const auto& shapes = environment.layers[0].shapes;
+        check(shapes[8].kind == plugin_ui::Shape::Kind::follow && shapes[8].points.size() == 2 && shapes[8].points[0][2] == -10.0f &&
+                  std::fabs(shapes[8].points[1][0] - 1060.0f) < 0.01f && shapes[10].kind == plugin_ui::Shape::Kind::unfollow,
+              "A followed point goes to the overlay with where the plugin saw it, and d:follow() ends it");
+        check(shapes[8].fit == 0 && shapes[11].kind == plugin_ui::Shape::Kind::follow && shapes[11].fit == 1 &&
+                  std::fabs(shapes[11].radius - 0.3f) < 1e-6f && shapes[12].kind == plugin_ui::Shape::Kind::unfollow,
+              "{ghost_head = metres} keeps it over a ghost's head, that far up");
+    }
     check(environment.logged("drawn"), "and the draw handler ran to its end\n" + environment.all());
     const auto& first = environment.layers[0].shapes[0];
     check(first.kind == plugin_ui::Shape::Kind::text && first.text == "hello" && first.style.colour == 0xff0080ff &&

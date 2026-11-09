@@ -3246,7 +3246,9 @@ struct WorldApi {
     static int tas_ghost_record(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "tas", "reskate.tas.ghost_record");
-        return result(L, game(plugin).tas_ghost_record(lua_toboolean(L, 1) != 0));
+        const bool on = lua_toboolean(L, 1) != 0;
+        if (on) game(plugin).tas_ghost_claim(plugin.id());
+        return result(L, game(plugin).tas_ghost_record(on));
     }
     static int tas_ghost_capture(lua_State* L) {
         auto& plugin = plugin_of(L);
@@ -3254,6 +3256,15 @@ struct WorldApi {
         const double step = luaL_checknumber(L, 1);
         if (!(step >= 0 && step < 4294967295.0)) luaL_argerror(L, 1, "a step is a whole number from 0");
         return result(L, game(plugin).tas_ghost_capture(static_cast<std::uint32_t>(step)));
+    }
+    // tas.player_name(): the player's own name, their Steam persona (offline too); nil when it isn't known.
+    static int tas_player_name(lua_State* L) {
+        auto& plugin = plugin_of(L);
+        need(L, plugin, "tas", "reskate.tas.player_name");
+        const auto name = game(plugin).tas_player_name();
+        if (name.empty()) lua_pushnil(L);
+        else lua_pushlstring(L, name.data(), name.size());
+        return 1;
     }
     // tas.ghost_status(): {recording, recorded, recorded_first, recorded_last, recorded_outfit, loaded, loaded_first,
     // loaded_last, loaded_outfit, shown, file}.
@@ -3327,7 +3338,17 @@ struct WorldApi {
         const double step = luaL_checknumber(L, 1);
         if (!std::isfinite(step)) luaL_argerror(L, 1, "a step is a number");
         std::string why;
-        const auto frame = game(plugin).tas_ghost_frame(step, show, why);
+        std::optional<TasGhostFrame> frame;
+        {
+            // Showing it builds a skater model and dresses it (ReSkate's work, as reading a clip is), which can take
+            // longer than a plugin's tick: the plugin was stopped as the ghost first showed.
+            std::optional<Plugin::Untimed> untimed;
+            if (show) {
+                untimed.emplace(plugin);
+                game(plugin).tas_ghost_claim(plugin.id());
+            }
+            frame = game(plugin).tas_ghost_frame(step, show, why);
+        }
         if (!frame) {
             lua_pushnil(L);
             lua_pushlstring(L, why.data(), why.size());
@@ -3359,6 +3380,7 @@ struct WorldApi {
     static int tas_ghost_hide(lua_State* L) {
         auto& plugin = plugin_of(L);
         need(L, plugin, "tas", "reskate.tas.ghost_hide");
+        const Plugin::Untimed untimed{plugin}; // taking the model down: ReSkate's work
         game(plugin).tas_ghost_hide();
         return 0;
     }
@@ -3773,7 +3795,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
         {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
         {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status},
         {"line_note", tas_line_note}, {"ghost_probe", tas_ghost_probe}, {"sensor_start", tas_sensor_start},
-        {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
+        {"player_name", tas_player_name}, {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
         {"ghost_export", tas_ghost_export}, {"ghost_note", tas_ghost_note}, {"ghost_load", tas_ghost_load},
         {"ghost_frame", tas_ghost_frame}, {"ghost_show", tas_ghost_show}, {"ghost_hide", tas_ghost_hide}});
     add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});

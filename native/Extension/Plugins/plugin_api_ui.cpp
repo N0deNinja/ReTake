@@ -349,6 +349,37 @@ struct UiApi {
         add(L, plugin, {plugin_ui::Shape::Kind::clip, {point(L, 2, "a clip's top left"), point(L, 3, "a clip's bottom right")}});
         return 0;
     }
+    // d:follow(world_position, {ghost_head = metres}): where the point is on screen now (as
+    // world_to_screen: nil behind the camera), and what is drawn after it, until d:follow(), keeps to the
+    // point as the camera moves between ticks: draw a tag about the point it returns. Nothing is added
+    // when it returns nil.
+    static int follow(lua_State* L) {
+        auto& plugin = drawing(L);
+        if (lua_isnone(L, 2)) {
+            add(L, plugin, {plugin_ui::Shape::Kind::unfollow, {}});
+            return 0;
+        }
+        const auto world = point(L, 2, "the followed position");
+        const auto on = plugin.services_.world_to_screen(world);
+        const auto drawable = [](float v) { return std::isfinite(v) && std::fabs(v) <= 1e6f; };
+        if (!on || !drawable((*on)[0]) || !drawable((*on)[1]) || !drawable((*on)[2])) {
+            lua_pushnil(L);
+            return 1;
+        }
+        plugin_ui::Shape shape{plugin_ui::Shape::Kind::follow, {world, *on}};
+        // {ghost_head = metres}: kept that far above the middle of a ghost line's skater's head as the renderer
+        // draws it (the point given stands in until it is drawn), so a name keeps to the model, not a tick off it.
+        if (lua_istable(L, 3)) {
+            if (lua_getfield(L, 3, "ghost_head") != LUA_TNIL) {
+                shape.radius = std::clamp(finite(L, -1, "ghost_head"), -3.0f, 3.0f);
+                shape.fit = 1;
+            }
+            lua_pop(L, 1);
+        }
+        add(L, plugin, std::move(shape));
+        lua_pushvector(L, (*on)[0], (*on)[1], (*on)[2]);
+        return 1;
+    }
     // d:measure(text, style): how wide and tall the text is drawn, in the window's pixels.
     static int measure(lua_State* L) {
         auto& plugin = plugin_of(L);
@@ -912,7 +943,7 @@ void UiApi::install(Plugin& plugin, lua_State* L) {
     push_functions(L, {{"text", F::text}, {"rect", F::rect}, {"line", F::line}, {"circle", F::circle}, {"poly", F::poly},
                        {"world_text", F::world_text}, {"world_line", F::world_line}, {"world_circle", F::world_circle},
                        {"image", F::image}, {"world_image", F::world_image}, {"game_image", F::game_image}, {"rough_rect", F::rough_rect}, {"scribble", F::scribble}, {"halftone", F::halftone},
-                       {"clip", F::clip}, {"measure", F::measure},
+                       {"clip", F::clip}, {"follow", F::follow}, {"measure", F::measure},
                        {"gradient", F::gradient}, {"skeleton", F::skeleton}, {"size", F::size}, {"world_to_screen", F::world_to_screen}});
     plugin.draw_table_ = lua_ref(L, -1);
     lua_pop(L, 1);

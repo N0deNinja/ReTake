@@ -358,8 +358,160 @@ index 0000000..e52e626
 +};
 +inline StepScript& step_script() { static auto* value = new StepScript; return *value; }
 +}
+diff --git a/Extension/Multiplayer/Remote/native_cosmetics.cpp b/Extension/Multiplayer/Remote/native_cosmetics.cpp
+index 34f51cd..88d89ce 100644
+--- a/Extension/Multiplayer/Remote/native_cosmetics.cpp
++++ b/Extension/Multiplayer/Remote/native_cosmetics.cpp
+@@ -146,7 +146,7 @@ std::optional<Appearance> capture_cosmetics(std::uintptr_t base, const NativeFra
+     }
+ }
+ void apply_cosmetic_recipe(std::uintptr_t base, std::uintptr_t entity, std::uintptr_t local_entity,
+-                           const CosmeticRecipe &recipe) {
++                           const CosmeticRecipe &recipe, bool dress_gaps) {
+     const CosmeticMemory memory{readable, base};
+     const auto c = memory.component(entity), local = memory.component(local_entity);
+     memory.check(entity != local_entity && c != local && memory.ptr(entity) == memory.ptr(local_entity) &&
+@@ -216,6 +216,10 @@ void apply_cosmetic_recipe(std::uintptr_t base, std::uintptr_t entity, std::uint
+                          "Multiplayer: a player wears \"{}\", which is not installed here; showing {} instead.",
+                          missing, replacement.empty() ? "nothing" : replacement);
+     }
++    if (dress_gaps && recipe.key == skater_recipe_key)
++        if (const auto dressed = memory.dress_gaps(resource, usable, swaps, default_cosmetic_items, reserved))
++            logging::log(logging::Level::info, logging::Channel::runtime,
++                         "Ghost line: an item it wears is not installed here, so it wears the default outfit ({} slots dressed).", dressed);
+     memory.validate(resource, usable);
+     constexpr auto copy_prefix = addr::native_cosmetics::recipe_copy_prefix;
+     memory.check(memory.get<std::array<std::uint8_t, copy_prefix.size()>>(
+diff --git a/Extension/Multiplayer/Remote/native_cosmetics.h b/Extension/Multiplayer/Remote/native_cosmetics.h
+index 9ba3388..b16c01e 100644
+--- a/Extension/Multiplayer/Remote/native_cosmetics.h
++++ b/Extension/Multiplayer/Remote/native_cosmetics.h
+@@ -2,7 +2,9 @@
+ #include "native_skater.h"
+ namespace dingosdk::multiplayer {
+ std::optional<Appearance> capture_cosmetics(std::uintptr_t base, const NativeFrame &, std::string &detail);
+-// Only called for the owned remote actor on the verified client update thread.
++// Only called for the owned remote actor on the verified client update thread. `dress_gaps` (a
++// ghost line's skater): an item not installed here that leaves a slot empty puts the default
++// outfit on the empty slots it fits (CosmeticMemory::dress_gaps).
+ void apply_cosmetic_recipe(std::uintptr_t base, std::uintptr_t entity, std::uintptr_t local_entity,
+-                           const CosmeticRecipe &);
++                           const CosmeticRecipe &, bool dress_gaps = false);
+ } // namespace dingosdk::multiplayer
+diff --git a/Extension/Multiplayer/Remote/native_cosmetics_layout.h b/Extension/Multiplayer/Remote/native_cosmetics_layout.h
+index 855e162..728dfd0 100644
+--- a/Extension/Multiplayer/Remote/native_cosmetics_layout.h
++++ b/Extension/Multiplayer/Remote/native_cosmetics_layout.h
+@@ -244,6 +244,30 @@ template <class Read> struct CosmeticMemory {
+         }
+         return swaps;
+     }
++    // After substitute_missing, for a ghost line: when an item it wore became nothing here (a
++    // modded costume, say, that left the top and bottoms empty under it), every empty slot one of
++    // `defaults` fits takes it, so the skater wears the default outfit rather than going without.
++    // Returns how many slots were dressed.
++    template <class Defaults, class Blocked = bool (*)(const std::string &)>
++    std::size_t dress_gaps(std::uintptr_t res, CosmeticRecipe &r, const std::vector<std::pair<std::string, std::string>> &swaps,
++                           const Defaults &defaults, const Blocked &blocked = [](const std::string &) { return false; }) const {
++        if (std::none_of(swaps.begin(), swaps.end(), [](const auto &swap) { return !swap.first.empty() && swap.second.empty(); }))
++            return 0;
++        std::size_t dressed{};
++        for (std::size_t i = 0; i < r.items.size(); ++i) {
++            auto &item = r.items[i];
++            if (!item.asset.empty()) continue;
++            for (const auto &candidate : defaults) {
++                CosmeticSlot fallback{item.slot, std::string(candidate), item.parameters};
++                if (item_installed(res, i, fallback) && !blocked(fallback.asset)) {
++                    item = std::move(fallback);
++                    ++dressed;
++                    break;
++                }
++            }
++        }
++        return dressed;
++    }
+     // A mod can add slots to the skater or the board (stickers, say), and then two players'
+     // templates hold different slots. Puts a peer's items in this game's slots by slot hash:
+     // a slot the peer does not have stays empty, and an item in a slot this game does not
+diff --git a/Extension/Multiplayer/Remote/native_skater.h b/Extension/Multiplayer/Remote/native_skater.h
+index 94020a4..3bbf301 100644
+--- a/Extension/Multiplayer/Remote/native_skater.h
++++ b/Extension/Multiplayer/Remote/native_skater.h
+@@ -19,8 +19,10 @@ NativeFrame capture_local(std::uintptr_t base, std::uintptr_t client);
+ bool show_remote(std::uintptr_t base, std::uintptr_t client, const NativeFrame &, const Pose &,
+                  std::string &detail);
+ void remove_remote(std::uintptr_t base) noexcept;
++// `dress_gaps`: a ghost line's outfit, whose missing items leave no slot it can fill bare
++// (apply_cosmetic_recipe).
+ void update_remote_cosmetics(std::uintptr_t base, const NativeFrame &, const Appearance &,
+-                             std::string &detail);
++                             std::string &detail, bool dress_gaps = false);
+ std::uint64_t remote_pose_updates() noexcept;
+ std::uint64_t remote_board_pose_updates() noexcept;
+ NativeAnimationStats remote_animation_stats() noexcept;
+diff --git a/Extension/Multiplayer/Remote/native_skater_spawn.cpp b/Extension/Multiplayer/Remote/native_skater_spawn.cpp
+index c07fb99..41d601d 100644
+--- a/Extension/Multiplayer/Remote/native_skater_spawn.cpp
++++ b/Extension/Multiplayer/Remote/native_skater_spawn.cpp
+@@ -507,7 +507,7 @@ void remove_remote(std::uintptr_t base) noexcept {
+     }
+ }
+ void update_remote_cosmetics(std::uintptr_t base, const NativeFrame &local, const Appearance &appearance,
+-                             std::string &detail) {
++                             std::string &detail, bool dress_gaps) {
+     auto &r = remote();
+     try {
+         require(valid_appearance(appearance), "Peer cosmetic recipe is invalid.");
+@@ -536,7 +536,7 @@ void update_remote_cosmetics(std::uintptr_t base, const NativeFrame &local, cons
+         if (!r.skater_appearance) r.stand_ins_applied = stand_ins_now;
+         try {
+             if (!r.skater_appearance || *r.skater_appearance != appearance.skater) {
+-                apply_cosmetic_recipe(base, r.entity, local.entity, appearance.skater);
++                apply_cosmetic_recipe(base, r.entity, local.entity, appearance.skater, dress_gaps);
+                 r.skater_appearance = appearance.skater;
+             }
+             r.rejected_appearance.reset();
+diff --git a/Extension/Multiplayer/Test/mesh_tests.cpp b/Extension/Multiplayer/Test/mesh_tests.cpp
+index 5e0445a..7293d2b 100644
+--- a/Extension/Multiplayer/Test/mesh_tests.cpp
++++ b/Extension/Multiplayer/Test/mesh_tests.cpp
+@@ -303,7 +303,7 @@ bool show_remote(std::uintptr_t, std::uintptr_t, const NativeFrame &, const Pose
+     return true;
+ }
+ void remove_remote(std::uintptr_t) noexcept {}
+-void update_remote_cosmetics(std::uintptr_t, const NativeFrame &, const Appearance &, std::string &) {}
++void update_remote_cosmetics(std::uintptr_t, const NativeFrame &, const Appearance &, std::string &, bool) {}
+ std::uint64_t remote_pose_updates() noexcept { return 0; }
+ std::uint64_t remote_board_pose_updates() noexcept { return 0; }
+ NativeAnimationStats remote_animation_stats() noexcept { return {}; }
+diff --git a/Extension/Multiplayer/Test/native_layout_tests.cpp b/Extension/Multiplayer/Test/native_layout_tests.cpp
+index 1db6b5b..383deca 100644
+--- a/Extension/Multiplayer/Test/native_layout_tests.cpp
++++ b/Extension/Multiplayer/Test/native_layout_tests.cpp
+@@ -619,6 +619,21 @@ void cosmetic_layout_regression() {
+     const std::array<std::string_view, 1> none{"Own_NotInstalled"};
+     fake.substitute_missing(res, modded, none);
+     check(modded.items[0].asset.empty() && !reject(m, modded), "A missing peer item without a default must become empty");
++    // A ghost line: a missing item that became nothing puts the default outfit on the empty slots it fits.
++    {
++        auto ghost = wrong;
++        const auto gone = fake.substitute_missing(res, ghost, none);
++        check(fake.dress_gaps(res, ghost, gone, fallbacks) == 1 && ghost.items[0].asset == "Own_Shirt" && !reject(m, ghost),
++              "A ghost whose modded item left a slot empty must wear the default there");
++        auto kept = one;
++        kept.items[0].asset.clear();
++        check(fake.dress_gaps(res, kept, {}, fallbacks) == 0 && kept.items[0].asset.empty(),
++              "A slot left empty on purpose (nothing missing) must stay empty");
++        auto swapped = wrong;
++        const auto stood_in = fake.substitute_missing(res, swapped, fallbacks);
++        check(fake.dress_gaps(res, swapped, stood_in, fallbacks) == 0 && swapped.items[0].asset == "Own_Shirt",
++              "A missing item that already has a stand-in needs no more");
++    }
+     modded = one;
+     check(fake.substitute_missing(res, modded, fallbacks).empty() && modded == one, "Installed peer items must stay");
+     // A peer whose mods add slots (or who lacks this game's): items go to this game's slots by slot hash.
 diff --git a/Extension/Plugins/Test/plugin_tests.cpp b/Extension/Plugins/Test/plugin_tests.cpp
-index 6c43ca0..a29a15a 100644
+index 6c43ca0..4062108 100644
 --- a/Extension/Plugins/Test/plugin_tests.cpp
 +++ b/Extension/Plugins/Test/plugin_tests.cpp
 @@ -14,6 +14,9 @@
@@ -743,7 +895,41 @@ index 6c43ca0..a29a15a 100644
  void controller_reports_preserve_non_controls() {
      using namespace dingosdk;
      for (int variant = 0; variant < 5; ++variant) {
-@@ -7822,6 +8182,7 @@ int main() {
+@@ -4632,6 +4992,14 @@ void plugins_draw_on_the_overlay() {
+             assert(d:world_to_screen(vector.create(1000, 0, -0.06)) == nil, "far off the screen")
+             assert(d:world_to_screen(vector.create(0, 1000, -0.06)) == nil, "far above the screen")
+             assert(d:world_to_screen(vector.create(1, 0, -0.06)), "off the screen but drawable")
++            -- A tag kept to a point in the world: where it is now, then what is drawn about it.
++            local tag = d:follow(vector.create(1, 0, -10))
++            assert(tag and math.abs(tag.x - 1060) < 0.01, "follow gives the point on screen")
++            d:rect(tag, tag + vector.create(10, 10, 0))
++            d:follow()
++            assert(d:follow(vector.create(0, 0, 5)) == nil, "nothing follows a point behind the camera")
++            assert(d:follow(vector.create(1, 0, -10), {ghost_head = 0.3}), "over a ghost's head")
++            d:follow()
+             assert(d:size().x == 1920 and d:size().y == 1080)
+             assert(not pcall(d.text, d, vector.create(0, 0, 0), "x", {colour = "red"}), "a colour by name")
+             assert(not pcall(d.text, d, vector.create(0 / 0, 0, 0), "x"), "NaN")
+@@ -4659,8 +5027,17 @@ void plugins_draw_on_the_overlay() {
+     check(environment.logged("unseen refused"), "Drawing needs overlay\n" + environment.all());
+     ticks(host, environment, 1);
+     running(host, "painter", environment);
+-    check(environment.layers.size() == 1 && environment.layers[0].plugin == "painter" && environment.layers[0].shapes.size() == 8,
++    check(environment.layers.size() == 1 && environment.layers[0].plugin == "painter" && environment.layers[0].shapes.size() == 13,
+           "Its shapes are handed to the overlay each tick\n" + environment.all());
++    {
++        const auto& shapes = environment.layers[0].shapes;
++        check(shapes[8].kind == plugin_ui::Shape::Kind::follow && shapes[8].points.size() == 2 && shapes[8].points[0][2] == -10.0f &&
++                  std::fabs(shapes[8].points[1][0] - 1060.0f) < 0.01f && shapes[10].kind == plugin_ui::Shape::Kind::unfollow,
++              "A followed point goes to the overlay with where the plugin saw it, and d:follow() ends it");
++        check(shapes[8].fit == 0 && shapes[11].kind == plugin_ui::Shape::Kind::follow && shapes[11].fit == 1 &&
++                  std::fabs(shapes[11].radius - 0.3f) < 1e-6f && shapes[12].kind == plugin_ui::Shape::Kind::unfollow,
++              "{ghost_head = metres} keeps it over a ghost's head, that far up");
++    }
+     check(environment.logged("drawn"), "and the draw handler ran to its end\n" + environment.all());
+     const auto& first = environment.layers[0].shapes[0];
+     check(first.kind == plugin_ui::Shape::Kind::text && first.text == "hello" && first.style.colour == 0xff0080ff &&
+@@ -7822,6 +8199,7 @@ int main() {
          run(plugins_place_world_entities);
          run(plugins_have_what_a_prop_hunt_needs);
          run(plugins_write_normalized_controllers);
@@ -1118,11 +1304,62 @@ index 0000000..312c1a4
 +    return true;
 +}
 +}
+diff --git a/Extension/Plugins/plugin_api_ui.cpp b/Extension/Plugins/plugin_api_ui.cpp
+index 5e2d234..8111112 100644
+--- a/Extension/Plugins/plugin_api_ui.cpp
++++ b/Extension/Plugins/plugin_api_ui.cpp
+@@ -349,6 +349,37 @@ struct UiApi {
+         add(L, plugin, {plugin_ui::Shape::Kind::clip, {point(L, 2, "a clip's top left"), point(L, 3, "a clip's bottom right")}});
+         return 0;
+     }
++    // d:follow(world_position, {ghost_head = metres}): where the point is on screen now (as
++    // world_to_screen: nil behind the camera), and what is drawn after it, until d:follow(), keeps to the
++    // point as the camera moves between ticks: draw a tag about the point it returns. Nothing is added
++    // when it returns nil.
++    static int follow(lua_State* L) {
++        auto& plugin = drawing(L);
++        if (lua_isnone(L, 2)) {
++            add(L, plugin, {plugin_ui::Shape::Kind::unfollow, {}});
++            return 0;
++        }
++        const auto world = point(L, 2, "the followed position");
++        const auto on = plugin.services_.world_to_screen(world);
++        const auto drawable = [](float v) { return std::isfinite(v) && std::fabs(v) <= 1e6f; };
++        if (!on || !drawable((*on)[0]) || !drawable((*on)[1]) || !drawable((*on)[2])) {
++            lua_pushnil(L);
++            return 1;
++        }
++        plugin_ui::Shape shape{plugin_ui::Shape::Kind::follow, {world, *on}};
++        // {ghost_head = metres}: kept that far above the middle of a ghost line's skater's head as the renderer
++        // draws it (the point given stands in until it is drawn), so a name keeps to the model, not a tick off it.
++        if (lua_istable(L, 3)) {
++            if (lua_getfield(L, 3, "ghost_head") != LUA_TNIL) {
++                shape.radius = std::clamp(finite(L, -1, "ghost_head"), -3.0f, 3.0f);
++                shape.fit = 1;
++            }
++            lua_pop(L, 1);
++        }
++        add(L, plugin, std::move(shape));
++        lua_pushvector(L, (*on)[0], (*on)[1], (*on)[2]);
++        return 1;
++    }
+     // d:measure(text, style): how wide and tall the text is drawn, in the window's pixels.
+     static int measure(lua_State* L) {
+         auto& plugin = plugin_of(L);
+@@ -912,7 +943,7 @@ void UiApi::install(Plugin& plugin, lua_State* L) {
+     push_functions(L, {{"text", F::text}, {"rect", F::rect}, {"line", F::line}, {"circle", F::circle}, {"poly", F::poly},
+                        {"world_text", F::world_text}, {"world_line", F::world_line}, {"world_circle", F::world_circle},
+                        {"image", F::image}, {"world_image", F::world_image}, {"game_image", F::game_image}, {"rough_rect", F::rough_rect}, {"scribble", F::scribble}, {"halftone", F::halftone},
+-                       {"clip", F::clip}, {"measure", F::measure},
++                       {"clip", F::clip}, {"follow", F::follow}, {"measure", F::measure},
+                        {"gradient", F::gradient}, {"skeleton", F::skeleton}, {"size", F::size}, {"world_to_screen", F::world_to_screen}});
+     plugin.draw_table_ = lua_ref(L, -1);
+     lua_pop(L, 1);
 diff --git a/Extension/Plugins/plugin_api_world.cpp b/Extension/Plugins/plugin_api_world.cpp
-index 8abd30b..79441c9 100644
+index 8abd30b..c45e0d1 100644
 --- a/Extension/Plugins/plugin_api_world.cpp
 +++ b/Extension/Plugins/plugin_api_world.cpp
-@@ -2930,6 +2930,499 @@ struct WorldApi {
+@@ -2930,6 +2930,521 @@ struct WorldApi {
          lua_setfield(L, -2, "playstation");
          return 1;
      }
@@ -1442,7 +1679,9 @@ index 8abd30b..79441c9 100644
 +    static int tas_ghost_record(lua_State* L) {
 +        auto& plugin = plugin_of(L);
 +        need(L, plugin, "tas", "reskate.tas.ghost_record");
-+        return result(L, game(plugin).tas_ghost_record(lua_toboolean(L, 1) != 0));
++        const bool on = lua_toboolean(L, 1) != 0;
++        if (on) game(plugin).tas_ghost_claim(plugin.id());
++        return result(L, game(plugin).tas_ghost_record(on));
 +    }
 +    static int tas_ghost_capture(lua_State* L) {
 +        auto& plugin = plugin_of(L);
@@ -1450,6 +1689,15 @@ index 8abd30b..79441c9 100644
 +        const double step = luaL_checknumber(L, 1);
 +        if (!(step >= 0 && step < 4294967295.0)) luaL_argerror(L, 1, "a step is a whole number from 0");
 +        return result(L, game(plugin).tas_ghost_capture(static_cast<std::uint32_t>(step)));
++    }
++    // tas.player_name(): the player's own name, their Steam persona (offline too); nil when it isn't known.
++    static int tas_player_name(lua_State* L) {
++        auto& plugin = plugin_of(L);
++        need(L, plugin, "tas", "reskate.tas.player_name");
++        const auto name = game(plugin).tas_player_name();
++        if (name.empty()) lua_pushnil(L);
++        else lua_pushlstring(L, name.data(), name.size());
++        return 1;
 +    }
 +    // tas.ghost_status(): {recording, recorded, recorded_first, recorded_last, recorded_outfit, loaded, loaded_first,
 +    // loaded_last, loaded_outfit, shown, file}.
@@ -1523,7 +1771,17 @@ index 8abd30b..79441c9 100644
 +        const double step = luaL_checknumber(L, 1);
 +        if (!std::isfinite(step)) luaL_argerror(L, 1, "a step is a number");
 +        std::string why;
-+        const auto frame = game(plugin).tas_ghost_frame(step, show, why);
++        std::optional<TasGhostFrame> frame;
++        {
++            // Showing it builds a skater model and dresses it (ReSkate's work, as reading a clip is), which can take
++            // longer than a plugin's tick: the plugin was stopped as the ghost first showed.
++            std::optional<Plugin::Untimed> untimed;
++            if (show) {
++                untimed.emplace(plugin);
++                game(plugin).tas_ghost_claim(plugin.id());
++            }
++            frame = game(plugin).tas_ghost_frame(step, show, why);
++        }
 +        if (!frame) {
 +            lua_pushnil(L);
 +            lua_pushlstring(L, why.data(), why.size());
@@ -1555,6 +1813,7 @@ index 8abd30b..79441c9 100644
 +    static int tas_ghost_hide(lua_State* L) {
 +        auto& plugin = plugin_of(L);
 +        need(L, plugin, "tas", "reskate.tas.ghost_hide");
++        const Plugin::Untimed untimed{plugin}; // taking the model down: ReSkate's work
 +        game(plugin).tas_ghost_hide();
 +        return 0;
 +    }
@@ -1622,7 +1881,7 @@ index 8abd30b..79441c9 100644
      // A whole replacement for a real controller, in the same units as input.gamepad().
      static int input_write(lua_State* L) {
          auto& plugin = plugin_of(L);
-@@ -3274,6 +3767,15 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
+@@ -3274,6 +3789,15 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
      add_functions(L, "trainer", {{"set_point", set_point}, {"back", back}});
      add_functions(L, "hud", {{"hide", hide_hud}, {"corner", hud_corner}});
      add_functions(L, "time", {{"slow", slow}, {"speed", speed}});
@@ -1632,7 +1891,7 @@ index 8abd30b..79441c9 100644
 +        {"line", tas_line}, {"line_position", tas_line_position}, {"line_bodies", tas_line_bodies}, {"line_save", tas_line_save}, {"skater_dump", tas_skater_dump}, {"skater_dump_status", tas_skater_dump_status},
 +        {"line_export", tas_line_export}, {"line_import", tas_line_import}, {"line_file_status", tas_line_file_status},
 +        {"line_note", tas_line_note}, {"ghost_probe", tas_ghost_probe}, {"sensor_start", tas_sensor_start},
-+        {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
++        {"player_name", tas_player_name}, {"ghost_record", tas_ghost_record}, {"ghost_capture", tas_ghost_capture}, {"ghost_status", tas_ghost_status},
 +        {"ghost_export", tas_ghost_export}, {"ghost_note", tas_ghost_note}, {"ghost_load", tas_ghost_load},
 +        {"ghost_frame", tas_ghost_frame}, {"ghost_show", tas_ghost_show}, {"ghost_hide", tas_ghost_hide}});
      add_functions(L, "objects", {{"catalog", catalog}, {"list", objects}, {"place", place}, {"move", move}, {"remove", remove}});
@@ -1659,7 +1918,7 @@ index 173bdd7..6decf4f 100644
              if (has("strings")) actions.push_back("change the text the game shows, in its menus and its store");
              if (has("capture")) actions.push_back("record your screen");
 diff --git a/Extension/Plugins/plugin_game.h b/Extension/Plugins/plugin_game.h
-index 61689ee..18daf47 100644
+index 61689ee..0dd5a6a 100644
 --- a/Extension/Plugins/plugin_game.h
 +++ b/Extension/Plugins/plugin_game.h
 @@ -143,7 +143,54 @@ struct PhysicsStep {
@@ -1717,7 +1976,7 @@ index 61689ee..18daf47 100644
  // What a plugin sets of a launch into the air, m/s, each if given: across the direction of travel
  // (+ its left), along it, and up. And a launch as it went (Extension/Skater/launches.h).
  struct LaunchShape {
-@@ -1076,6 +1123,74 @@ public:
+@@ -1076,6 +1123,79 @@ public:
      virtual std::string hold_gameplay_option(std::string_view, std::string_view, std::optional<bool>) { return unavailable; }
      virtual std::optional<PadInput> gamepad(int /*controller*/ = -1) { return std::nullopt; }
      virtual std::string write_pad(std::string_view /*plugin*/, unsigned /*controller*/, std::optional<PadInput>) { return unavailable; }
@@ -1776,6 +2035,8 @@ index 61689ee..18daf47 100644
 +    virtual std::string tas_ghost_record(bool /*on*/) { return unavailable; }
 +    virtual std::string tas_ghost_capture(std::uint32_t /*step*/) { return unavailable; }
 +    virtual TasGhostStatus tas_ghost_status() { return {}; }
++    // The player's own name, as ReSkate shows it: their Steam persona, offline too. Empty when it isn't known.
++    virtual std::string tas_player_name() { return {}; }
 +    virtual std::string tas_ghost_export(std::string_view /*plugin*/, std::string_view /*path*/, std::string_view /*note*/) { return unavailable; }
 +    virtual std::optional<std::string> tas_ghost_note(std::string_view /*plugin*/, std::string_view /*path*/, std::string& why) {
 +        why = unavailable;
@@ -1787,13 +2048,16 @@ index 61689ee..18daf47 100644
 +        return std::nullopt;
 +    }
 +    virtual void tas_ghost_hide() {}
++    // The plugin that last recorded or showed a ghost: when it stops (release), its ghost is taken down and its
++    // recording ended, so a plugin stopped mid-watch leaves no skater behind.
++    virtual void tas_ghost_claim(std::string_view /*plugin*/) {}
 +    // Research: the skater's sensor block written as it is in a ridden skater, on the next physics step.
 +    virtual std::string tas_sensor_start() { return unavailable; }
      // The first controller (a radio first), or with device >= 0 that one (StickDevice::device).
      // Neither ever waits on Windows: a thread of ReSkate's reads the controllers.
      virtual std::optional<StickInput> joystick(int /*device*/ = -1) { return std::nullopt; }
 diff --git a/Extension/Plugins/plugin_game_runtime.cpp b/Extension/Plugins/plugin_game_runtime.cpp
-index 5c0acee..4858c7a 100644
+index 5c0acee..1575610 100644
 --- a/Extension/Plugins/plugin_game_runtime.cpp
 +++ b/Extension/Plugins/plugin_game_runtime.cpp
 @@ -28,8 +28,16 @@
@@ -1813,9 +2077,12 @@ index 5c0acee..4858c7a 100644
  #include "Extension/Skater/launches.h"
  #include "Extension/Skater/pad_hide.h"
  #include "Engine/Game/Skater/first_person_cycle.h"
-@@ -41,11 +49,14 @@
+@@ -40,12 +48,17 @@
+ #include "Extension/Throwdowns/throwdown_kit.h"
  #include "plugin_camera.h"
  #include "Extension/Multiplayer/Session/session.h"
++#include "Extension/Multiplayer/Steam/steam_social.h"
++#include "Engine/Core/Platform/launcher_support.h"
  #include "Extension/Multiplayer/Remote/stand_ins.h"
 +#include "Extension/Multiplayer/Remote/native_cosmetics.h"
 +#include "Extension/Multiplayer/Session/peer_slots.h"
@@ -1828,7 +2095,7 @@ index 5c0acee..4858c7a 100644
  #include "Extension/Settings/named_settings.h"
  #include "Engine/Game/Settings/multiplayer_settings_lock.h"
  #include "Extension/Skater/ai_skaters.h"
-@@ -75,6 +86,7 @@
+@@ -75,6 +88,7 @@
  #include "Extension/UI/Overlay/viewmodel.h"
  #include "Extension/UI/Overlay/scripted_pad.h"
  #include "Engine/Game/Input/pad_output.h"
@@ -1836,7 +2103,7 @@ index 5c0acee..4858c7a 100644
  #include "Engine/Game/Skater/animation_values.h"
  #include "Extension/Skater/grind_target.h"
  #include "Engine/Game/Input/gameplay_options.h"
-@@ -87,6 +99,7 @@
+@@ -87,6 +101,7 @@
  #include <shellapi.h>
  #include <algorithm>
  #include <array>
@@ -1844,7 +2111,7 @@ index 5c0acee..4858c7a 100644
  #include <cmath>
  #include <format>
  #include <fstream>
-@@ -697,6 +710,12 @@ public:
+@@ -697,6 +712,12 @@ public:
              for (std::size_t i = 1; i < skater_body::count; ++i) {
                  const auto& c = s.body.bodies[i];
                  if (const auto& pose = s.poses[i]) step.poses.emplace(skater_body::names[i], PhysicsStep::Pose{pose->transform, pose->velocity});
@@ -1857,7 +2124,7 @@ index 5c0acee..4858c7a 100644
                  if (!c.touching) continue;
                  const float slide = std::sqrt(c.slide[0] * c.slide[0] + c.slide[1] * c.slide[1] + c.slide[2] * c.slide[2]);
                  step.bodies.push_back({skater_body::names[i], c.impact, std::isfinite(slide) ? slide : 0.0f, c.hit.board, c.hit.vehicle,
-@@ -1085,6 +1104,1178 @@ public:
+@@ -1085,6 +1106,1200 @@ public:
              axis(pad->left_x), axis(pad->left_y), axis(pad->right_x), axis(pad->right_y)};
          return input::pad_outputs().write(plugin, controller, out, GetTickCount64());
      }
@@ -2672,6 +2939,7 @@ index 5c0acee..4858c7a 100644
 +    }
 +    bool ghost_shown_now_{};
 +    std::uint64_t ghost_shown_serial_{}, ghost_outfit_generation_{};
++    std::string ghost_owner_; // the plugin that last recorded or showed a ghost (tas_ghost_claim)
 +    static std::vector<std::uint8_t> encode_outfit(const multiplayer::Appearance& outfit) {
 +        multiplayer::Packet p;
 +        p.kind = multiplayer::PacketKind::cosmetics;
@@ -2729,6 +2997,11 @@ index 5c0acee..4858c7a 100644
 +        if (outfit) g.recorded_outfit = std::move(outfit);
 +        if (!g.recorder.add(step, local.pose, camera)) return "that step is before the last one, or the ghost is full";
 +        return {};
++    }
++    std::string tas_player_name() override {
++        const auto social = multiplayer::steam_social_snapshot();
++        if (!social || social->local.name.empty() || social->local.name == launcher::offline_player_name) return {};
++        return social->local.name;
 +    }
 +    TasGhostStatus tas_ghost_status() override {
 +        auto& g = ghosts();
@@ -2933,6 +3206,7 @@ index 5c0acee..4858c7a 100644
 +            why = detail.empty() ? std::string("the ghost is not shown yet") : detail;
 +            return std::nullopt;
 +        }
++        xray::set_ghost(multiplayer::remote_skater_entity()); // its head as drawn, for the name over it (d:follow)
 +        // Its outfit: once a new ghost is loaded, and again whenever the game builds the model anew.
 +        const auto generation = multiplayer::remote_skater_generation();
 +        if (serial != ghost_shown_serial_ || generation != ghost_outfit_generation_) {
@@ -2942,7 +3216,7 @@ index 5c0acee..4858c7a 100644
 +            }
 +            std::string outfit_why;
 +            if (outfit) {
-+                multiplayer::update_remote_cosmetics(base_, local, *outfit, outfit_why);
++                multiplayer::update_remote_cosmetics(base_, local, *outfit, outfit_why, true); // missing mod items: the default outfit
 +            } else if (auto mine = multiplayer::capture_cosmetics(base_, local, outfit_why)) {
 +                multiplayer::update_remote_cosmetics(base_, local, *mine, outfit_why); // a ghost with no outfit wears yours
 +            }
@@ -2952,8 +3226,23 @@ index 5c0acee..4858c7a 100644
 +        out.shown = true;
 +        return out;
 +    }
++    void tas_ghost_claim(std::string_view plugin) override {
++        if (ghost_owner_ != plugin) ghost_owner_ = plugin;
++    }
++    // A stopped plugin's ghost: taken down, and a recording it had going ended.
++    void release_ghost(std::string_view plugin) {
++        if (ghost_owner_.empty() || ghost_owner_ != plugin) return;
++        tas_ghost_hide();
++        {
++            auto& g = ghosts();
++            std::lock_guard lock(g.mutex);
++            g.recording = false;
++        }
++        ghost_owner_.clear();
++    }
 +    void tas_ghost_hide() override {
 +        if (!ghost_shown_now_) return;
++        xray::set_ghost(0);
 +        const multiplayer::PeerScope scope(multiplayer::max_remote_players - 1);
 +        multiplayer::remove_remote(base_);
 +        ghost_shown_now_ = false;
@@ -3036,11 +3325,12 @@ index 5c0acee..4858c7a 100644
      std::optional<StickInput> joystick(int device) override {
          if (!joystick::game_in_foreground()) return std::nullopt;
          const auto sample = joystick::poll(device);
-@@ -1876,6 +3067,8 @@ public:
+@@ -1876,6 +3091,9 @@ public:
      }
      void release(std::string_view plugin) override {
          input::pad_outputs().release(plugin);
 +        tas_stop(plugin);
++        release_ghost(plugin);
 +        if (virtual_time::active()) (void)virtual_time::set(false);
          grind_target::release(plugin);
          input::gameplay_options().release(plugin);
@@ -3087,6 +3377,25 @@ index a9fc444..ea3b92e 100644
  }
  
  bool known_permission(std::string_view name) noexcept {
+diff --git a/Extension/Plugins/plugin_ui.h b/Extension/Plugins/plugin_ui.h
+index 82781ec..b67a17f 100644
+--- a/Extension/Plugins/plugin_ui.h
++++ b/Extension/Plugins/plugin_ui.h
+@@ -58,8 +58,13 @@ struct Shape {
+     // rough_rect: skate.'s hand-cut tile from points[0] to [1], `seed` its edge, `radius` its scale.
+     // halftone: a screen-print of `columns` x `rows` dots from points[0]. scribble: the dry-brush
+     // scribble over points[0] to [1]. clip: what follows is clipped to points[0] to [1], until unclip.
++    // follow: the screen shapes after it, until unfollow, are drawn about world point points[0], which
++    // the plugin saw at points[1]: moved by where the camera puts it as the frame is drawn, so a tag over
++    // something in the world keeps to it while the camera moves (the plugin's camera is a tick older).
++    // With `fit` 1 the point is the middle of a ghost line's skater's head as the renderer drew it,
++    // `radius` metres up (xray::ghost_head), points[0] until it is drawn.
+     enum class Kind { text, rect, line, circle, poly, world_text, world_line, world_circle, image, world_image, game_image, gradient, skeleton,
+-                      rough_rect, halftone, scribble, clip, unclip } kind{Kind::text};
++                      rough_rect, halftone, scribble, clip, unclip, follow, unfollow } kind{Kind::text};
+     std::vector<Vec3> points;
+     float radius{};
+     std::string text;
 diff --git a/Extension/Skater/motion_snapshot.cpp b/Extension/Skater/motion_snapshot.cpp
 new file mode 100644
 index 0000000..861e50f
@@ -4050,6 +4359,284 @@ index 0000000..edd549c
 +// Reads of the clock answered since the game started, whether on or off: 0 means the hook sees nothing.
 +std::uint64_t reads() noexcept;
 +}
+diff --git a/Extension/Skater/xray.cpp b/Extension/Skater/xray.cpp
+index 0df9add..42284de 100644
+--- a/Extension/Skater/xray.cpp
++++ b/Extension/Skater/xray.cpp
+@@ -2,6 +2,7 @@
+ #include "xray_render.h"
+ #include <Windows.h>
+ #include <atomic>
++#include <cmath>
+ #include <mutex>
+ #include <set>
+ #include <string>
+@@ -15,8 +16,11 @@ struct State {
+     std::mutex mutex;
+     std::set<std::string, std::less<>> owners; // client thread
+     std::set<std::string, std::less<>> hiders; // client thread: plugins hiding the local skater
+-    bool hooked{};                             // client thread
++    bool hooked{}, hook_tried{};               // client thread
+     std::atomic<std::uint64_t> drawn_at{};     // render thread -> client tick
++    std::atomic<std::uint64_t> camera_at{};    // render thread -> client tick: the overlay asked for the camera
++    std::atomic<std::uintptr_t> ghost_entity{}; // a ghost line's skater (set_ghost)
++    std::atomic<std::uint64_t> ghost_at{};      // render thread -> client tick: the overlay asked for its head
+ };
+ State& state() {
+     static auto* value = new State; // the renderer's hooks may call in until exit
+@@ -65,15 +69,66 @@ void tick() noexcept {
+             xray = !s.owners.empty();
+             hiding = !s.hiders.empty();
+         }
+-        const bool drawn = GetTickCount64() - s.drawn_at.load(std::memory_order_acquire) < follow_ms;
++        const auto now = GetTickCount64();
++        const bool drawn = now - s.drawn_at.load(std::memory_order_acquire) < follow_ms;
++        const bool camera = now - s.camera_at.load(std::memory_order_acquire) < follow_ms;
+         follow_render((xray && drawn) || hiding);
++        follow_camera(camera);
++        const bool ghost = now - s.ghost_at.load(std::memory_order_acquire) < follow_ms;
++        follow_ghost(ghost ? s.ghost_entity.load(std::memory_order_acquire) : 0);
+         hide_skater(hiding);
+-        const bool wanted = xray || hiding;
+-        if (wanted != s.hooked && hook_render(wanted)) s.hooked = wanted;
++        // Putting the renderer's hooks on or off patches its code, which holds every thread of the game for a moment:
++        // a hitch the player sees. They went on and off with the x-ray and with labels over the world, and the game
++        // hitched as a label came and went. So they go on once, at the first tick (the game still loading in), and
++        // stay on: idle, each passes the call straight on (follow_render, follow_camera).
++        const bool wanted = xray || hiding || camera;
++        if (!s.hooked && (wanted || !s.hook_tried)) {
++            s.hook_tried = true;
++            s.hooked = hook_render(true);
++        }
+     } catch (...) {
+     }
+ }
+ 
++bool camera(std::array<float, 16>& world, float& vertical_fov) noexcept {
++    auto& s = state();
++    if (!s.ready.load(std::memory_order_acquire)) return false;
++    s.camera_at.store(GetTickCount64(), std::memory_order_release);
++    return render_camera(world, vertical_fov);
++}
++
++void set_ghost(std::uintptr_t entity) noexcept {
++    auto& s = state();
++    if (!s.ready.load(std::memory_order_acquire)) return;
++    if (s.ghost_entity.exchange(entity, std::memory_order_acq_rel) != entity && entity) prepare_skeleton(); // once, in the background
++}
++
++bool ghost_head(std::array<float, 3>& head) noexcept {
++    auto& s = state();
++    if (!s.ready.load(std::memory_order_acquire) || !s.ghost_entity.load(std::memory_order_acquire)) return false;
++    s.ghost_at.store(GetTickCount64(), std::memory_order_release);
++    static std::vector<LinearTransform> skin; // render thread only: reused frame to frame
++    const auto mesh = skeleton_mesh();
++    if (!mesh || !latest_ghost_skin(skin) || skin.size() < mesh->bone_count) return false;
++    // The middle of the head's vertices, posed as the renderer drew them.
++    constexpr std::uint8_t head_part = 1; // skater_body::names: "Head"
++    std::array<double, 3> sum{};
++    std::size_t count{};
++    for (std::size_t i = 0; i < mesh->vertices.size() && i < mesh->parts.size(); ++i) {
++        if (mesh->parts[i] != head_part) continue;
++        const auto& vertex = mesh->vertices[i];
++        for (std::size_t slot = 0; slot < max_influences && vertex.weights[slot] > 0; ++slot) {
++            if (vertex.bones[slot] >= skin.size()) return false;
++            const auto p = game::place(vertex.position, skin[vertex.bones[slot]]);
++            for (std::size_t axis = 0; axis < 3; ++axis) sum[axis] += static_cast<double>(p[axis]) * vertex.weights[slot];
++        }
++        ++count;
++    }
++    if (!count) return false;
++    for (std::size_t axis = 0; axis < 3; ++axis) head[axis] = static_cast<float>(sum[axis] / static_cast<double>(count));
++    return std::isfinite(head[0]) && std::isfinite(head[1]) && std::isfinite(head[2]);
++}
++
+ bool latest(Pose& pose) {
+     auto& s = state();
+     if (!s.ready.load(std::memory_order_acquire)) return false;
+diff --git a/Extension/Skater/xray.h b/Extension/Skater/xray.h
+index cf7b203..335ea3f 100644
+--- a/Extension/Skater/xray.h
++++ b/Extension/Skater/xray.h
+@@ -11,8 +11,8 @@
+ // (xray_render.h), seen by the camera of that same picture. The overlay draws it, each body in the
+ // colour a plugin gives it (Extension/UI/Overlay/xray_overlay.cpp).
+ //
+-// The renderer's two hooks are on while any plugin keeps the x-ray ready (off, the renderer never
+-// calls them), and the picture is read only while one draws it.
++// The renderer's two hooks go on at the first tick and stay on (putting them on or off holds the game's threads
++// for a moment, a hitch); idle they pass each call straight on, and the picture is read only while one draws it.
+ namespace dingosdk::xray {
+ // Requires the validated build: prepares the renderer's hooks, which patches nothing.
+ bool start(std::uintptr_t image_base) noexcept;
+@@ -20,8 +20,8 @@ bool available() noexcept;
+ // Client thread: a plugin wants the x-ray ready (true) or no longer (false). The mesh is read in the
+ // background the first time.
+ void prepare(std::string_view owner, bool on);
+-// Client thread, every tick: the hooks on while any plugin keeps it ready; the picture read while it
+-// was drawn lately.
++// Client thread, every tick: the hooks on from the first (and kept on); the picture read while it was
++// drawn lately, the camera kept while the overlay asks for it.
+ void tick() noexcept;
+ 
+ // The skeleton as the renderer last drew the skater, in world space, with that picture's camera.
+@@ -36,4 +36,14 @@ bool latest(Pose& pose);
+ // Client thread: the local skater not drawn on this screen while any plugin asks (reskate.skater.hide),
+ // through the same renderer hook. False when the renderer's hooks are unavailable.
+ bool hide(std::string_view owner, bool on);
++// Render thread: the camera the renderer drew the last frame's main view with (world matrix: right,
++// up, back, position rows; degrees), for drawing over the world exactly where the frame has it; false
++// until there is one. Asking keeps the renderer's view hook on for a second (the next ticks).
++bool camera(std::array<float, 16>& world, float& vertical_fov) noexcept;
++// Client thread: a ghost line's skater entity, as it is shown (0: none).
++void set_ghost(std::uintptr_t entity) noexcept;
++// Render thread: the middle of that skater's head as the renderer drew it this frame, so a name over it
++// moves with the model, not a tick off it; false until there is a picture. Asking keeps it followed
++// for a second.
++bool ghost_head(std::array<float, 3>& head) noexcept;
+ }
+diff --git a/Extension/Skater/xray_render.cpp b/Extension/Skater/xray_render.cpp
+index 67eeb6d..08b6fa0 100644
+--- a/Extension/Skater/xray_render.cpp
++++ b/Extension/Skater/xray_render.cpp
+@@ -34,6 +34,12 @@ struct State {
+     RenderView view_original{};
+     std::array<std::atomic<std::uint32_t>, build::render_modes> indices{no_index, no_index};
+     std::atomic<std::uint64_t> indices_until{};
++    std::atomic<std::uint64_t> camera_until{}; // the main view's camera kept on its own (follow_camera)
++    // A ghost line's skater (follow_ghost): its render objects, and its skinning matrices as last drawn.
++    std::array<std::atomic<std::uint32_t>, build::render_modes> ghost_indices{no_index, no_index};
++    std::atomic<std::uint64_t> ghost_until{};
++    std::vector<game::LinearTransform> ghost_skin; // under lock
++    std::uint64_t ghost_skin_at{};
+     std::atomic<bool> found_logged{}, hiding{}, hide_logged{};
+     std::mutex lock; // guards the picture's parts
+     std::vector<game::LinearTransform> skin;
+@@ -91,16 +97,21 @@ bool clear_byte(std::uintptr_t address) noexcept {
+         return false;
+     }
+ }
+-// Render threads, after each skinned draw packet: the local skater's visible one, as skinning
+-// matrices in the world.
++// Render threads, after each skinned draw packet: the local skater's visible one, and a ghost line's
++// skater's (follow_ghost), as skinning matrices in the world.
+ void observe_packet(std::uintptr_t object, std::uintptr_t packet) {
+     auto& s = state();
+     std::uint32_t index{}, count{}, locked{};
+     std::uint8_t visible{}, relative{};
+-    if (GetTickCount64() > s.indices_until.load(std::memory_order_acquire) ||
+-        pointer_at(object) != s.base + build::render_object_vtable || !memory::peek(object + build::render_index_offset, index) ||
+-        (index != s.indices[0].load(std::memory_order_acquire) && index != s.indices[1].load(std::memory_order_acquire)))
++    const auto now = GetTickCount64();
++    const bool local_on = now <= s.indices_until.load(std::memory_order_acquire), ghost_on = now <= s.ghost_until.load(std::memory_order_acquire);
++    if ((!local_on && !ghost_on) || pointer_at(object) != s.base + build::render_object_vtable ||
++        !memory::peek(object + build::render_index_offset, index))
+         return;
++    const bool local = local_on && (index == s.indices[0].load(std::memory_order_acquire) || index == s.indices[1].load(std::memory_order_acquire));
++    const bool ghost = !local && ghost_on &&
++                       (index == s.ghost_indices[0].load(std::memory_order_acquire) || index == s.ghost_indices[1].load(std::memory_order_acquire));
++    if (!local && !ghost) return;
+     if (!memory::peek(packet + build::packet_visible_offset, visible) || !visible ||
+         !memory::peek(packet + build::packet_bone_count_offset, count) || !count || count > most_bones ||
+         !memory::peek(packet + build::packet_relative_offset, relative) ||
+@@ -119,6 +130,11 @@ void observe_packet(std::uintptr_t object, std::uintptr_t packet) {
+         if (!draw_packet::skin(packed[bone], placed, skin[bone])) return;
+     {
+         std::lock_guard guard(s.lock);
++        if (ghost) {
++            s.ghost_skin = std::move(skin);
++            s.ghost_skin_at = GetTickCount64();
++            return;
++        }
+         s.skin = std::move(skin);
+         s.skin_at = GetTickCount64();
+     }
+@@ -144,7 +160,8 @@ void draw_packet_hook(std::uintptr_t object, std::uintptr_t packet) {
+ // The camera of the main picture: a sound world matrix, close to the client's own camera.
+ void observe_view(std::uintptr_t view) {
+     auto& s = state();
+-    if (GetTickCount64() > s.indices_until.load(std::memory_order_acquire)) return;
++    const auto now = GetTickCount64();
++    if (now > s.indices_until.load(std::memory_order_acquire) && now > s.camera_until.load(std::memory_order_acquire)) return;
+     std::uint32_t kind{};
+     std::array<std::byte, build::view_size> data{};
+     if (!memory::peek(view - build::view_kind_back, kind) || kind != build::main_view_kind ||
+@@ -271,6 +288,43 @@ void follow_render(bool wanted) noexcept {
+ }
+ 
+ void hide_skater(bool hidden) noexcept { state().hiding.store(hidden, std::memory_order_release); }
++void follow_camera(bool wanted) noexcept {
++    auto& s = state();
++    if (!s.ready.load(std::memory_order_acquire)) return;
++    s.camera_until.store(wanted ? GetTickCount64() + lease_ms : 0, std::memory_order_release);
++}
++void follow_ghost(std::uintptr_t entity) noexcept {
++    auto& s = state();
++    if (!s.ready.load(std::memory_order_acquire)) return;
++    if (!entity) {
++        s.ghost_until.store(0, std::memory_order_release);
++        return;
++    }
++    for (std::size_t mode = 0; mode < build::render_modes; ++mode)
++        s.ghost_indices[mode].store(render_index(s.base, entity, mode), std::memory_order_release);
++    s.ghost_until.store(GetTickCount64() + lease_ms, std::memory_order_release);
++}
++bool latest_ghost_skin(std::vector<game::LinearTransform>& skin) noexcept {
++    auto& s = state();
++    const auto now = GetTickCount64();
++    std::lock_guard guard(s.lock);
++    if (!s.ghost_skin_at || now - s.ghost_skin_at > fresh_ms) return false;
++    try {
++        skin = s.ghost_skin;
++    } catch (...) {
++        return false;
++    }
++    return true;
++}
++bool render_camera(std::array<float, 16>& camera, float& vertical_fov) noexcept {
++    auto& s = state();
++    const auto now = GetTickCount64();
++    std::lock_guard guard(s.lock);
++    if (!s.camera_at || now - s.camera_at > fresh_ms) return false;
++    camera = s.camera;
++    vertical_fov = s.vertical_fov;
++    return true;
++}
+ bool latest_picture(Picture& picture) noexcept {
+     auto& s = state();
+     const auto now = GetTickCount64();
+diff --git a/Extension/Skater/xray_render.h b/Extension/Skater/xray_render.h
+index eaba36b..54a2696 100644
+--- a/Extension/Skater/xray_render.h
++++ b/Extension/Skater/xray_render.h
+@@ -11,8 +11,8 @@
+ namespace dingosdk::xray {
+ // Requires the validated build: verifies the layout and prepares both hooks, which patches nothing.
+ bool start_render(std::uintptr_t image_base) noexcept;
+-// Client tick: both hooks on while a plugin keeps the x-ray ready, off otherwise, so the renderer
+-// never calls them for nothing. False when they could not be changed (logged; both stay as they were).
++// Client tick: both hooks on or off. Each change holds the game's threads for a moment (a hitch), so
++// xray.cpp puts them on once and leaves them. False when they could not be changed (logged; both stay as they were).
+ bool hook_render(bool on) noexcept;
+ // Client tick: while `wanted` (a plugin draws the x-ray), which render objects are the local skater's
+ // (no_bail.h no_bail_skater), riding and walking; otherwise both hooks pass every call straight on.
+@@ -25,6 +25,16 @@ struct Picture {
+ };
+ // Render thread: the latest picture's, while the renderer draws the local skater.
+ bool latest_picture(Picture& picture) noexcept;
++// Client tick: while true (and the hooks are on), the main view's camera is kept even with no x-ray,
++// for drawing over the world where the frame puts it (render_camera).
++void follow_camera(bool wanted) noexcept;
++// Render thread: the camera the renderer last drew the main view with (right, up, back, position
++// rows; degrees), while it is fresh.
++bool render_camera(std::array<float, 16>& camera, float& vertical_fov) noexcept;
++// Client tick: a ghost line's skater entity (0: none) whose draw packets are kept too, as the local
++// skater's are; render thread: its skinning matrices as last drawn, while fresh.
++void follow_ghost(std::uintptr_t entity) noexcept;
++bool latest_ghost_skin(std::vector<game::LinearTransform>& skin) noexcept;
+ // Client tick: while true (and followed, follow_render), the local skater's draw packets go out
+ // not visible, so this screen does not draw it; while hidden there is no picture.
+ void hide_skater(bool hidden) noexcept;
 diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
 index b70545c..2a40fff 100644
 --- a/Extension/UI/Overlay/input_capture.cpp
@@ -4103,10 +4690,21 @@ index b70545c..2a40fff 100644
          output->Gamepad = {};
          output->dwPacketNumber ^= 0x80000000u;
 diff --git a/Extension/UI/Overlay/plugin_overlay.cpp b/Extension/UI/Overlay/plugin_overlay.cpp
-index b3565bf..d547980 100644
+index b3565bf..948e3f8 100644
 --- a/Extension/UI/Overlay/plugin_overlay.cpp
 +++ b/Extension/UI/Overlay/plugin_overlay.cpp
-@@ -29,8 +29,19 @@ ImU32 shadow_of(ImU32 colour) {
+@@ -7,7 +7,10 @@
+ #include "Extension/UI/Overlay/xray_overlay.h"
+ #include "Extension/UI/Overlay/overlay.h"
+ #include "Extension/UI/Overlay/skate_style.h"
++#include "Extension/Skater/xray.h"
+ #include <algorithm>
++#include <numbers>
++#include <optional>
+ #include <array>
+ #include <map>
+ #include <imgui_internal.h>
+@@ -29,8 +32,19 @@ ImU32 shadow_of(ImU32 colour) {
      const auto alpha = static_cast<ImU32>(((colour >> IM_COL32_A_SHIFT) & 0xff) * 0.75f);
      return IM_COL32(0, 0, 0, alpha);
  }
@@ -4126,6 +4724,93 @@ index b3565bf..d547980 100644
      if (shape.style.wrap > 0) {
          // Wrapped: from its top left, as d:measure counts it.
          const float wrap = shape.style.wrap * k;
+@@ -492,7 +506,35 @@ void draw_plugins() {
+                                        s.menu.heading ? s.menu.heading : fallback, s.menu.title ? s.menu.title : fallback,
+                                        s.menu.title_large ? s.menu.title_large : s.menu.title ? s.menu.title : fallback};
+     auto* draw = ImGui::GetBackgroundDrawList();
+-    const auto camera = plugin_camera::projector(display.x, display.y);
++    using Kind = plugin_ui::Shape::Kind;
++    // World shapes and followed tags go through the camera the renderer drew the frame with (the
++    // x-ray's view hook, on while they are drawn), so they hold still on the world while the camera
++    // moves; the game's camera read now, a frame apart, until the renderer has given one.
++    bool over_world = false;
++    for (const auto& layer : *layers) {
++        for (const auto& shape : layer.shapes)
++            if (shape.kind == Kind::follow || shape.kind == Kind::world_text || shape.kind == Kind::world_line ||
++                shape.kind == Kind::world_circle || shape.kind == Kind::world_image) {
++                over_world = true;
++                break;
++            }
++        if (over_world) break;
++    }
++    std::optional<plugin_camera::Projector> camera;
++    if (over_world) {
++        std::array<float, 16> drawn{};
++        float fov{};
++        if (xray::camera(drawn, fov) && fov > 1 && fov < 175) {
++            plugin_camera::Projector p;
++            p.m = drawn;
++            p.width = display.x;
++            p.height = display.y;
++            p.focal = display.y / (2.0f * std::tan(fov * std::numbers::pi_v<float> / 360.0f));
++            camera = p;
++        } else {
++            camera = plugin_camera::projector(display.x, display.y);
++        }
++    }
+     // The fonts' advances for d:measure, again whenever the atlas is new.
+     static const void* measured{};
+     if (measured != ImGui::GetIO().Fonts) {
+@@ -505,7 +547,6 @@ void draw_plugins() {
+             plugin_ui::set_font(i, m);
+         }
+     }
+-    using Kind = plugin_ui::Shape::Kind;
+     const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.25f);
+     std::vector<std::string> covering; // plugins over most of the screen, named after the drawing
+     for (const auto& layer : *layers) {
+@@ -518,7 +559,13 @@ void draw_plugins() {
+         if (over.hidden >= named_cover) covering.push_back(layer.plugin);
+         int clips = 0;
+         plugin_ui::Shape held;
++        // d:follow: screen shapes moved to where the followed point is in this frame's camera; left
++        // out while it is behind the camera.
++        ImVec2 shift{};
++        bool unseen = false;
++        const auto at = [&](const plugin_ui::Vec3& p) { return ImVec2(p[0] + shift.x, p[1] + shift.y); };
+         for (const auto& source : layer.shapes) {
++            if (unseen && source.kind != Kind::unfollow) continue;
+             // (Copied only while it is being dimmed.)
+             const plugin_ui::Shape* drawn = &source;
+             if (dim < 1.0f) {
+@@ -607,6 +654,27 @@ void draw_plugins() {
+                     --clips;
+                 }
+                 break;
++            case Kind::follow: {
++                shift = {};
++                unseen = false;
++                if (p.size() < 2) break;
++                // Over a ghost's head: where the renderer drew it this frame, else the plugin's point.
++                plugin_ui::Vec3 anchor = p[0];
++                if (std::array<float, 3> head{}; shape.fit == 1 && xray::ghost_head(head))
++                    anchor = {head[0], head[1] + shape.radius, head[2]};
++                const auto now = camera ? camera->project(anchor) : std::nullopt;
++                // Behind the camera now, or swung so far that the tag would leave the screen: not drawn.
++                if (!now || !std::isfinite((*now)[0]) || !std::isfinite((*now)[1]) || std::fabs((*now)[0]) > 1e6f || std::fabs((*now)[1]) > 1e6f) {
++                    unseen = true;
++                    break;
++                }
++                shift = ImVec2((*now)[0] - p[1][0], (*now)[1] - p[1][1]);
++                break;
++            }
++            case Kind::unfollow:
++                shift = {};
++                unseen = false;
++                break;
+             }
+         }
+         for (; clips > 0; --clips) draw->PopClipRect();
 diff --git a/Extension/UI/Overlay/skate_menu.cpp b/Extension/UI/Overlay/skate_menu.cpp
 index 99ea53e..27102c7 100644
 --- a/Extension/UI/Overlay/skate_menu.cpp

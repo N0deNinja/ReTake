@@ -146,7 +146,7 @@ std::optional<Appearance> capture_cosmetics(std::uintptr_t base, const NativeFra
     }
 }
 void apply_cosmetic_recipe(std::uintptr_t base, std::uintptr_t entity, std::uintptr_t local_entity,
-                           const CosmeticRecipe &recipe) {
+                           const CosmeticRecipe &recipe, bool dress_gaps) {
     const CosmeticMemory memory{readable, base};
     const auto c = memory.component(entity), local = memory.component(local_entity);
     memory.check(entity != local_entity && c != local && memory.ptr(entity) == memory.ptr(local_entity) &&
@@ -216,6 +216,10 @@ void apply_cosmetic_recipe(std::uintptr_t base, std::uintptr_t entity, std::uint
                          "Multiplayer: a player wears \"{}\", which is not installed here; showing {} instead.",
                          missing, replacement.empty() ? "nothing" : replacement);
     }
+    if (dress_gaps && recipe.key == skater_recipe_key)
+        if (const auto dressed = memory.dress_gaps(resource, usable, swaps, default_cosmetic_items, reserved))
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                         "Ghost line: an item it wears is not installed here, so it wears the default outfit ({} slots dressed).", dressed);
     memory.validate(resource, usable);
     constexpr auto copy_prefix = addr::native_cosmetics::recipe_copy_prefix;
     memory.check(memory.get<std::array<std::uint8_t, copy_prefix.size()>>(
